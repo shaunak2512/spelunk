@@ -1,0 +1,22 @@
+# Additive ablation rungs. Each isolates one harness component's contribution.
+# schema_mode: dump    = full schema DDL placed in the prompt (classic text-to-SQL baseline)
+#              explore = no dump; agent calls list_tables / describe_table to learn the schema
+# profile:     include null %, distinct counts, sample values in describe()
+# rag:         pre-retrieve the top-k most relevant tables for the question
+
+rungs:
+  - name: R0_baseline
+    schema_mode: dump
+    profile: false
+    rag: false
+
+  - name: R1_discovery_fs
+    schema_mode: explore
+    profile: true
+    rag: false
+
+  - name: R2_schema_rag
+    schema_mode: explore
+    profile: true
+    rag: true
+    rag_top_k: 5
