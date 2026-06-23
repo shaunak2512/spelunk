@@ -16,13 +16,13 @@ frozen contract (signatures in the module + types in `spelunk/core/types.py` + `
 ## Wave 0 — Foundations  ✅ (this scaffold)
 - [x] `core/types.py`, frozen `core` signatures, `eval/schemas.py`, `configs/*`, test scaffold
 
-## Wave 1 — Core leaves (parallel, mutually independent)
-- [ ] `core/guard.py` — `assert_read_only`, `enforce_limit` (sqlglot AST). → `tests/test_guard.py`
-- [ ] `core/connection.py` — `connect` + read-only enforcement. → `tests/test_connection.py`
-- [ ] `eval/dataset.py` — download + stratified-sample BIRD → `questions.jsonl` (`BirdQuestion`)
-- [ ] `eval/score.py` — execution accuracy (adapt BIRD comparator) over `(pred_sql, gold_sql, db)`
-- [ ] `eval/report.py` — `results.csv` (`RunResult`) → headline + cost charts (matplotlib)
-- [ ] `agent/models.py` — `load_model(name)` via `init_chat_model` from `configs/models.yaml`
+## Wave 1 — Core leaves  ✅ (merged to main, 0 conflicts)
+- [x] `core/guard.py` — `assert_read_only`, `enforce_limit` (sqlglot AST). → `tests/test_guard.py`
+- [x] `core/connection.py` — `connect` + read-only enforcement. → `tests/test_connection.py`
+- [x] `eval/dataset.py` — download + stratified-sample BIRD → `questions.jsonl` (`BirdQuestion`)
+- [x] `eval/score.py` — execution accuracy (adapt BIRD comparator) over `(pred_sql, gold_sql, db)`
+- [x] `eval/report.py` — `results.csv` (`RunResult`) → headline + cost charts (matplotlib)
+- [x] `agent/models.py` — `load_model(name)` via `init_chat_model` from `configs/models.yaml`
 
 ## Wave 2 — Composition + side front-ends (parallel; depend on Wave 1)
 - [ ] `core/introspect.py` — `list_objects`, `describe` (+profile). → `tests/test_introspect.py`
