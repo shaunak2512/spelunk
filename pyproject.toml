@@ -23,6 +23,10 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-cov", "ruff"]
 mcp = ["fastmcp>=2.0"]
+# Drivers for connecting to existing server databases. SQL Server's pyodbc also
+# needs a system ODBC driver (e.g. "ODBC Driver 18 for SQL Server"); pymssql is a
+# no-ODBC alternative usable via a mssql+pymssql:// DSN.
+servers = ["psycopg[binary]>=3.1", "pymysql>=1.1", "pyodbc>=5.0"]
 
 [build-system]
 requires = ["hatchling"]
