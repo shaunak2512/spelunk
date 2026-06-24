@@ -22,7 +22,9 @@ collects, and the orchestrator independently re-runs the tests (reviewer step) b
 1. From `TASKS.md`, pick the wave's parallel modules. Mind sub-wave dependencies (below).
 2. Create a worktree per module (run in repo root):
    `git worktree add -b waveN/<mod> ../spelunk-wt/<mod> main`
-3. Spawn one `general-purpose` agent per worktree using the prompt template below.
+3. Spawn one `general-purpose` agent per worktree using the prompt template below. **Default the
+   subagent model to Sonnet (`claude-sonnet-4-6`)** — wave modules are contract-/test-driven, so Sonnet
+   is sufficient and much cheaper than Opus.
 4. **Reviewer step** — for each worktree:
    `cd ../spelunk-wt/<mod>; .\.venv\Scripts\python.exe -m pytest tests\test_<mod>.py -q`
    `git diff --name-only main HEAD` (only the intended files)  ·  `git status --short` (clean)
@@ -74,4 +76,5 @@ Full-suite (main) deps through Wave 1: `pydantic sqlglot sqlalchemy pandas matpl
 - `eval/score` uses multiset row comparison (stricter than BIRD's `set()` dedupe) — decide parity when wiring the Wave 3 runner.
 - Package `__init__` files intentionally do NOT re-export submodules (keeps `import spelunk.eval` from dragging in pandas/matplotlib). Import from submodules: `from spelunk.eval.dataset import ...`.
 - The assistant won't spawn agents unless you ask — say "spawn the agents" / "use subagents".
+- **Model:** default worker subagents to **Sonnet** (`claude-sonnet-4-6`) to save tokens. Run the orchestrator on Opus for sharper reviewer/merge judgment, or Sonnet for max savings — fine for simple/independent waves; prefer Opus once waves get interdependent.
 - Current state: Wave 0 + Wave 1 merged to `main`. Remaining red tests = `introspect` + `query` (Wave 2a).
