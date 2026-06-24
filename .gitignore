@@ -12,3 +12,4 @@ results/
 dist/
 build/
 .coverage
+*.html
