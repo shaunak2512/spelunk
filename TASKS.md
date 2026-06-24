@@ -31,10 +31,10 @@ Briefs in `briefs/wave-2/`; process in `briefs/ORCHESTRATION.md`. Has an interna
 - [x] `core/introspect.py` — `list_objects`, `describe` (+profile). → `tests/test_introspect.py`
 - [x] `core/query.py` — `run_sql` (guarded pipeline). → `tests/test_query.py`
 
-**Barrier**, then **Wave 2b (parallel; depend on 2a merged to `main`):**
-- [ ] `agent/tools.py` — wrap core fns as LangChain tools + `submit_sql` terminator
-- [ ] `rag/schema_index.py` — embed schema + numpy-cosine retrieve top-k tables
-- [ ] `mcp/server.py` — FastMCP resources + `run_query` tool (**OPTIONAL extra**)
+**Barrier**, then **Wave 2b (parallel; depend on 2a merged to `main`):**  ✅ (merged to main, 0 conflicts)
+- [x] `agent/tools.py` — wrap core fns as LangChain tools + `submit_sql` terminator
+- [x] `rag/schema_index.py` — embed schema + numpy-cosine retrieve top-k tables
+- [x] `mcp/server.py` — FastMCP resources + `run_query` tool (**OPTIONAL extra**)
 
 ## Wave 3 — Integration & run (mostly serial)
 - [ ] `agent/rungs.py` — apply R0 / R1 / R2 flags from `configs/rungs.yaml`
