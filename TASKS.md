@@ -37,14 +37,19 @@ Briefs in `briefs/wave-2/`; process in `briefs/ORCHESTRATION.md`. Has an interna
 - [x] `mcp/server.py` — FastMCP resources + `run_query` tool (**OPTIONAL extra**)
 
 ## Wave 3 — Integration & run (mostly serial)
-- [ ] `agent/rungs.py` — apply R0 / R1 / R2 flags from `configs/rungs.yaml`
-- [ ] `agent/graph.py` — `create_react_agent` loop, max-steps cap, probe-row cap
-- [ ] `eval/runner.py` — `(model × rung × question)` matrix + telemetry + response cache
-- [ ] end-to-end smoke (~5 questions) → then the lean matrix run (~150 Q)
-- [ ] `README` writeup: headline chart + honest small-schema caveat + error taxonomy
+Code modules built directly on Opus (serial, interdependent) + run scaffolding staged. The
+**paid run** (smoke + matrix) and README are deferred — they need a `.env` with API keys.
+- [x] `agent/rungs.py` — typed `RungConfig` loader for the R0/R1/R2 ablation. → `tests/test_rungs.py`
+- [x] `agent/graph.py` — hand-wired ReAct loop (step/probe caps, `submit_sql` terminator, telemetry). → `tests/test_graph.py`
+- [x] `eval/runner.py` — `(model × rung × question)` matrix + frontier→R0 filter + response cache + telemetry → `results.csv`. → `tests/test_runner.py`
+- [x] Run scaffolding staged: BIRD dev downloaded (gitignored), `data/questions.jsonl` frozen (150 Q, 5 DBs), `scripts/freeze_bird_questions.py`.
+- [ ] **(deferred — needs API keys)** end-to-end smoke (~5 questions) → then the lean matrix run (~150 Q)
+- [ ] **(deferred — needs run results)** `README` writeup: headline chart + honest small-schema caveat + error taxonomy
 
 ---
 
 ### Open action item
-Confirm current **OpenAI** cheap/frontier model IDs + per-token prices in `configs/models.yaml`
-(placeholders + TODOs are in there now). Claude IDs are set.
+~~Confirm current OpenAI cheap/frontier model IDs + per-token prices in `configs/models.yaml`.~~
+✅ Resolved 2026-06-24: `configs/models.yaml` now carries confirmed IDs/prices for both vendors —
+Claude (`claude-haiku-4-5` $1/$5, `claude-opus-4-8` $5/$25) and OpenAI (`gpt-5.4-mini` $0.75/$4.50,
+`gpt-5.5` $5/$30). Re-confirm prices before a real billed run.
