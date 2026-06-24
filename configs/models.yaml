@@ -1,7 +1,9 @@
 # Benchmark models. Vendor-agnostic: loaded via LangChain `init_chat_model(f"{provider}:{model_id}")`.
 # Adding a vendor (gemini, ollama, ...) = add a list entry; no code change.
 #
-# prices are USD per 1,000,000 tokens. CONFIRM current values before any real run — placeholders below.
+# prices are USD per 1,000,000 tokens.
+# Confirmed 2026-06-24: Claude IDs/prices per the claude-api reference; OpenAI IDs/prices
+# per developers.openai.com/api/docs/pricing. Re-confirm before a real billed run.
 
 models:
   # --- cheap tier (the parity candidates; run across all rungs) ---
@@ -9,27 +11,27 @@ models:
     provider: anthropic
     model_id: claude-haiku-4-5
     tier: cheap
-    price_in: 1.00      # TODO confirm
-    price_out: 5.00     # TODO confirm
+    price_in: 1.00
+    price_out: 5.00
 
   - name: gpt-cheap
     provider: openai
-    model_id: gpt-5-mini    # TODO confirm current OpenAI cheap-tier id
+    model_id: gpt-5.4-mini    # current OpenAI cheap/mini tier (gpt-5-mini family successor)
     tier: cheap
-    price_in: 0.25      # TODO confirm
-    price_out: 2.00     # TODO confirm
+    price_in: 0.75
+    price_out: 4.50
 
   # --- frontier tier (the "expensive, no harness" reference bar; run on R0 only) ---
   - name: claude-frontier
     provider: anthropic
     model_id: claude-opus-4-8
     tier: frontier
-    price_in: 15.00     # TODO confirm
-    price_out: 75.00    # TODO confirm
+    price_in: 5.00
+    price_out: 25.00
 
   - name: gpt-frontier
     provider: openai
-    model_id: gpt-5         # TODO confirm current OpenAI frontier id
+    model_id: gpt-5.5         # current OpenAI flagship
     tier: frontier
-    price_in: 10.00     # TODO confirm
-    price_out: 30.00    # TODO confirm
+    price_in: 5.00
+    price_out: 30.00
