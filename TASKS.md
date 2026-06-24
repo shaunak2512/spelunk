@@ -24,9 +24,14 @@ frozen contract (signatures in the module + types in `spelunk/core/types.py` + `
 - [x] `eval/report.py` — `results.csv` (`RunResult`) → headline + cost charts (matplotlib)
 - [x] `agent/models.py` — `load_model(name)` via `init_chat_model` from `configs/models.yaml`
 
-## Wave 2 — Composition + side front-ends (parallel; depend on Wave 1)
+## Wave 2 — Composition + side front-ends
+Briefs in `briefs/wave-2/`; process in `briefs/ORCHESTRATION.md`. Has an internal sub-wave split:
+
+**Wave 2a (parallel leaves; depend on done `connection`/`guard`):**
 - [ ] `core/introspect.py` — `list_objects`, `describe` (+profile). → `tests/test_introspect.py`
 - [ ] `core/query.py` — `run_sql` (guarded pipeline). → `tests/test_query.py`
+
+**Barrier**, then **Wave 2b (parallel; depend on 2a merged to `main`):**
 - [ ] `agent/tools.py` — wrap core fns as LangChain tools + `submit_sql` terminator
 - [ ] `rag/schema_index.py` — embed schema + numpy-cosine retrieve top-k tables
 - [ ] `mcp/server.py` — FastMCP resources + `run_query` tool (**OPTIONAL extra**)
