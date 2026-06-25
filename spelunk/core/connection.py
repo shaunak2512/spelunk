@@ -21,7 +21,13 @@ _DEFAULT_DRIVERS = {
 }
 
 
-def connect(dsn: str, *, read_only: bool = True) -> Engine:
+def connect(
+    dsn: str,
+    *,
+    read_only: bool = True,
+    connect_args: dict | None = None,
+    require_tls: bool = False,
+) -> Engine:
     """Return a pooled SQLAlchemy ``Engine`` for ``dsn``.
 
     Contract:
@@ -36,6 +42,19 @@ def connect(dsn: str, *, read_only: bool = True) -> Engine:
       * If the DSN names only the backend (no ``+driver``), a sensible default driver
         from the ``servers`` extra is filled in (Postgres→psycopg, MySQL/MariaDB→pymysql,
         SQL Server→pyodbc). An explicit ``+driver`` is always honoured.
+
+    Authentication / driver tuning:
+      * ``connect_args`` is merged into the DBAPI ``connect()`` keyword arguments. Use it
+        for auth that cannot be expressed in the URL — e.g. a pre-built ``ssl.SSLContext``,
+        pyodbc ``attrs_before`` carrying an Azure AD access token, or psycopg
+        ``sslrootcert``. Caller keys win; the only key we *merge* rather than overwrite is
+        libpq ``options`` (the Postgres read-only flag is appended to any options you pass).
+      * ``require_tls=True`` turns on transport encryption per dialect: Postgres
+        ``sslmode=require``, SQL Server ``Encrypt=yes``, MySQL/MariaDB a pymysql SSL
+        context. This only *encrypts* the connection — it does NOT verify the server
+        certificate; for full verification pass a CA via ``connect_args`` / the DSN
+        (e.g. Postgres ``sslmode=verify-full`` + ``sslrootcert``). A no-op for SQLite, and
+        never overrides a TLS setting you already put in the DSN/``connect_args``.
 
     Read-only enforcement is dialect-specific. The guard layer (sqlglot) is the primary
     defence; these connection-level measures are defence-in-depth. For server databases
@@ -57,19 +76,25 @@ def connect(dsn: str, *, read_only: bool = True) -> Engine:
     backend = url.get_backend_name()
     url = _normalize_driver(url, backend)
 
+    # Caller-supplied connect_args are the base we layer our own settings onto.
+    args: dict = dict(connect_args or {})
+
     # ---- SQLite -----------------------------------------------------------------
     if backend == "sqlite":
+        # require_tls is meaningless for a local file DB; silently ignored.
         if read_only:
             url = _sqlite_read_only_url(url)
-        return create_engine(url)
+        return create_engine(url, connect_args=args)
 
     # ---- Server dialects (PostgreSQL / MySQL / MariaDB / SQL Server) -------------
-    connect_args: dict = {}
-    if read_only and backend in ("postgresql", "postgres"):
-        # Applied by libpq for psycopg/psycopg2; every transaction is read-only.
-        connect_args["options"] = "-c default_transaction_read_only=on"
+    if require_tls:
+        url = _apply_require_tls(url, backend, args)
 
-    engine = create_engine(url, pool_pre_ping=True, connect_args=connect_args)
+    if read_only and backend in ("postgresql", "postgres"):
+        # libpq option; appended so it never clobbers caller-supplied options.
+        _append_pg_option(args, "default_transaction_read_only=on")
+
+    engine = create_engine(url, pool_pre_ping=True, connect_args=args)
 
     if read_only and backend in ("mysql", "mariadb"):
 
@@ -100,6 +125,36 @@ def _normalize_driver(url, backend):
     if default is None:
         return url
     return url.set(drivername=f"{backend}+{default}")
+
+
+def _append_pg_option(args: dict, option: str) -> None:
+    """Append a libpq ``-c <option>`` to ``connect_args['options']`` in place.
+
+    Preserves any ``options`` string the caller already supplied (so a read-only flag and
+    a caller's ``search_path`` can coexist) rather than overwriting it.
+    """
+    flag = f"-c {option}"
+    existing = args.get("options")
+    args["options"] = f"{existing} {flag}" if existing else flag
+
+
+def _apply_require_tls(url, backend, args: dict):
+    """Enable transport encryption for a server dialect; return the (possibly new) URL.
+
+    Encryption only — no certificate verification (pass a CA via ``connect_args`` / the DSN
+    for that). Never overrides a TLS setting the caller already specified.
+    """
+    if backend in ("postgresql", "postgres"):
+        if "sslmode" not in url.query and "sslmode" not in args:
+            url = url.update_query_dict({"sslmode": "require"})
+    elif backend == "mssql":
+        if not any(k.lower() == "encrypt" for k in url.query):
+            url = url.update_query_dict({"Encrypt": "yes"})
+    elif backend in ("mysql", "mariadb"):
+        # pymysql enables TLS when handed a non-empty ssl dict; without a CA it
+        # encrypts without verifying the server certificate.
+        args.setdefault("ssl", {"check_hostname": False})
+    return url
 
 
 def _sqlite_read_only_url(url):
