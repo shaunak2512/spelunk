@@ -1,0 +1,94 @@
+{
+    "@context": {
+        "@language": "en",
+        "@vocab": "https://schema.org/",
+        "citeAs": "cr:citeAs",
+        "column": "cr:column",
+        "conformsTo": "dct:conformsTo",
+        "cr": "http://mlcommons.org/croissant/",
+        "data": {
+            "@id": "cr:data",
+            "@type": "@json"
+        },
+        "dataBiases": "cr:dataBiases",
+        "dataCollection": "cr:dataCollection",
+        "dataType": {
+            "@id": "cr:dataType",
+            "@type": "@vocab"
+        },
+        "dct": "http://purl.org/dc/terms/",
+        "extract": "cr:extract",
+        "field": "cr:field",
+        "fileProperty": "cr:fileProperty",
+        "fileObject": "cr:fileObject",
+        "fileSet": "cr:fileSet",
+        "format": "cr:format",
+        "includes": "cr:includes",
+        "isEnumeration": "cr:isEnumeration",
+        "jsonPath": "cr:jsonPath",
+        "key": "cr:key",
+        "md5": "cr:md5",
+        "parentField": "cr:parentField",
+        "path": "cr:path",
+        "personalSensitiveInformation": "cr:personalSensitiveInformation",
+        "recordSet": "cr:recordSet",
+        "references": "cr:references",
+        "regex": "cr:regex",
+        "repeated": "cr:repeated",
+        "replace": "cr:replace",
+        "sc": "https://schema.org/",
+        "separator": "cr:separator",
+        "source": "cr:source",
+        "subField": "cr:subField",
+        "transform": "cr:transform",
+        "wd": "https://www.wikidata.org/wiki/"
+    },
+    "alternateName": "Pitchfork reviews from Jan 5, 1999 to Jan 8, 2017",
+    "conformsTo": "http://mlcommons.org/croissant/1.0",
+    "license": {
+        "@type": "sc:CreativeWork",
+        "name": "Unknown"
+    },
+    "distribution": [
+        {
+            "contentUrl": "https://www.kaggle.com/api/v1/datasets/download/nolanbconaway/pitchfork-data?datasetVersionNumber=1",
+            "contentSize": "33.274 MB",
+            "md5": "6wNJ4arlJUg5IHH6C55ozw==",
+            "encodingFormat": "application/zip",
+            "@id": "archive.zip",
+            "@type": "cr:FileObject",
+            "name": "archive.zip",
+            "description": "Archive containing all the contents of the 18,393 Pitchfork Reviews dataset"
+        }
+    ],
+    "version": 1,
+    "keywords": [
+        "subject \u003E arts and entertainment \u003E music",
+        "subject \u003E people and society \u003E business \u003E ratings and reviews"
+    ],
+    "isAccessibleForFree": true,
+    "includedInDataCatalog": {
+        "@type": "sc:DataCatalog",
+        "name": "Kaggle",
+        "url": "https://www.kaggle.com"
+    },
+    "creator": {
+        "@type": "sc:Person",
+        "name": "Nolan Conaway",
+        "url": "/nolanbconaway",
+        "image": "https://storage.googleapis.com/kaggle-avatars/thumbnails/772431-kg.jpeg"
+    },
+    "publisher": {
+        "@type": "sc:Organization",
+        "name": "Kaggle",
+        "url": "https://www.kaggle.com/organizations/kaggle",
+        "image": "https://storage.googleapis.com/kaggle-organizations/4/thumbnail.png"
+    },
+    "thumbnailUrl": "https://storage.googleapis.com/kaggle-datasets-images/655/1252/bd6052e9b62eeecbe56295c54312d0a3/dataset-card.jpg",
+    "dateModified": "2017-01-13T04:18:10.113",
+    "datePublished": "2017-01-13T04:18:10.097",
+    "@type": "sc:Dataset",
+    "name": "18,393 Pitchfork Reviews",
+    "url": "https://www.kaggle.com/datasets/nolanbconaway/pitchfork-data/versions/1",
+    "description": "# Context \n\n[Pitchfork](https://pitchfork.com/) is a music-centric online magazine. It was started in 1995 and grew out of independent music reviewing into a general publication format, but is still famed for its variety music reviews. I scraped over 18,000 [Pitchfork][1] reviews (going back to January 1999). Initially, this was done to satisfy a few of [my own curiosities][2], but I bet Kagglers can come up with some really interesting analyses! \n\n# Content\n\nThis dataset is provided as a \u0060sqlite\u0060 database with the following tables: \u0060artists\u0060, \u0060content\u0060, \u0060genres\u0060, \u0060labels\u0060, \u0060reviews\u0060, \u0060years\u0060. For column-level information on specific tables, refer to the [Metadata tab](https://www.kaggle.com/nolanbconaway/pitchfork-data/data).\n\n# Inspiration\n\n* Do review scores for individual artists generally improve over time, or go down?\n* How has Pitchfork\u0027s review genre selection changed over time?\n* Who are the most highly rated artists? The least highly rated artists?\n\n# Acknowledgements\n\nGotta love [Beautiful Soup][4]!\n\n  [1]: http://pitchfork.com/\n  [2]: https://github.com/nolanbconaway/pitchfork-data\n  [3]: https://github.com/nolanbconaway/pitchfork-data/tree/master/scrape\n  [4]: https://www.crummy.com/software/BeautifulSoup/"
+}

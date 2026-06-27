@@ -19,6 +19,14 @@ if TYPE_CHECKING:
     from sqlalchemy.engine import Engine
 
 
+_DIALECT_LABELS = {
+    "sqlite": "SQLite",
+    "postgresql": "PostgreSQL",
+    "mysql": "MySQL",
+    "mssql": "SQL Server",
+}
+
+
 def build_server(engine: "Engine") -> FastMCP:
     """Build and return a FastMCP instance wired to *engine*.
 
@@ -27,7 +35,36 @@ def build_server(engine: "Engine") -> FastMCP:
     - Template  ``db://{table}``       — describes one table (wraps describe).
     - Tool      ``run_query(sql)``     — executes a read-only SQL query (wraps run_sql).
     """
-    mcp = FastMCP("spelunk")
+    dialect_name = engine.dialect.name
+    dialect_label = _DIALECT_LABELS.get(dialect_name, dialect_name)
+
+    mcp = FastMCP(
+        "spelunk",
+        instructions=(
+            f"Spelunk exposes a connected {dialect_label} database for read-only exploration and querying.\n\n"
+            "## Resources\n"
+            "- `db://tables` — call this first to get a JSON array of all tables and views "
+            "(each entry has `name`, `kind`, and `row_count`).\n"
+            "- `db://{table}` — describe a single table by name: columns with types and nullability, "
+            "primary key, foreign-key relationships, a few sample rows, and per-column value profiles. "
+            "Use this to understand schema details before writing SQL.\n\n"
+            "## Tool\n"
+            "- `run_query(sql)` — execute a read-only SELECT query and get back rows as a list of dicts. "
+            "Results are capped at 1 000 rows. Writes (INSERT/UPDATE/DELETE/DDL/PRAGMA writes) are "
+            "blocked at the AST level and will raise an error.\n\n"
+            "## Recommended workflow\n"
+            "1. Read `db://tables` to discover what tables exist.\n"
+            "2. Read `db://{table}` for each table relevant to the question — pay attention to "
+            "foreign keys to understand join paths and to column profiles for value distributions.\n"
+            "3. Draft a SELECT query. Prefer explicit column lists over `SELECT *`.\n"
+            "4. Call `run_query` with your SQL. If the result is empty or unexpected, inspect the "
+            "sample rows from step 2 and adjust.\n\n"
+            "## Constraints\n"
+            "- All queries must be read-only SELECT statements (CTEs are fine).\n"
+            "- Row limit is 1 000 per query; use `WHERE`, `LIMIT`, or aggregation to stay within it.\n"
+            f"- The connected database is {dialect_label} — write SQL in its dialect."
+        ),
+    )
 
     # ------------------------------------------------------------------ #
     # Resource: list all tables
