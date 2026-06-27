@@ -14,3 +14,4 @@ build/
 .coverage
 *.html
 sample_data/
+potential_extensions.md
