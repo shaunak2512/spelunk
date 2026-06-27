@@ -142,7 +142,12 @@ def build_server(engine: "Engine") -> FastMCP:
         elif fmt == "json":
             df.to_json(abs_path, orient="records", indent=2, force_ascii=False)
         elif fmt == "parquet":
-            df.to_parquet(abs_path, index=False)
+            import duckdb
+            # DuckDB accepts forward slashes on Windows; escape any literal quotes.
+            safe_path = abs_path.replace("\\", "/").replace("'", "''")
+            with duckdb.connect() as dconn:
+                dconn.register("_export", df)
+                dconn.execute(f"COPY _export TO '{safe_path}' (FORMAT PARQUET)")
 
         return {
             "path": abs_path,
