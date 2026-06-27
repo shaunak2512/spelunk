@@ -230,6 +230,81 @@ class TestDescribeQueryTool:
 
 
 # --------------------------------------------------------------------------- #
+# Session workspace: named results round-trip
+# --------------------------------------------------------------------------- #
+
+class TestSessionWorkspace:
+    """save_result -> list_results -> query_results -> save_result_from -> export."""
+
+    def test_save_result_caches_source_query(self, mcp_server):
+        result = _run(mcp_server.call_tool(
+            "save_result",
+            {"sql": "SELECT * FROM customers", "name": "cust"},
+        ))
+        data = result.structured_content
+        assert data["name"] == "cust"
+        assert data["row_count"] == 3
+        col_names = [c["name"] for c in data["columns"]]
+        assert "name" in col_names and "city" in col_names
+
+    def test_list_results_reports_saved_table(self, mcp_server):
+        _run(mcp_server.call_tool(
+            "save_result", {"sql": "SELECT * FROM customers", "name": "cust"}))
+        result = _run(mcp_server.call_tool("list_results", {}))
+        data = result.structured_content
+        names = {r["name"] for r in data["results"]}
+        assert "cust" in names
+        cust = next(r for r in data["results"] if r["name"] == "cust")
+        assert cust["row_count"] == 3
+
+    def test_query_results_reads_named_table(self, mcp_server):
+        _run(mcp_server.call_tool(
+            "save_result", {"sql": "SELECT * FROM customers", "name": "cust"}))
+        result = _run(mcp_server.call_tool(
+            "query_results", {"sql": "SELECT name FROM cust ORDER BY id"}))
+        data = result.structured_content
+        names = [row[0] for row in data["rows"]]
+        assert names == ["Ada", "Linus", "Grace"]
+
+    def test_save_result_from_builds_on_prior_result(self, mcp_server):
+        _run(mcp_server.call_tool(
+            "save_result", {"sql": "SELECT * FROM orders", "name": "ord"}))
+        out = _run(mcp_server.call_tool(
+            "save_result_from",
+            {"sql": "SELECT status, COUNT(*) AS n FROM ord GROUP BY status", "name": "by_status"},
+        ))
+        data = out.structured_content
+        assert data["name"] == "by_status"
+        # query the derived result back
+        check = _run(mcp_server.call_tool(
+            "query_results", {"sql": "SELECT SUM(n) FROM by_status"}))
+        assert check.structured_content["rows"][0][0] == 3
+
+    def test_query_results_rejects_writes(self, mcp_server):
+        _run(mcp_server.call_tool(
+            "save_result", {"sql": "SELECT * FROM customers", "name": "cust"}))
+        with pytest.raises(Exception):
+            _run(mcp_server.call_tool(
+                "query_results", {"sql": "DROP TABLE cust"}))
+
+    def test_invalid_name_rejected(self, mcp_server):
+        with pytest.raises(Exception):
+            _run(mcp_server.call_tool(
+                "save_result", {"sql": "SELECT * FROM customers", "name": "bad name; DROP"}))
+
+    def test_export_result_writes_parquet(self, mcp_server, tmp_path):
+        _run(mcp_server.call_tool(
+            "save_result", {"sql": "SELECT * FROM customers", "name": "cust"}))
+        out_path = str(tmp_path / "cust.parquet")
+        result = _run(mcp_server.call_tool(
+            "export_result", {"name": "cust", "format": "parquet", "path": out_path}))
+        data = result.structured_content
+        assert data["row_count"] == 3
+        import os as _os
+        assert _os.path.exists(data["path"])
+
+
+# --------------------------------------------------------------------------- #
 # build_server contract
 # --------------------------------------------------------------------------- #
 
@@ -247,9 +322,11 @@ class TestBuildServerContract:
         resources = _run(mcp_server.list_resources())
         templates = _run(mcp_server.list_resource_templates())
         tool_names = {t.name for t in tools}
-        assert tool_names == {"run_query", "export_query", "describe_query"}, (
-            f"Unexpected tools: {tool_names}"
-        )
+        assert tool_names == {
+            "run_query", "export_query", "describe_query",
+            "save_result", "query_results", "save_result_from",
+            "list_results", "export_result",
+        }, f"Unexpected tools: {tool_names}"
         assert len(resources) == 1, f"Expected 1 resource, got: {[str(r.uri) for r in resources]}"
         assert len(templates) == 1, f"Expected 1 template, got: {[t.uri_template for t in templates]}"
 
@@ -260,5 +337,5 @@ class TestBuildServerContract:
         s2 = build_server(engine)
         tools1 = _run(s1.list_tools())
         tools2 = _run(s2.list_tools())
-        assert len(tools1) == 3
-        assert len(tools2) == 3
+        assert len(tools1) == 8
+        assert len(tools2) == 8

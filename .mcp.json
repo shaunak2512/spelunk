@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "spelunk": {
+      "command": "C:\\Users\\shaun\\repo\\spelunk\\.venv\\Scripts\\python.exe",
+      "args": [
+        "-m",
+        "spelunk.mcp.server",
+        "--dsn",
+        "sqlite:///C:/Users/shaun/repo/spelunk/data/bird/dev_20240627/dev_databases/financial/financial.sqlite",
+        "--session-dir",
+        "C:/Users/shaun/repo/spelunk/.spelunk_session"
+      ]
+    }
+  }
+}

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -17,6 +18,7 @@ from sqlalchemy import text as _sa_text
 import pandas as pd
 from fastmcp import FastMCP
 
+from spelunk.core import guard
 from spelunk.core.introspect import describe, list_objects
 from spelunk.core.query import run_sql
 
@@ -86,17 +88,51 @@ _DIALECT_LABELS = {
     "mssql": "SQL Server",
 }
 
+# Valid workspace result names: SQL-identifier-safe so they can be interpolated
+# into CREATE TABLE / quoted references without injection risk. This is also why
+# the LLM addresses results by NAME, never by filesystem path.
+_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
 
-def build_server(engine: "Engine") -> FastMCP:
+
+def _validate_name(name: str) -> str:
+    """Raise ValueError unless *name* is a safe SQL identifier; return it otherwise."""
+    if not _NAME_RE.match(name or ""):
+        raise ValueError(
+            f"Invalid result name {name!r}. Use a SQL identifier: letters, digits, "
+            "and underscores, starting with a letter or underscore (max 63 chars)."
+        )
+    return name
+
+
+def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
     """Build and return a FastMCP instance wired to *engine*.
 
     Registers:
     - Resource  ``db://tables``        — lists all tables/views (wraps list_objects).
     - Template  ``db://{table}``       — describes one table (wraps describe).
     - Tool      ``run_query(sql)``     — executes a read-only SQL query (wraps run_sql).
+    - Tools     ``save_result`` / ``query_results`` / ``save_result_from`` /
+      ``list_results`` / ``export_result`` — a session-scoped DuckDB workspace for
+      caching source-DB results under a name and querying/joining them locally.
+
+    *session_dir*, when given, roots a durable workspace (``workspace.duckdb`` under
+    it) so named results survive restarts. When omitted, the workspace is an
+    ephemeral in-memory DuckDB that lives only for the server process.
     """
     dialect_name = engine.dialect.name
     dialect_label = _DIALECT_LABELS.get(dialect_name, dialect_name)
+
+    # --- session workspace: a DuckDB database addressed by result name --- #
+    # With session_dir -> a durable file; without -> in-memory (ephemeral, and
+    # naturally isolated so multiple servers in one process never lock-conflict).
+    import duckdb
+
+    if session_dir is not None:
+        session_path = os.path.abspath(session_dir)
+        os.makedirs(session_path, exist_ok=True)
+        workspace = duckdb.connect(os.path.join(session_path, "workspace.duckdb"))
+    else:
+        workspace = duckdb.connect()
 
     mcp = FastMCP(
         "spelunk",
@@ -124,6 +160,23 @@ def build_server(engine: "Engine") -> FastMCP:
             "Text/object columns return non_null_count, null_rate, unique, "
             "top (most-frequent value), freq (its count). "
             "Use this instead of writing manual aggregation queries.\n\n"
+            "## Session workspace (named results)\n"
+            "A local DuckDB workspace lets you cache results from the source database "
+            "under a name and then query, join, and transform them locally — without "
+            "re-hitting the source DB. Results are addressed by NAME, never by file path.\n"
+            "- `save_result(sql, name)` — run a SELECT against the SOURCE database (no row "
+            "cap) and store the full result in the workspace as table `name`. Use this to "
+            "pull a slice once and reuse it.\n"
+            "- `query_results(sql)` — run DuckDB SQL over the saved results (e.g. "
+            "`SELECT * FROM orders JOIN customers USING (cust_id)`). Read-only, capped at "
+            "1000 rows.\n"
+            "- `save_result_from(sql, name)` — run DuckDB SQL over the saved results and "
+            "store the output under a new `name`. This is how you build step-by-step: each "
+            "result feeds the next.\n"
+            "- `list_results()` — list saved results with their columns, types, and row "
+            "counts so you know what you can build on.\n"
+            "- `export_result(name, format, path)` — write a saved result to a file "
+            "(parquet/csv/json) when you want a durable artifact.\n\n"
             "## Recommended workflow\n"
             "1. Read `db://tables` to discover what tables exist.\n"
             "2. Read `db://{table}` for each table relevant to the question — pay attention to "
@@ -346,6 +399,155 @@ def build_server(engine: "Engine") -> FastMCP:
             "columns": col_stats,
         }
 
+    # ------------------------------------------------------------------ #
+    # Session workspace: named results cached in a local DuckDB file
+    # ------------------------------------------------------------------ #
+    def _workspace_columns(name: str) -> list[dict[str, str]]:
+        """Return [{name, type}] for a workspace table, in declaration order."""
+        rows = workspace.execute(
+            "SELECT column_name, data_type FROM information_schema.columns "
+            "WHERE table_schema = 'main' AND table_name = ? ORDER BY ordinal_position",
+            [name],
+        ).fetchall()
+        return [{"name": c, "type": t} for c, t in rows]
+
+    @mcp.tool(
+        name="save_result",
+        description=(
+            "Run a read-only SELECT against the SOURCE database (no row cap) and store the "
+            "full result in the session workspace as a named table. Reuse it later with "
+            "query_results / save_result_from without re-querying the source. "
+            "`name` must be a SQL identifier (letters, digits, underscores). "
+            "Replaces any existing result with the same name."
+        ),
+    )
+    def _save_result(sql: str, name: str) -> dict:
+        """Materialize a source-DB query into the workspace as table *name*."""
+        _validate_name(name)
+        # run_sql applies the read-only guard against the source dialect and pulls
+        # all rows (max_rows=None). Reuses the exact bridge export_query already uses.
+        result = run_sql(engine, sql, max_rows=None)
+        df = pd.DataFrame(result.rows, columns=result.columns)
+        workspace.register("_save_src", df)
+        try:
+            workspace.execute(f'CREATE OR REPLACE TABLE "{name}" AS SELECT * FROM _save_src')
+        finally:
+            workspace.unregister("_save_src")
+        return {
+            "name": name,
+            "row_count": result.row_count,
+            "columns": _workspace_columns(name),
+            "elapsed_s": round(result.elapsed_s or 0.0, 3),
+        }
+
+    @mcp.tool(
+        name="query_results",
+        description=(
+            "Execute read-only DuckDB SQL over the named results in the session workspace "
+            "(reference them by name, e.g. `FROM my_result`). Use this to filter, join, or "
+            "aggregate cached results locally. Results are capped at 1000 rows — use "
+            "save_result_from or export_result for full output."
+        ),
+    )
+    def _query_results(sql: str) -> dict:
+        """Run a read-only DuckDB query over the workspace and return rows."""
+        guard.assert_read_only(sql, "duckdb")
+        sql2 = guard.enforce_limit(sql, "duckdb", 1000)
+        t0 = time.perf_counter()
+        cur = workspace.execute(sql2)
+        columns = [d[0] for d in cur.description] if cur.description else []
+        rows = [[_to_python(v) for v in row] for row in cur.fetchall()]
+        elapsed_s = time.perf_counter() - t0
+        return {
+            "columns": columns,
+            "rows": rows,
+            "row_count": len(rows),
+            "truncated": len(rows) == 1000,
+            "elapsed_s": round(elapsed_s, 3),
+            "sql_executed": sql2,
+        }
+
+    @mcp.tool(
+        name="save_result_from",
+        description=(
+            "Run read-only DuckDB SQL over the named results in the session workspace and "
+            "store its full output (no row cap) under a new name. This is how you build "
+            "analyses step by step — each saved result can feed the next. "
+            "`name` must be a SQL identifier. Replaces any existing result with that name."
+        ),
+    )
+    def _save_result_from(sql: str, name: str) -> dict:
+        """Materialize a workspace query under a new table *name*."""
+        _validate_name(name)
+        guard.assert_read_only(sql, "duckdb")
+        t0 = time.perf_counter()
+        workspace.execute(f'CREATE OR REPLACE TABLE "{name}" AS {sql}')
+        row_count = workspace.execute(f'SELECT COUNT(*) FROM "{name}"').fetchone()[0]
+        return {
+            "name": name,
+            "row_count": int(row_count),
+            "columns": _workspace_columns(name),
+            "elapsed_s": round(time.perf_counter() - t0, 3),
+        }
+
+    @mcp.tool(
+        name="list_results",
+        description=(
+            "List the named results currently in the session workspace, each with its "
+            "columns, types, and row count, so you know what you can query or build on."
+        ),
+    )
+    def _list_results() -> dict:
+        """Return all workspace tables with schema and row counts."""
+        tables = workspace.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = 'main' ORDER BY table_name"
+        ).fetchall()
+        results = []
+        for (tname,) in tables:
+            row_count = workspace.execute(f'SELECT COUNT(*) FROM "{tname}"').fetchone()[0]
+            results.append({
+                "name": tname,
+                "row_count": int(row_count),
+                "columns": _workspace_columns(tname),
+            })
+        return {"results": results}
+
+    @mcp.tool(
+        name="export_result",
+        description=(
+            "Write a named workspace result to a file for a durable artifact. "
+            "Supported formats: csv, json, parquet. `path` is an absolute or relative file "
+            "path; parent directories are created automatically."
+        ),
+    )
+    def _export_result(name: str, format: str, path: str) -> dict:
+        """Export workspace table *name* to *path* in *format* via DuckDB COPY."""
+        _validate_name(name)
+        fmt = format.lower().strip()
+        copy_opts = {
+            "parquet": "(FORMAT PARQUET)",
+            "csv": "(FORMAT CSV, HEADER)",
+            "json": "(FORMAT JSON)",
+        }
+        if fmt not in copy_opts:
+            raise ValueError(f"Unsupported format {fmt!r}. Choose csv, json, or parquet.")
+
+        abs_path = os.path.abspath(path)
+        parent = os.path.dirname(abs_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        # DuckDB accepts forward slashes on Windows; escape any literal quotes.
+        safe_path = abs_path.replace("\\", "/").replace("'", "''")
+        workspace.execute(f'COPY "{name}" TO \'{safe_path}\' {copy_opts[fmt]}')
+        row_count = workspace.execute(f'SELECT COUNT(*) FROM "{name}"').fetchone()[0]
+        return {
+            "path": abs_path,
+            "format": fmt,
+            "name": name,
+            "row_count": int(row_count),
+        }
+
     return mcp
 
 
@@ -366,10 +568,18 @@ def main() -> None:
         required=True,
         help="SQLAlchemy DSN, e.g. sqlite:///path/to.db",
     )
+    parser.add_argument(
+        "--session-dir",
+        default=None,
+        help=(
+            "Directory for a durable session workspace (workspace.duckdb holding named "
+            "results that survive restarts). Omit for an ephemeral in-memory workspace."
+        ),
+    )
     args = parser.parse_args()
 
     engine = connect(args.dsn)
-    server = build_server(engine)
+    server = build_server(engine, session_dir=args.session_dir)
     server.run(transport="stdio")
 
 
