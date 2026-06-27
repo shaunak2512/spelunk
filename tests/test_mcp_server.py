@@ -173,6 +173,63 @@ class TestRunQueryTool:
 
 
 # --------------------------------------------------------------------------- #
+# describe_query tool
+# --------------------------------------------------------------------------- #
+
+class TestDescribeQueryTool:
+    """describe_query returns per-column stats with correct field names."""
+
+    def test_numeric_column_has_non_null_count(self, mcp_server):
+        result = _run(mcp_server.call_tool("describe_query", {"sql": "SELECT amount FROM orders"}))
+        data = result.structured_content
+        assert "non_null_count" in data["columns"]["amount"], (
+            f"Expected 'non_null_count' key in numeric column stats, got: {data['columns']['amount'].keys()}"
+        )
+
+    def test_numeric_column_has_no_bare_count(self, mcp_server):
+        result = _run(mcp_server.call_tool("describe_query", {"sql": "SELECT amount FROM orders"}))
+        data = result.structured_content
+        assert "count" not in data["columns"]["amount"], (
+            "Key 'count' should be renamed to 'non_null_count'"
+        )
+
+    def test_numeric_column_has_std(self, mcp_server):
+        result = _run(mcp_server.call_tool("describe_query", {"sql": "SELECT amount FROM orders"}))
+        data = result.structured_content
+        assert "std" in data["columns"]["amount"], (
+            f"Expected 'std' in numeric column stats, got: {data['columns']['amount'].keys()}"
+        )
+        assert data["columns"]["amount"]["std"] is not None
+
+    def test_text_column_has_non_null_count(self, mcp_server):
+        result = _run(mcp_server.call_tool("describe_query", {"sql": "SELECT status FROM orders"}))
+        data = result.structured_content
+        assert "non_null_count" in data["columns"]["status"], (
+            f"Expected 'non_null_count' key in text column stats, got: {data['columns']['status'].keys()}"
+        )
+
+    def test_text_column_has_no_bare_count(self, mcp_server):
+        result = _run(mcp_server.call_tool("describe_query", {"sql": "SELECT status FROM orders"}))
+        data = result.structured_content
+        assert "count" not in data["columns"]["status"], (
+            "Key 'count' should be renamed to 'non_null_count'"
+        )
+
+    def test_row_count_matches_expected(self, mcp_server):
+        result = _run(mcp_server.call_tool("describe_query", {"sql": "SELECT amount FROM orders"}))
+        data = result.structured_content
+        assert data["row_count"] == 3, f"Expected 3 rows, got: {data['row_count']}"
+
+    def test_non_null_count_excludes_nulls(self, mcp_server):
+        # city has one NULL (Grace has no city); non_null_count should be 2
+        result = _run(mcp_server.call_tool("describe_query", {"sql": "SELECT city FROM customers"}))
+        data = result.structured_content
+        assert data["columns"]["city"]["non_null_count"] == 2, (
+            f"Expected non_null_count=2 for city (one NULL), got: {data['columns']['city']}"
+        )
+
+
+# --------------------------------------------------------------------------- #
 # build_server contract
 # --------------------------------------------------------------------------- #
 
@@ -190,7 +247,9 @@ class TestBuildServerContract:
         resources = _run(mcp_server.list_resources())
         templates = _run(mcp_server.list_resource_templates())
         tool_names = {t.name for t in tools}
-        assert tool_names == {"run_query", "export_query"}, f"Unexpected tools: {tool_names}"
+        assert tool_names == {"run_query", "export_query", "describe_query"}, (
+            f"Unexpected tools: {tool_names}"
+        )
         assert len(resources) == 1, f"Expected 1 resource, got: {[str(r.uri) for r in resources]}"
         assert len(templates) == 1, f"Expected 1 template, got: {[t.uri_template for t in templates]}"
 
@@ -201,5 +260,5 @@ class TestBuildServerContract:
         s2 = build_server(engine)
         tools1 = _run(s1.list_tools())
         tools2 = _run(s2.list_tools())
-        assert len(tools1) == 2
-        assert len(tools2) == 2
+        assert len(tools1) == 3
+        assert len(tools2) == 3
