@@ -189,7 +189,8 @@ class TestBuildServerContract:
         tools = _run(mcp_server.list_tools())
         resources = _run(mcp_server.list_resources())
         templates = _run(mcp_server.list_resource_templates())
-        assert len(tools) == 1, f"Expected 1 tool, got: {[t.name for t in tools]}"
+        tool_names = {t.name for t in tools}
+        assert tool_names == {"run_query", "export_query"}, f"Unexpected tools: {tool_names}"
         assert len(resources) == 1, f"Expected 1 resource, got: {[str(r.uri) for r in resources]}"
         assert len(templates) == 1, f"Expected 1 template, got: {[t.uri_template for t in templates]}"
 
@@ -200,5 +201,5 @@ class TestBuildServerContract:
         s2 = build_server(engine)
         tools1 = _run(s1.list_tools())
         tools2 = _run(s2.list_tools())
-        assert len(tools1) == 1
-        assert len(tools2) == 1
+        assert len(tools1) == 2
+        assert len(tools2) == 2

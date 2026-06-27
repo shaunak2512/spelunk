@@ -8,8 +8,10 @@ No model, no loop — Claude Code is the agent.
 from __future__ import annotations
 
 import json
+import os
 from typing import TYPE_CHECKING
 
+import pandas as pd
 from fastmcp import FastMCP
 
 from spelunk.core.introspect import describe, list_objects
@@ -48,10 +50,14 @@ def build_server(engine: "Engine") -> FastMCP:
             "- `db://{table}` — describe a single table by name: columns with types and nullability, "
             "primary key, foreign-key relationships, a few sample rows, and per-column value profiles. "
             "Use this to understand schema details before writing SQL.\n\n"
-            "## Tool\n"
+            "## Tools\n"
             "- `run_query(sql)` — execute a read-only SELECT query and get back rows as a list of dicts. "
             "Results are capped at 1 000 rows. Writes (INSERT/UPDATE/DELETE/DDL/PRAGMA writes) are "
-            "blocked at the AST level and will raise an error.\n\n"
+            "blocked at the AST level and will raise an error.\n"
+            "- `export_query(sql, format, path, timeout_s?)` — run a query with no row cap and write "
+            "the full result to a file. Supported formats: `csv`, `json`, `parquet` (parquet requires "
+            "pyarrow). `path` is an absolute or relative file path; parent directories are created "
+            "automatically. Default timeout is 300 s.\n\n"
             "## Recommended workflow\n"
             "1. Read `db://tables` to discover what tables exist.\n"
             "2. Read `db://{table}` for each table relevant to the question — pay attention to "
@@ -61,7 +67,7 @@ def build_server(engine: "Engine") -> FastMCP:
             "sample rows from step 2 and adjust.\n\n"
             "## Constraints\n"
             "- All queries must be read-only SELECT statements (CTEs are fine).\n"
-            "- Row limit is 1 000 per query; use `WHERE`, `LIMIT`, or aggregation to stay within it.\n"
+            "- `run_query` is capped at 1 000 rows; use `export_query` for full result sets.\n"
             f"- The connected database is {dialect_label} — write SQL in its dialect."
         ),
     )
@@ -103,6 +109,48 @@ def build_server(engine: "Engine") -> FastMCP:
         """Execute *sql* and return a QueryResult-shaped dict."""
         result = run_sql(engine, sql)
         return result.model_dump()
+
+    # ------------------------------------------------------------------ #
+    # Tool: export a query to a file (no row cap, extended timeout)
+    # ------------------------------------------------------------------ #
+    @mcp.tool(
+        name="export_query",
+        description=(
+            "Execute a read-only SQL query and export the full result set to a file. "
+            "No row limit is enforced — use this for large result sets. "
+            "Supported formats: csv, json, parquet (parquet requires pyarrow). "
+            "Parent directories are created automatically. "
+            "Writes (INSERT/UPDATE/DELETE/DDL) are rejected."
+        ),
+    )
+    def _export_query(sql: str, format: str, path: str, timeout_s: int = 300) -> dict:
+        """Run *sql* and write all rows to *path* in *format* (csv/json/parquet)."""
+        fmt = format.lower().strip()
+        if fmt not in ("csv", "json", "parquet"):
+            raise ValueError(f"Unsupported format {fmt!r}. Choose csv, json, or parquet.")
+
+        result = run_sql(engine, sql, max_rows=None, timeout_s=timeout_s)
+        df = pd.DataFrame(result.rows, columns=result.columns)
+
+        abs_path = os.path.abspath(path)
+        parent = os.path.dirname(abs_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+        if fmt == "csv":
+            df.to_csv(abs_path, index=False)
+        elif fmt == "json":
+            df.to_json(abs_path, orient="records", indent=2, force_ascii=False)
+        elif fmt == "parquet":
+            df.to_parquet(abs_path, index=False)
+
+        return {
+            "path": abs_path,
+            "format": fmt,
+            "row_count": result.row_count,
+            "columns": result.columns,
+            "elapsed_s": round(result.elapsed_s, 3),
+        }
 
     return mcp
 
