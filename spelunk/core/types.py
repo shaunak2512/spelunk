@@ -48,6 +48,14 @@ class TableInfo(BaseModel):
     comment: str | None = None
 
 
+class IndexInfo(BaseModel):
+    """One index on a table."""
+
+    name: str | None = None
+    unique: bool = False
+    columns: list[str] = Field(default_factory=list)
+
+
 class TableDescription(BaseModel):
     """The 'cat' of a table: schema + relationships + a sample, optionally profiled."""
 
@@ -55,6 +63,7 @@ class TableDescription(BaseModel):
     columns: list[ColumnInfo]
     primary_key: list[str] = Field(default_factory=list)
     foreign_keys: list[ForeignKey] = Field(default_factory=list)
+    indexes: list[IndexInfo] = Field(default_factory=list)
     sample_rows: list[dict[str, Any]] = Field(default_factory=list)
     profile: list[ColumnProfile] = Field(default_factory=list)
     row_count: int | None = None

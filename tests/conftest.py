@@ -27,6 +27,8 @@ def sample_db(tmp_path) -> str:
             status      TEXT,
             FOREIGN KEY (customer_id) REFERENCES customers(id)
         );
+        CREATE INDEX idx_orders_customer_id ON orders (customer_id);
+        CREATE UNIQUE INDEX idx_customers_city ON customers (city);
         """
     )
     con.executemany(

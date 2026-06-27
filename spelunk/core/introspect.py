@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any
 import sqlalchemy as sa
 from sqlalchemy import inspect, text
 
-from .types import ColumnInfo, ColumnProfile, ForeignKey, TableDescription, TableInfo
+from .types import ColumnInfo, ColumnProfile, ForeignKey, IndexInfo, TableDescription, TableInfo
 
 if TYPE_CHECKING:
     from sqlalchemy.engine import Engine
@@ -54,6 +54,16 @@ def describe(engine: "Engine", table: str, *, profile: bool = True) -> TableDesc
                 comment=col.get("comment"),
             )
         )
+
+    # -- Indexes ----------------------------------------------------------------
+    indexes: list[IndexInfo] = [
+        IndexInfo(
+            name=idx.get("name"),
+            unique=bool(idx.get("unique", False)),
+            columns=idx.get("column_names", []),
+        )
+        for idx in inspector.get_indexes(table)
+    ]
 
     # -- Foreign keys -----------------------------------------------------------
     raw_fks = inspector.get_foreign_keys(table)
@@ -134,6 +144,7 @@ def describe(engine: "Engine", table: str, *, profile: bool = True) -> TableDesc
         columns=columns,
         primary_key=pk_cols,
         foreign_keys=foreign_keys,
+        indexes=indexes,
         sample_rows=sample_rows,
         profile=profile_list,
         row_count=row_count,
