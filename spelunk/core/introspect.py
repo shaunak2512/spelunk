@@ -15,15 +15,21 @@ if TYPE_CHECKING:
 def list_objects(engine: "Engine") -> list[TableInfo]:
     """List tables and views (the 'files'). Use a SQLAlchemy ``Inspector``.
 
-    ``row_count`` may be left ``None`` (a cheap listing) or filled if trivially available.
+    Tables get a ``row_count`` from a single-connection COUNT sweep; views are left ``None``
+    because view queries can be arbitrarily expensive.
     """
     inspector = inspect(engine)
+    table_names = inspector.get_table_names()
+    view_names = inspector.get_view_names()
+
     result: list[TableInfo] = []
+    with engine.connect() as conn:
+        for name in table_names:
+            tbl = sa.table(name)
+            count: int = conn.execute(sa.select(sa.func.count()).select_from(tbl)).scalar() or 0
+            result.append(TableInfo(name=name, kind="table", row_count=count))
 
-    for name in inspector.get_table_names():
-        result.append(TableInfo(name=name, kind="table"))
-
-    for name in inspector.get_view_names():
+    for name in view_names:
         result.append(TableInfo(name=name, kind="view"))
 
     return result

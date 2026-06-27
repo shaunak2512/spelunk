@@ -7,8 +7,10 @@ from spelunk.core.introspect import describe, list_objects
 
 def test_list_objects_finds_tables(sample_db):
     engine = connect(sample_db)
-    names = {t.name for t in list_objects(engine)}
-    assert {"customers", "orders"} <= names
+    tables = {t.name: t for t in list_objects(engine)}
+    assert {"customers", "orders"} <= tables.keys()
+    assert tables["customers"].row_count == 3
+    assert tables["orders"].row_count == 3
 
 
 def test_describe_columns_and_fk(sample_db):
