@@ -10,8 +10,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 from sqlalchemy import text as _sa_text
 
@@ -93,12 +95,15 @@ _DIALECT_LABELS = {
 # the LLM addresses results by NAME, never by filesystem path.
 _NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
 
+# Schemas the workspace must never create tables in or drop — DuckDB's own.
+_RESERVED_SCHEMAS = frozenset({"main", "information_schema", "pg_catalog", "system", "temp"})
 
-def _validate_name(name: str) -> str:
+
+def _validate_name(name: str, kind: str = "result name") -> str:
     """Raise ValueError unless *name* is a safe SQL identifier; return it otherwise."""
     if not _NAME_RE.match(name or ""):
         raise ValueError(
-            f"Invalid result name {name!r}. Use a SQL identifier: letters, digits, "
+            f"Invalid {kind} {name!r}. Use a SQL identifier: letters, digits, "
             "and underscores, starting with a letter or underscore (max 63 chars)."
         )
     return name
@@ -134,6 +139,17 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
     else:
         workspace = duckdb.connect()
 
+    # Each flow is a DuckDB schema, so parallel pipelines can't collide on names
+    # and a whole pipeline tears down with one DROP SCHEMA. The default flow is the
+    # schema "default"; ensure it exists up front so list_flows always shows it.
+    default_flow = "default"
+    workspace.execute(f'CREATE SCHEMA IF NOT EXISTS "{default_flow}"')
+
+    # A single DuckDBPyConnection isn't safe for concurrent use, so serialize every
+    # workspace touch. The slow part — source-DB pulls in save_result — happens
+    # OUTSIDE this lock, so parallel flows still overlap where it actually matters.
+    ws_lock = threading.Lock()
+
     mcp = FastMCP(
         "spelunk",
         instructions=(
@@ -163,20 +179,48 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
             "## Session workspace (named results)\n"
             "A local DuckDB workspace lets you cache results from the source database "
             "under a name and then query, join, and transform them locally — without "
-            "re-hitting the source DB. Results are addressed by NAME, never by file path.\n"
-            "- `save_result(sql, name)` — run a SELECT against the SOURCE database (no row "
-            "cap) and store the full result in the workspace as table `name`. Use this to "
-            "pull a slice once and reuse it.\n"
-            "- `query_results(sql)` — run DuckDB SQL over the saved results (e.g. "
-            "`SELECT * FROM orders JOIN customers USING (cust_id)`). Read-only, capped at "
-            "1000 rows.\n"
-            "- `save_result_from(sql, name)` — run DuckDB SQL over the saved results and "
-            "store the output under a new `name`. This is how you build step-by-step: each "
-            "result feeds the next.\n"
-            "- `list_results()` — list saved results with their columns, types, and row "
-            "counts so you know what you can build on.\n"
-            "- `export_result(name, format, path)` — write a saved result to a file "
-            "(parquet/csv/json) when you want a durable artifact.\n\n"
+            "re-hitting the source DB. Results are addressed by NAME, never by file path.\n\n"
+            "Results live in a FLOW: an independent, named workspace (its own namespace). "
+            "Every workspace tool takes an optional `flow` (default `\"default\"`). Use one "
+            "flow per concurrent line of analysis so their results never collide — even when "
+            "they share the same result name. NOTE: a spelunk flow is just a result "
+            "namespace in this database; it is NOT an orchestration or control-flow "
+            "'pipeline'. If asked to run several analyses in parallel, give each its own "
+            "flow.\n\n"
+            "Worked example — pull once from the source, then query it locally in a flow:\n"
+            "  save_result('SELECT id, name FROM artist', 'art', flow='artists')\n"
+            "  query_results('SELECT COUNT(*) FROM art', flow='artists')\n\n"
+            "### Tools\n"
+            "- `save_result(sql, name, flow?)` — run a SELECT against the SOURCE database "
+            "(no row cap) and store the full result in the flow as table `name`. Use this "
+            "to pull a slice once and reuse it.\n"
+            "- `query_results(sql, flow?)` — run DuckDB SQL over the saved results in a flow "
+            "(e.g. `SELECT * FROM orders JOIN customers USING (cust_id)`). Reference results "
+            "by bare name. Read-only, capped at 1000 rows.\n"
+            "- `save_result_from(sql, name, flow?)` — run DuckDB SQL over the saved results "
+            "and store the output under a new `name` in the same flow. This is how you build "
+            "step-by-step: each result feeds the next.\n"
+            "- `list_results(flow?)` — list saved results in a flow with their columns, "
+            "types, and row counts so you know what you can build on.\n"
+            "- `export_result(name, format, path, flow?)` — write a saved result to a file "
+            "(parquet/csv/json) when you want a durable artifact.\n"
+            "- `drop_result(name, flow?)` — delete a single intermediate you no longer need.\n"
+            "- `drop_flow(flow)` — delete an entire flow (all its results) in one call.\n"
+            "- `list_flows()` — list active flows and how many results each holds.\n\n"
+            "### Running several analyses at once\n"
+            "Give each line of analysis its own `flow` so their intermediates stay separate. "
+            "Within a flow, `query_results` / `save_result_from` resolve bare result names "
+            "automatically. To combine results across flows, fully-qualify each name as "
+            "`\"<flow>\".\"<name>\"` — for example, joining a result from flow `q1` with one "
+            "from flow `q2`:\n"
+            "  query_results('SELECT * FROM \"q1\".\"loans\" a "
+            "JOIN \"q2\".\"loans\" b ON a.region = b.region')\n\n"
+            "### Lifecycle\n"
+            "Flows persist for the life of the server (and across restarts when a session "
+            "directory is configured), and remain available across turns until you remove "
+            "them. Use `list_flows()` to see what exists, `drop_result` to drop a single "
+            "intermediate, and `drop_flow` to tidy up an entire analysis when you're done "
+            "with it.\n\n"
             "## Recommended workflow\n"
             "1. Read `db://tables` to discover what tables exist.\n"
             "2. Read `db://{table}` for each table relevant to the question — pay attention to "
@@ -185,7 +229,13 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
             "4. Call `run_query` with your SQL. If the result is empty or unexpected, inspect the "
             "sample rows from step 2 and adjust.\n"
             "5. Call `describe_query` to profile the distribution of any result set — "
-            "use it instead of writing manual aggregation queries.\n\n"
+            "use it instead of writing manual aggregation queries.\n"
+            "6. For multi-step analysis — caching an expensive pull, combining several "
+            "source queries, or building intermediate results — switch to the session "
+            "workspace: `save_result` to cache a source query, then `query_results` / "
+            "`save_result_from` to build on it locally without re-hitting the source. When "
+            "running several independent analyses at once, give each its own `flow` (see "
+            "the Session workspace section), and `drop_flow` to clean up when done.\n\n"
             "## Constraints\n"
             "- All queries must be read-only SELECT statements (CTEs are fine).\n"
             "- `run_query` is capped at 1 000 rows; use `export_query` for full result sets.\n"
@@ -400,14 +450,20 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
         }
 
     # ------------------------------------------------------------------ #
-    # Session workspace: named results cached in a local DuckDB file
+    # Session workspace: named results in a local DuckDB database.
+    # Each flow is a schema, so parallel pipelines stay isolated and tear
+    # down independently. Every workspace touch holds ws_lock.
     # ------------------------------------------------------------------ #
-    def _workspace_columns(name: str) -> list[dict[str, str]]:
-        """Return [{name, type}] for a workspace table, in declaration order."""
+    def _ensure_flow(flow: str) -> None:
+        """Create the flow's schema if absent (caller holds ws_lock)."""
+        workspace.execute(f'CREATE SCHEMA IF NOT EXISTS "{flow}"')
+
+    def _workspace_columns(name: str, flow: str) -> list[dict[str, str]]:
+        """Return [{name, type}] for a result in *flow* (caller holds ws_lock)."""
         rows = workspace.execute(
             "SELECT column_name, data_type FROM information_schema.columns "
-            "WHERE table_schema = 'main' AND table_name = ? ORDER BY ordinal_position",
-            [name],
+            "WHERE table_schema = ? AND table_name = ? ORDER BY ordinal_position",
+            [flow, name],
         ).fetchall()
         return [{"name": c, "type": t} for c, t in rows]
 
@@ -417,47 +473,63 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
             "Run a read-only SELECT against the SOURCE database (no row cap) and store the "
             "full result in the session workspace as a named table. Reuse it later with "
             "query_results / save_result_from without re-querying the source. "
-            "`name` must be a SQL identifier (letters, digits, underscores). "
-            "Replaces any existing result with the same name."
+            "`name` must be a SQL identifier. `flow` (default 'default') is an isolated "
+            "result namespace — give each concurrent line of analysis its own flow. "
+            "Replaces any existing result with the same name in that flow."
         ),
     )
-    def _save_result(sql: str, name: str) -> dict:
-        """Materialize a source-DB query into the workspace as table *name*."""
+    def _save_result(sql: str, name: str, flow: str = default_flow) -> dict:
+        """Materialize a source-DB query into *flow* as table *name*."""
         _validate_name(name)
-        # run_sql applies the read-only guard against the source dialect and pulls
-        # all rows (max_rows=None). Reuses the exact bridge export_query already uses.
+        _validate_name(flow, "flow name")
+        # run_sql applies the read-only guard and pulls all rows (max_rows=None).
+        # This source pull is the slow part and runs OUTSIDE the lock so parallel
+        # save_result calls overlap on the source DB.
         result = run_sql(engine, sql, max_rows=None)
         df = pd.DataFrame(result.rows, columns=result.columns)
-        workspace.register("_save_src", df)
-        try:
-            workspace.execute(f'CREATE OR REPLACE TABLE "{name}" AS SELECT * FROM _save_src')
-        finally:
-            workspace.unregister("_save_src")
+        tmp = f"_save_src_{uuid4().hex}"  # unique so concurrent saves never clobber
+        with ws_lock:
+            _ensure_flow(flow)
+            workspace.register(tmp, df)
+            try:
+                workspace.execute(
+                    f'CREATE OR REPLACE TABLE "{flow}"."{name}" AS SELECT * FROM {tmp}'
+                )
+            finally:
+                workspace.unregister(tmp)
+            columns = _workspace_columns(name, flow)
         return {
             "name": name,
+            "flow": flow,
             "row_count": result.row_count,
-            "columns": _workspace_columns(name),
+            "columns": columns,
             "elapsed_s": round(result.elapsed_s or 0.0, 3),
         }
 
     @mcp.tool(
         name="query_results",
         description=(
-            "Execute read-only DuckDB SQL over the named results in the session workspace "
-            "(reference them by name, e.g. `FROM my_result`). Use this to filter, join, or "
-            "aggregate cached results locally. Results are capped at 1000 rows — use "
-            "save_result_from or export_result for full output."
+            "Execute read-only DuckDB SQL over the named results in a flow (reference them "
+            "by bare name, e.g. `FROM my_result`). Use this to filter, join, or aggregate "
+            "cached results locally. `flow` (default 'default') selects the namespace; to "
+            "read another flow's result, qualify it as \"<flow>\".\"<name>\". "
+            "Results are capped at 1000 rows — use save_result_from or export_result for "
+            "full output."
         ),
     )
-    def _query_results(sql: str) -> dict:
-        """Run a read-only DuckDB query over the workspace and return rows."""
+    def _query_results(sql: str, flow: str = default_flow) -> dict:
+        """Run a read-only DuckDB query over *flow* and return rows."""
+        _validate_name(flow, "flow name")
         guard.assert_read_only(sql, "duckdb")
         sql2 = guard.enforce_limit(sql, "duckdb", 1000)
-        t0 = time.perf_counter()
-        cur = workspace.execute(sql2)
-        columns = [d[0] for d in cur.description] if cur.description else []
-        rows = [[_to_python(v) for v in row] for row in cur.fetchall()]
-        elapsed_s = time.perf_counter() - t0
+        with ws_lock:
+            _ensure_flow(flow)
+            workspace.execute(f"SET search_path = '{flow}'")
+            t0 = time.perf_counter()
+            cur = workspace.execute(sql2)
+            columns = [d[0] for d in cur.description] if cur.description else []
+            rows = [[_to_python(v) for v in row] for row in cur.fetchall()]
+            elapsed_s = time.perf_counter() - t0
         return {
             "columns": columns,
             "rows": rows,
@@ -470,60 +542,75 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
     @mcp.tool(
         name="save_result_from",
         description=(
-            "Run read-only DuckDB SQL over the named results in the session workspace and "
-            "store its full output (no row cap) under a new name. This is how you build "
-            "analyses step by step — each saved result can feed the next. "
-            "`name` must be a SQL identifier. Replaces any existing result with that name."
+            "Run read-only DuckDB SQL over the named results in a flow and store its full "
+            "output (no row cap) under a new name in that same flow. This is how you build "
+            "analyses step by step — each result feeds the next. `name`/`flow` must be SQL "
+            "identifiers. Replaces any existing result with that name in the flow."
         ),
     )
-    def _save_result_from(sql: str, name: str) -> dict:
-        """Materialize a workspace query under a new table *name*."""
+    def _save_result_from(sql: str, name: str, flow: str = default_flow) -> dict:
+        """Materialize a *flow* query under a new table *name* in the same flow."""
         _validate_name(name)
+        _validate_name(flow, "flow name")
         guard.assert_read_only(sql, "duckdb")
-        t0 = time.perf_counter()
-        workspace.execute(f'CREATE OR REPLACE TABLE "{name}" AS {sql}')
-        row_count = workspace.execute(f'SELECT COUNT(*) FROM "{name}"').fetchone()[0]
+        with ws_lock:
+            _ensure_flow(flow)
+            workspace.execute(f"SET search_path = '{flow}'")
+            t0 = time.perf_counter()
+            workspace.execute(f'CREATE OR REPLACE TABLE "{flow}"."{name}" AS {sql}')
+            row_count = workspace.execute(
+                f'SELECT COUNT(*) FROM "{flow}"."{name}"'
+            ).fetchone()[0]
+            columns = _workspace_columns(name, flow)
         return {
             "name": name,
+            "flow": flow,
             "row_count": int(row_count),
-            "columns": _workspace_columns(name),
+            "columns": columns,
             "elapsed_s": round(time.perf_counter() - t0, 3),
         }
 
     @mcp.tool(
         name="list_results",
         description=(
-            "List the named results currently in the session workspace, each with its "
-            "columns, types, and row count, so you know what you can query or build on."
+            "List the named results in a flow (default 'default'), each with its columns, "
+            "types, and row count, so you know what you can query or build on."
         ),
     )
-    def _list_results() -> dict:
-        """Return all workspace tables with schema and row counts."""
-        tables = workspace.execute(
-            "SELECT table_name FROM information_schema.tables "
-            "WHERE table_schema = 'main' ORDER BY table_name"
-        ).fetchall()
-        results = []
-        for (tname,) in tables:
-            row_count = workspace.execute(f'SELECT COUNT(*) FROM "{tname}"').fetchone()[0]
-            results.append({
-                "name": tname,
-                "row_count": int(row_count),
-                "columns": _workspace_columns(tname),
-            })
-        return {"results": results}
+    def _list_results(flow: str = default_flow) -> dict:
+        """Return all results in *flow* with schema and row counts."""
+        _validate_name(flow, "flow name")
+        with ws_lock:
+            _ensure_flow(flow)
+            tables = workspace.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = ? ORDER BY table_name",
+                [flow],
+            ).fetchall()
+            results = []
+            for (tname,) in tables:
+                row_count = workspace.execute(
+                    f'SELECT COUNT(*) FROM "{flow}"."{tname}"'
+                ).fetchone()[0]
+                results.append({
+                    "name": tname,
+                    "row_count": int(row_count),
+                    "columns": _workspace_columns(tname, flow),
+                })
+        return {"flow": flow, "results": results}
 
     @mcp.tool(
         name="export_result",
         description=(
-            "Write a named workspace result to a file for a durable artifact. "
+            "Write a named result from a flow to a file for a durable artifact. "
             "Supported formats: csv, json, parquet. `path` is an absolute or relative file "
             "path; parent directories are created automatically."
         ),
     )
-    def _export_result(name: str, format: str, path: str) -> dict:
-        """Export workspace table *name* to *path* in *format* via DuckDB COPY."""
+    def _export_result(name: str, format: str, path: str, flow: str = default_flow) -> dict:
+        """Export result *name* from *flow* to *path* in *format* via DuckDB COPY."""
         _validate_name(name)
+        _validate_name(flow, "flow name")
         fmt = format.lower().strip()
         copy_opts = {
             "parquet": "(FORMAT PARQUET)",
@@ -539,14 +626,85 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
             os.makedirs(parent, exist_ok=True)
         # DuckDB accepts forward slashes on Windows; escape any literal quotes.
         safe_path = abs_path.replace("\\", "/").replace("'", "''")
-        workspace.execute(f'COPY "{name}" TO \'{safe_path}\' {copy_opts[fmt]}')
-        row_count = workspace.execute(f'SELECT COUNT(*) FROM "{name}"').fetchone()[0]
+        with ws_lock:
+            workspace.execute(
+                f'COPY "{flow}"."{name}" TO \'{safe_path}\' {copy_opts[fmt]}'
+            )
+            row_count = workspace.execute(
+                f'SELECT COUNT(*) FROM "{flow}"."{name}"'
+            ).fetchone()[0]
         return {
             "path": abs_path,
             "format": fmt,
             "name": name,
+            "flow": flow,
             "row_count": int(row_count),
         }
+
+    @mcp.tool(
+        name="drop_result",
+        description=(
+            "Delete a single named result from a flow when you no longer need it. "
+            "No error if it doesn't exist. Returns whether a result was actually removed."
+        ),
+    )
+    def _drop_result(name: str, flow: str = default_flow) -> dict:
+        """Drop result *name* from *flow* (idempotent)."""
+        _validate_name(name)
+        _validate_name(flow, "flow name")
+        with ws_lock:
+            existed = workspace.execute(
+                "SELECT COUNT(*) FROM information_schema.tables "
+                "WHERE table_schema = ? AND table_name = ?",
+                [flow, name],
+            ).fetchone()[0] > 0
+            workspace.execute(f'DROP TABLE IF EXISTS "{flow}"."{name}"')
+        return {"name": name, "flow": flow, "dropped": bool(existed)}
+
+    @mcp.tool(
+        name="drop_flow",
+        description=(
+            "Delete an entire flow and every result in it in one call — use this to clean "
+            "up a finished analysis. Cannot drop DuckDB's reserved schemas."
+        ),
+    )
+    def _drop_flow(flow: str) -> dict:
+        """Drop the whole *flow* schema and its results (idempotent)."""
+        _validate_name(flow, "flow name")
+        if flow in _RESERVED_SCHEMAS:
+            raise ValueError(f"Cannot drop reserved schema {flow!r}.")
+        with ws_lock:
+            dropped = workspace.execute(
+                "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ?",
+                [flow],
+            ).fetchone()[0]
+            workspace.execute(f'DROP SCHEMA IF EXISTS "{flow}" CASCADE')
+        return {"flow": flow, "dropped_results": int(dropped)}
+
+    @mcp.tool(
+        name="list_flows",
+        description=(
+            "List the active flows in the workspace and how many results each holds. "
+            "Use this to see what flows exist and what can be cleaned up."
+        ),
+    )
+    def _list_flows() -> dict:
+        """Return every user flow (schema) with its result count."""
+        with ws_lock:
+            placeholders = ", ".join("?" for _ in _RESERVED_SCHEMAS)
+            schemas = workspace.execute(
+                "SELECT schema_name FROM information_schema.schemata "
+                f"WHERE schema_name NOT IN ({placeholders}) ORDER BY schema_name",
+                list(_RESERVED_SCHEMAS),
+            ).fetchall()
+            flows = []
+            for (sname,) in schemas:
+                count = workspace.execute(
+                    "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ?",
+                    [sname],
+                ).fetchone()[0]
+                flows.append({"flow": sname, "result_count": int(count)})
+        return {"flows": flows}
 
     return mcp
 

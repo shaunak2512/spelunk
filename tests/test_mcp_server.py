@@ -304,6 +304,78 @@ class TestSessionWorkspace:
         assert _os.path.exists(data["path"])
 
 
+class TestFlowsAndCleanup:
+    """Parallel-flow isolation and lifecycle (drop_result / drop_flow / list_flows)."""
+
+    def test_same_name_in_different_flows_isolated(self, mcp_server):
+        """Two flows using the same result name must not clobber each other."""
+        _run(mcp_server.call_tool("save_result", {
+            "sql": "SELECT * FROM customers WHERE city = 'London'",
+            "name": "step1", "flow": "flow_a"}))
+        _run(mcp_server.call_tool("save_result", {
+            "sql": "SELECT * FROM customers",
+            "name": "step1", "flow": "flow_b"}))
+        a = _run(mcp_server.call_tool(
+            "query_results", {"sql": "SELECT COUNT(*) FROM step1", "flow": "flow_a"}))
+        b = _run(mcp_server.call_tool(
+            "query_results", {"sql": "SELECT COUNT(*) FROM step1", "flow": "flow_b"}))
+        a_count = a.structured_content["rows"][0][0]
+        b_count = b.structured_content["rows"][0][0]
+        assert b_count == 3, f"flow_b/step1 should be all customers, got {b_count}"
+        assert a_count < b_count, "flow_a/step1 should be a strict subset; flows leaked"
+
+    def test_list_results_scoped_to_flow(self, mcp_server):
+        _run(mcp_server.call_tool("save_result", {
+            "sql": "SELECT * FROM customers", "name": "only_a", "flow": "flow_a"}))
+        listed = _run(mcp_server.call_tool("list_results", {"flow": "flow_b"}))
+        names = {r["name"] for r in listed.structured_content["results"]}
+        assert "only_a" not in names, "flow_b listing leaked flow_a's result"
+
+    def test_cross_flow_qualified_reference(self, mcp_server):
+        _run(mcp_server.call_tool("save_result", {
+            "sql": "SELECT * FROM customers", "name": "src", "flow": "flow_a"}))
+        # From flow_b, read flow_a's result by qualifying it.
+        out = _run(mcp_server.call_tool("query_results", {
+            "sql": 'SELECT COUNT(*) FROM "flow_a"."src"', "flow": "flow_b"}))
+        assert out.structured_content["rows"][0][0] == 3
+
+    def test_drop_result_removes_one(self, mcp_server):
+        _run(mcp_server.call_tool("save_result", {
+            "sql": "SELECT * FROM customers", "name": "tmp"}))
+        dropped = _run(mcp_server.call_tool("drop_result", {"name": "tmp"}))
+        assert dropped.structured_content["dropped"] is True
+        listed = _run(mcp_server.call_tool("list_results", {}))
+        names = {r["name"] for r in listed.structured_content["results"]}
+        assert "tmp" not in names
+
+    def test_drop_result_idempotent(self, mcp_server):
+        dropped = _run(mcp_server.call_tool("drop_result", {"name": "never_existed"}))
+        assert dropped.structured_content["dropped"] is False
+
+    def test_drop_flow_removes_all(self, mcp_server):
+        _run(mcp_server.call_tool("save_result", {
+            "sql": "SELECT * FROM customers", "name": "a", "flow": "doomed"}))
+        _run(mcp_server.call_tool("save_result", {
+            "sql": "SELECT * FROM orders", "name": "b", "flow": "doomed"}))
+        result = _run(mcp_server.call_tool("drop_flow", {"flow": "doomed"}))
+        assert result.structured_content["dropped_results"] == 2
+        flows = _run(mcp_server.call_tool("list_flows", {}))
+        names = {f["flow"] for f in flows.structured_content["flows"]}
+        assert "doomed" not in names
+
+    def test_drop_flow_rejects_reserved(self, mcp_server):
+        with pytest.raises(Exception):
+            _run(mcp_server.call_tool("drop_flow", {"flow": "main"}))
+
+    def test_list_flows_reports_counts(self, mcp_server):
+        _run(mcp_server.call_tool("save_result", {
+            "sql": "SELECT * FROM customers", "name": "x", "flow": "pipe1"}))
+        flows = {f["flow"]: f["result_count"]
+                 for f in _run(mcp_server.call_tool("list_flows", {})).structured_content["flows"]}
+        assert flows.get("pipe1") == 1
+        assert "information_schema" not in flows and "main" not in flows
+
+
 # --------------------------------------------------------------------------- #
 # build_server contract
 # --------------------------------------------------------------------------- #
@@ -326,6 +398,7 @@ class TestBuildServerContract:
             "run_query", "export_query", "describe_query",
             "save_result", "query_results", "save_result_from",
             "list_results", "export_result",
+            "drop_result", "drop_flow", "list_flows",
         }, f"Unexpected tools: {tool_names}"
         assert len(resources) == 1, f"Expected 1 resource, got: {[str(r.uri) for r in resources]}"
         assert len(templates) == 1, f"Expected 1 template, got: {[t.uri_template for t in templates]}"
@@ -337,5 +410,5 @@ class TestBuildServerContract:
         s2 = build_server(engine)
         tools1 = _run(s1.list_tools())
         tools2 = _run(s2.list_tools())
-        assert len(tools1) == 8
-        assert len(tools2) == 8
+        assert len(tools1) == 11
+        assert len(tools2) == 11
