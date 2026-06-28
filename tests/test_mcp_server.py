@@ -234,7 +234,7 @@ class TestDescribeQueryTool:
 # --------------------------------------------------------------------------- #
 
 class TestSessionWorkspace:
-    """extract -> list_results -> query_results -> transform -> export."""
+    """extract -> list_results -> peek -> transform -> export."""
 
     def test_extract_caches_source_query(self, mcp_server):
         result = _run(mcp_server.call_tool(
@@ -257,11 +257,11 @@ class TestSessionWorkspace:
         cust = next(r for r in data["results"] if r["name"] == "cust")
         assert cust["row_count"] == 3
 
-    def test_query_results_reads_named_table(self, mcp_server):
+    def test_peek_reads_named_table(self, mcp_server):
         _run(mcp_server.call_tool(
             "extract", {"sql": "SELECT * FROM customers", "name": "cust"}))
         result = _run(mcp_server.call_tool(
-            "query_results", {"sql": "SELECT name FROM cust ORDER BY id"}))
+            "peek", {"sql": "SELECT name FROM cust ORDER BY id"}))
         data = result.structured_content
         names = [row[0] for row in data["rows"]]
         assert names == ["Ada", "Linus", "Grace"]
@@ -277,33 +277,33 @@ class TestSessionWorkspace:
         assert data["name"] == "by_status"
         # query the derived result back
         check = _run(mcp_server.call_tool(
-            "query_results", {"sql": "SELECT SUM(n) FROM by_status"}))
+            "peek", {"sql": "SELECT SUM(n) FROM by_status"}))
         assert check.structured_content["rows"][0][0] == 3
 
-    def test_query_results_rejects_writes(self, mcp_server):
+    def test_peek_rejects_writes(self, mcp_server):
         _run(mcp_server.call_tool(
             "extract", {"sql": "SELECT * FROM customers", "name": "cust"}))
         with pytest.raises(Exception):
             _run(mcp_server.call_tool(
-                "query_results", {"sql": "DROP TABLE cust"}))
+                "peek", {"sql": "DROP TABLE cust"}))
 
-    def test_query_results_missing_result_names_available(self, mcp_server):
+    def test_peek_missing_result_names_available(self, mcp_server):
         """Referencing a non-existent result should surface what IS available."""
         _run(mcp_server.call_tool(
             "extract", {"sql": "SELECT * FROM customers", "name": "cust"}))
         with pytest.raises(Exception) as exc_info:
             _run(mcp_server.call_tool(
-                "query_results", {"sql": "SELECT * FROM nonexistent"}))
+                "peek", {"sql": "SELECT * FROM nonexistent"}))
         msg = str(exc_info.value)
         assert "cust" in msg or "available" in msg.lower() or "list_results" in msg
 
-    def test_query_results_response_includes_row_cap(self, mcp_server):
+    def test_peek_response_includes_row_cap(self, mcp_server):
         _run(mcp_server.call_tool(
             "extract", {"sql": "SELECT * FROM customers", "name": "cust"}))
         result = _run(mcp_server.call_tool(
-            "query_results", {"sql": "SELECT * FROM cust"}))
+            "peek", {"sql": "SELECT * FROM cust"}))
         data = result.structured_content
-        assert "row_cap" in data, f"Expected 'row_cap' in query_results response, got: {list(data.keys())}"
+        assert "row_cap" in data, f"Expected 'row_cap' in peek response, got: {list(data.keys())}"
         assert data["row_cap"] == 1000
 
     def test_invalid_name_rejected(self, mcp_server):
@@ -335,9 +335,9 @@ class TestFlowsAndCleanup:
             "sql": "SELECT * FROM customers",
             "name": "step1", "flow": "flow_b"}))
         a = _run(mcp_server.call_tool(
-            "query_results", {"sql": "SELECT COUNT(*) FROM step1", "flow": "flow_a"}))
+            "peek", {"sql": "SELECT COUNT(*) FROM step1", "flow": "flow_a"}))
         b = _run(mcp_server.call_tool(
-            "query_results", {"sql": "SELECT COUNT(*) FROM step1", "flow": "flow_b"}))
+            "peek", {"sql": "SELECT COUNT(*) FROM step1", "flow": "flow_b"}))
         a_count = a.structured_content["rows"][0][0]
         b_count = b.structured_content["rows"][0][0]
         assert b_count == 3, f"flow_b/step1 should be all customers, got {b_count}"
@@ -354,7 +354,7 @@ class TestFlowsAndCleanup:
         _run(mcp_server.call_tool("extract", {
             "sql": "SELECT * FROM customers", "name": "src", "flow": "flow_a"}))
         # From flow_b, read flow_a's result by qualifying it.
-        out = _run(mcp_server.call_tool("query_results", {
+        out = _run(mcp_server.call_tool("peek", {
             "sql": 'SELECT COUNT(*) FROM "flow_a"."src"', "flow": "flow_b"}))
         assert out.structured_content["rows"][0][0] == 3
 
@@ -415,7 +415,7 @@ class TestBuildServerContract:
         tool_names = {t.name for t in tools}
         assert tool_names == {
             "run_query", "export_query", "describe_query",
-            "extract", "query_results", "transform",
+            "extract", "peek", "transform",
             "list_results", "export_result",
             "drop_result", "drop_flow", "list_flows",
         }, f"Unexpected tools: {tool_names}"

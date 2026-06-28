@@ -116,7 +116,7 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
     - Resource  ``db://tables``        — lists all tables/views (wraps list_objects).
     - Template  ``db://{table}``       — describes one table (wraps describe).
     - Tool      ``run_query(sql)``     — executes a read-only SQL query (wraps run_sql).
-    - Tools     ``save_result`` / ``query_results`` / ``save_result_from`` /
+    - Tools     ``extract`` / ``transform`` / ``peek`` /
       ``list_results`` / ``export_result`` — a session-scoped DuckDB workspace for
       caching source-DB results under a name and querying/joining them locally.
 
@@ -192,12 +192,12 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
             "concurrent line of analysis its own flow.\n\n"
             "Worked example — pull once from the source, then query it locally in a flow:\n"
             "  extract('SELECT id, name FROM artist', 'art', flow='artists')\n"
-            "  query_results('SELECT COUNT(*) FROM art', flow='artists')\n\n"
+            "  peek('SELECT COUNT(*) FROM art', flow='artists')\n\n"
             "### Tools\n"
             "- `extract(sql, name, flow?)` — pull a SELECT from the SOURCE database "
             "(no row cap) into the flow as table `name`. Use this "
             "to pull a slice once and reuse it.\n"
-            "- `query_results(sql, flow?)` — inspect cached results (capped at 1000 rows). "
+            "- `peek(sql, flow?)` — inspect cached results (capped at 1000 rows). "
             "Use transform to compute over the full set without truncation. "
             "Sequential within a flow.\n"
             "- `transform(sql, name, flow?)` — materialize a query over cached results "
@@ -213,11 +213,11 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
             "### Running several analyses at once\n"
             "Give each line of analysis its own `flow` so their intermediates stay separate "
             "(see PARALLEL RULE above — steps within a flow are sequential). "
-            "Within a flow, `query_results` / `save_result_from` resolve bare result names "
+            "Within a flow, `peek` / `save_result_from` resolve bare result names "
             "automatically. To combine results across flows, fully-qualify each name as "
             "`\"<flow>\".\"<name>\"` — for example, joining a result from flow `q1` with one "
             "from flow `q2`:\n"
-            "  query_results('SELECT * FROM \"q1\".\"loans\" a "
+            "  peek('SELECT * FROM \"q1\".\"loans\" a "
             "JOIN \"q2\".\"loans\" b ON a.region = b.region')\n\n"
             "### Lifecycle\n"
             "Flows persist for the life of the server (and across restarts when a session "
@@ -236,7 +236,7 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
             "use it instead of writing manual aggregation queries.\n"
             "6. For multi-step analysis — caching an expensive pull, combining several "
             "source queries, or building intermediate results — switch to the session "
-            "workspace: `extract` to cache a source query, then `query_results` / "
+            "workspace: `extract` to cache a source query, then `peek` / "
             "`transform` to build on it locally without re-hitting the source. When "
             "running several independent analyses at once, give each its own `flow` (see "
             "the Session workspace section), and `drop_flow` to clean up when done.\n\n"
@@ -485,7 +485,7 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
         description=(
             "Run a read-only SELECT against the SOURCE database (no row cap) and store the "
             "full result in the session workspace as a named table. Reuse it later with "
-            "query_results / transform without re-querying the source. "
+            "peek / transform without re-querying the source. "
             "`name` must be a SQL identifier. `flow` (default 'default') is an isolated "
             "result namespace — give each concurrent line of analysis its own flow. "
             "Replaces any existing result with the same name in that flow."
@@ -520,7 +520,7 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
         }
 
     @mcp.tool(
-        name="query_results",
+        name="peek",
         description=(
             "Execute read-only DuckDB SQL over the named results in a flow. "
             "CAPPED AT 1000 ROWS — use transform to compute on the full set without "
@@ -530,7 +530,7 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
             "Calls within the same flow are sequential — use separate flows for parallel analysis."
         ),
     )
-    def _query_results(sql: str, flow: str = default_flow) -> dict:
+    def _peek(sql: str, flow: str = default_flow) -> dict:
         """Run a read-only DuckDB query over *flow* and return rows."""
         _validate_name(flow, "flow name")
         guard.assert_read_only(sql, "duckdb")
@@ -564,7 +564,7 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
         name="transform",
         description=(
             "Run read-only DuckDB SQL over the named results in a flow and store its full "
-            "output (NO row cap) under a new name in that same flow — unlike query_results, "
+            "output (NO row cap) under a new name in that same flow — unlike peek, "
             "which is capped at 1000 rows. This is how you build analyses step by step: "
             "each result feeds the next. `name`/`flow` must be SQL identifiers. "
             "Replaces any existing result with that name in the flow. "
