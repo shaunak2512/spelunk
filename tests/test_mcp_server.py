@@ -287,6 +287,25 @@ class TestSessionWorkspace:
             _run(mcp_server.call_tool(
                 "query_results", {"sql": "DROP TABLE cust"}))
 
+    def test_query_results_missing_result_names_available(self, mcp_server):
+        """Referencing a non-existent result should surface what IS available."""
+        _run(mcp_server.call_tool(
+            "save_result", {"sql": "SELECT * FROM customers", "name": "cust"}))
+        with pytest.raises(Exception) as exc_info:
+            _run(mcp_server.call_tool(
+                "query_results", {"sql": "SELECT * FROM nonexistent"}))
+        msg = str(exc_info.value)
+        assert "cust" in msg or "available" in msg.lower() or "list_results" in msg
+
+    def test_query_results_response_includes_row_cap(self, mcp_server):
+        _run(mcp_server.call_tool(
+            "save_result", {"sql": "SELECT * FROM customers", "name": "cust"}))
+        result = _run(mcp_server.call_tool(
+            "query_results", {"sql": "SELECT * FROM cust"}))
+        data = result.structured_content
+        assert "row_cap" in data, f"Expected 'row_cap' in query_results response, got: {list(data.keys())}"
+        assert data["row_cap"] == 1000
+
     def test_invalid_name_rejected(self, mcp_server):
         with pytest.raises(Exception):
             _run(mcp_server.call_tool(

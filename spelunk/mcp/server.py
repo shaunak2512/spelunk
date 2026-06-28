@@ -187,6 +187,9 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
             "namespace in this database; it is NOT an orchestration or control-flow "
             "'pipeline'. If asked to run several analyses in parallel, give each its own "
             "flow.\n\n"
+            "PARALLEL RULE: calls within the same flow are sequential (single DuckDB "
+            "connection). Calls across different flows are parallel-safe. Give each "
+            "concurrent line of analysis its own flow.\n\n"
             "Worked example — pull once from the source, then query it locally in a flow:\n"
             "  save_result('SELECT id, name FROM artist', 'art', flow='artists')\n"
             "  query_results('SELECT COUNT(*) FROM art', flow='artists')\n\n"
@@ -194,12 +197,12 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
             "- `save_result(sql, name, flow?)` — run a SELECT against the SOURCE database "
             "(no row cap) and store the full result in the flow as table `name`. Use this "
             "to pull a slice once and reuse it.\n"
-            "- `query_results(sql, flow?)` — run DuckDB SQL over the saved results in a flow "
-            "(e.g. `SELECT * FROM orders JOIN customers USING (cust_id)`). Reference results "
-            "by bare name. Read-only, capped at 1000 rows.\n"
-            "- `save_result_from(sql, name, flow?)` — run DuckDB SQL over the saved results "
-            "and store the output under a new `name` in the same flow. This is how you build "
-            "step-by-step: each result feeds the next.\n"
+            "- `query_results(sql, flow?)` — inspect cached results (capped at 1000 rows). "
+            "Use save_result_from to compute over the full set without truncation. "
+            "Sequential within a flow.\n"
+            "- `save_result_from(sql, name, flow?)` — materialize a query over cached results "
+            "as a new named table (no row cap). Build step-by-step: each result feeds the next. "
+            "Sequential within a flow.\n"
             "- `list_results(flow?)` — list saved results in a flow with their columns, "
             "types, and row counts so you know what you can build on.\n"
             "- `export_result(name, format, path, flow?)` — write a saved result to a file "
@@ -208,7 +211,8 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
             "- `drop_flow(flow)` — delete an entire flow (all its results) in one call.\n"
             "- `list_flows()` — list active flows and how many results each holds.\n\n"
             "### Running several analyses at once\n"
-            "Give each line of analysis its own `flow` so their intermediates stay separate. "
+            "Give each line of analysis its own `flow` so their intermediates stay separate "
+            "(see PARALLEL RULE above — steps within a flow are sequential). "
             "Within a flow, `query_results` / `save_result_from` resolve bare result names "
             "automatically. To combine results across flows, fully-qualify each name as "
             "`\"<flow>\".\"<name>\"` — for example, joining a result from flow `q1` with one "
@@ -467,6 +471,15 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
         ).fetchall()
         return [{"name": c, "type": t} for c, t in rows]
 
+    def _flow_result_names(flow: str) -> list[str]:
+        """Return all result names in *flow* (caller holds ws_lock)."""
+        rows = workspace.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = ? ORDER BY table_name",
+            [flow],
+        ).fetchall()
+        return [r[0] for r in rows]
+
     @mcp.tool(
         name="save_result",
         description=(
@@ -509,12 +522,12 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
     @mcp.tool(
         name="query_results",
         description=(
-            "Execute read-only DuckDB SQL over the named results in a flow (reference them "
-            "by bare name, e.g. `FROM my_result`). Use this to filter, join, or aggregate "
-            "cached results locally. `flow` (default 'default') selects the namespace; to "
-            "read another flow's result, qualify it as \"<flow>\".\"<name>\". "
-            "Results are capped at 1000 rows — use save_result_from or export_result for "
-            "full output."
+            "Execute read-only DuckDB SQL over the named results in a flow. "
+            "CAPPED AT 1000 ROWS — use save_result_from to compute on the full set without "
+            "truncation, or export_result to write it to a file. "
+            "Reference results by bare name (e.g. `FROM my_result`), or qualify across "
+            "flows as \"<flow>\".\"<name>\". `flow` (default 'default') selects the namespace. "
+            "Calls within the same flow are sequential — use separate flows for parallel analysis."
         ),
     )
     def _query_results(sql: str, flow: str = default_flow) -> dict:
@@ -526,7 +539,14 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
             _ensure_flow(flow)
             workspace.execute(f"SET search_path = '{flow}'")
             t0 = time.perf_counter()
-            cur = workspace.execute(sql2)
+            try:
+                cur = workspace.execute(sql2)
+            except duckdb.CatalogException as exc:
+                available = _flow_result_names(flow)
+                raise ValueError(
+                    f"{exc}\nFlow {flow!r} contains: {available or ['(none)']}. "
+                    f"Call list_results(flow={flow!r}) to see saved results."
+                ) from exc
             columns = [d[0] for d in cur.description] if cur.description else []
             rows = [[_to_python(v) for v in row] for row in cur.fetchall()]
             elapsed_s = time.perf_counter() - t0
@@ -534,6 +554,7 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
             "columns": columns,
             "rows": rows,
             "row_count": len(rows),
+            "row_cap": 1000,
             "truncated": len(rows) == 1000,
             "elapsed_s": round(elapsed_s, 3),
             "sql_executed": sql2,
@@ -543,9 +564,11 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
         name="save_result_from",
         description=(
             "Run read-only DuckDB SQL over the named results in a flow and store its full "
-            "output (no row cap) under a new name in that same flow. This is how you build "
-            "analyses step by step — each result feeds the next. `name`/`flow` must be SQL "
-            "identifiers. Replaces any existing result with that name in the flow."
+            "output (NO row cap) under a new name in that same flow — unlike query_results, "
+            "which is capped at 1000 rows. This is how you build analyses step by step: "
+            "each result feeds the next. `name`/`flow` must be SQL identifiers. "
+            "Replaces any existing result with that name in the flow. "
+            "Calls within the same flow are sequential — use separate flows for parallel analysis."
         ),
     )
     def _save_result_from(sql: str, name: str, flow: str = default_flow) -> dict:
@@ -557,7 +580,14 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
             _ensure_flow(flow)
             workspace.execute(f"SET search_path = '{flow}'")
             t0 = time.perf_counter()
-            workspace.execute(f'CREATE OR REPLACE TABLE "{flow}"."{name}" AS {sql}')
+            try:
+                workspace.execute(f'CREATE OR REPLACE TABLE "{flow}"."{name}" AS {sql}')
+            except duckdb.CatalogException as exc:
+                available = _flow_result_names(flow)
+                raise ValueError(
+                    f"{exc}\nFlow {flow!r} contains: {available or ['(none)']}. "
+                    f"Call list_results(flow={flow!r}) to see saved results."
+                ) from exc
             row_count = workspace.execute(
                 f'SELECT COUNT(*) FROM "{flow}"."{name}"'
             ).fetchone()[0]
