@@ -51,7 +51,11 @@ spelunk/rag/
   schema_index.py    # numpy cosine retrieval — top-k tables for a question (no vector DB)
 
 spelunk/mcp/
-  server.py          # FastMCP: resources + run_query tool (optional extra)
+  server.py          # FastMCP: resources + run_query + DuckDB session workspace
+                     #   build_server(engine, session_dir?) — optional durable workspace
+                     #   Workspace tools: extract / peek / transform / list_results /
+                     #     export_result / drop_result / drop_flow / list_flows
+                     #   Each flow is a DuckDB schema; flows isolate parallel analyses
 
 spelunk/eval/        # Benchmark pipeline — everything is built against frozen schemas
   schemas.py         # FROZEN: BirdQuestion, RunResult, RESULTS_CSV_COLUMNS
@@ -114,6 +118,25 @@ After any feature implementation or module completion:
    ```
 5. **Do not merge or push** — the orchestrator handles barrier merges.
 
+## MCP session workspace
+
+The MCP server exposes a flow-based DuckDB workspace that lets agents cache source-DB results locally and build multi-step analyses without re-hitting the source database.
+
+**Key concepts:**
+- A *flow* is an isolated DuckDB schema (default name `"default"`). Give each concurrent line of analysis its own flow to prevent name collisions.
+- Calls within the same flow are serialized (single DuckDB connection). Calls across different flows are parallel-safe.
+- A *durable* workspace persists `workspace.duckdb` in `--session-dir`; omitting `--session-dir` gives an ephemeral in-memory workspace.
+- `.spelunk_session/` is gitignored (holds the durable workspace file).
+
+**Workspace tools:** `extract` (pull from source DB → named table), `peek` (read-only query, capped 1000 rows), `transform` (materialize a DuckDB query as a new table, uncapped), `list_results`, `export_result` (write parquet/csv/json), `drop_result`, `drop_flow`, `list_flows`.
+
+**Starting the server with a durable workspace:**
+```powershell
+python -m spelunk.mcp.server --dsn sqlite:///path/to.db --session-dir .spelunk_session
+```
+
+A `.mcp.json` in the repo root wires Claude Code to a local SQLite DB with session persistence (path is machine-specific; edit before use).
+
 ## Current state
 
-All waves 0–3 are merged to `main`. The remaining deferred items (end-to-end smoke run, README writeup) require API keys in `.env` and actual run results. See TASKS.md for the open action item on model prices.
+All waves 0–3 are merged to `main`. The `feature/duckdb_pipeline` branch adds the DuckDB session workspace to the MCP server. The remaining deferred items (end-to-end smoke run, README writeup) require API keys in `.env` and actual run results. See TASKS.md for the open action item on model prices.
