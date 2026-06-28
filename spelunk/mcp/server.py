@@ -15,6 +15,9 @@ import time
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
+import sqlglot
+from sqlglot import exp
+from sqlglot.errors import SqlglotError
 from sqlalchemy import text as _sa_text
 
 import pandas as pd
@@ -109,6 +112,47 @@ def _validate_name(name: str, kind: str = "result name") -> str:
     return name
 
 
+# Runtime-nudge thresholds for run_query. Kept conservative so a hint fires only
+# when a flow genuinely pays off — over-firing trains the agent to ignore them, the
+# exact failure mode these nudges exist to fix.
+_SLOW_QUERY_S = 2.0   # a source pull slower than this is worth caching if reused
+_REPEAT_HINT_AT = 3   # Nth query of the same source table-set triggers a flow nudge
+_SAMPLE_ROWS = 5      # head-sample size returned by extract / transform
+
+
+def _source_tables(sql: str, dialect: str) -> frozenset[str]:
+    """Return the set of base table names referenced in *sql* (lowercased).
+
+    Used to detect when the agent re-queries the same source repeatedly. Returns an
+    empty set on unparseable SQL — better no nudge than a wrong one.
+    """
+    try:
+        tree = sqlglot.parse_one(sql, read=dialect)
+    except SqlglotError:
+        return frozenset()
+    return frozenset(t.name.lower() for t in tree.find_all(exp.Table) if t.name)
+
+
+def _is_summary_aggregate(sql: str, dialect: str) -> bool:
+    """True if *sql* computes summary aggregates over one table with no GROUP BY.
+
+    That is exactly what describe_query does in a single call, so it's the clearest
+    case for nudging describe_query. Frequency tables (GROUP BY) are left alone —
+    those are a legitimate run_query use.
+    """
+    try:
+        tree = sqlglot.parse_one(sql, read=dialect)
+    except SqlglotError:
+        return False
+    if not isinstance(tree, exp.Select):
+        return False
+    if len(list(tree.find_all(exp.Table))) != 1:
+        return False
+    if tree.args.get("group") is not None:
+        return False
+    return tree.find(exp.AggFunc) is not None
+
+
 def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
     """Build and return a FastMCP instance wired to *engine*.
 
@@ -150,6 +194,11 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
     # OUTSIDE this lock, so parallel flows still overlap where it actually matters.
     ws_lock = threading.Lock()
 
+    # run_query nudge state: count queries per source table-set to spot the
+    # antipattern of re-pulling the same source instead of caching it in a flow.
+    run_query_lock = threading.Lock()
+    source_hits: dict[frozenset[str], int] = {}
+
     mcp = FastMCP(
         "spelunk",
         instructions=(
@@ -176,6 +225,22 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
             "Text/object columns return non_null_count, null_rate, unique, "
             "top (most-frequent value), freq (its count). "
             "Use this instead of writing manual aggregation queries.\n\n"
+            "## Choosing a tool\n"
+            "- One-off look, or a quick query against a fast database → `run_query`. "
+            "Do NOT reach for flows when the source responds quickly and you won't "
+            "reuse the result; the staging overhead isn't worth it. The cheap path is "
+            "the right path here.\n"
+            "- Switch to a FLOW (`extract`, then `peek` / `transform`) when ANY of these hold:\n"
+            "  - the source pull is slow or expensive AND you'll query that slice more than once;\n"
+            "  - you need the FULL result set (`run_query` caps at 1000 rows);\n"
+            "  - you're chaining two or more derivations (filter → aggregate → join), each "
+            "step building on the last;\n"
+            "  - you're combining several source queries together locally.\n"
+            "  `extract` and `transform` return a head sample, so caching costs one call and "
+            "you still see your data immediately; `name` is optional (auto-assigned if omitted). "
+            "Caching once and querying locally beats re-issuing the same source query.\n"
+            "- Column distributions / summary stats (min/max/mean/std/percentiles, top value) "
+            "→ `describe_query`, not hand-written aggregation SQL.\n\n"
             "## Session workspace (named results)\n"
             "A local DuckDB workspace lets you cache results from the source database "
             "under a name and then query, join, and transform them locally — without "
@@ -194,14 +259,16 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
             "  extract('SELECT id, name FROM artist', 'art', flow='artists')\n"
             "  peek('SELECT COUNT(*) FROM art', flow='artists')\n\n"
             "### Tools\n"
-            "- `extract(sql, name, flow?)` — pull a SELECT from the SOURCE database "
-            "(no row cap) into the flow as table `name`. Use this "
-            "to pull a slice once and reuse it.\n"
+            "- `extract(sql, name?, flow?)` — pull a SELECT from the SOURCE database "
+            "(no row cap) into the flow as table `name`. Use this to pull a slice once and "
+            "reuse it. `name` is optional (auto-assigned if omitted); the response includes a "
+            "head sample so you see the data without a follow-up call.\n"
             "- `peek(sql, flow?)` — inspect cached results (capped at 1000 rows). "
             "Use transform to compute over the full set without truncation. "
             "Sequential within a flow.\n"
-            "- `transform(sql, name, flow?)` — materialize a query over cached results "
+            "- `transform(sql, name?, flow?)` — materialize a query over cached results "
             "as a new named table (no row cap). Build step-by-step: each result feeds the next. "
+            "`name` is optional (auto-assigned if omitted); the response includes a head sample. "
             "Sequential within a flow.\n"
             "- `list_results(flow?)` — list saved results in a flow with their columns, "
             "types, and row counts so you know what you can build on.\n"
@@ -273,6 +340,47 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
     # ------------------------------------------------------------------ #
     # Tool: run a read-only SQL query
     # ------------------------------------------------------------------ #
+    def _query_hints(sql: str, result) -> list[str]:
+        """Evidence-gated nudges toward flows / describe_query for a run_query call.
+
+        Fires only on observed runtime facts (slow pull, truncation, repeated source,
+        manual summary aggregation) so the cheap path stays unflagged when it's right.
+        """
+        hints: list[str] = []
+
+        tables = _source_tables(sql, dialect_name)
+        count = 0
+        if tables:
+            with run_query_lock:
+                count = source_hits.get(tables, 0) + 1
+                source_hits[tables] = count
+
+        if (result.elapsed_s or 0.0) >= _SLOW_QUERY_S:
+            hints.append(
+                f"This query took {result.elapsed_s:.1f}s. If you'll query this data "
+                "again, `extract` it into a flow once and run follow-ups locally with "
+                "`peek` / `transform` instead of re-hitting the source."
+            )
+        if result.truncated:
+            hints.append(
+                "Result was clipped to the 1000-row cap. To compute over the FULL set, "
+                "`extract` it into a flow and use `transform` (uncapped), or `export_query` "
+                "to write it to a file."
+            )
+        if count >= _REPEAT_HINT_AT:
+            tbl = ", ".join(sorted(tables))
+            hints.append(
+                f"You've queried {tbl} {count} times this session. Consider `extract`-ing "
+                "it into a flow once, then `peek` / `transform` locally to avoid repeated "
+                "source round-trips."
+            )
+        if _is_summary_aggregate(sql, dialect_name):
+            hints.append(
+                "This looks like manual summary aggregation. `describe_query(sql)` returns "
+                "per-column min/max/mean/std (and percentiles where supported) in one call."
+            )
+        return hints
+
     @mcp.tool(
         name="run_query",
         description=(
@@ -282,9 +390,13 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
         ),
     )
     def _run_query(sql: str) -> dict:
-        """Execute *sql* and return a QueryResult-shaped dict."""
+        """Execute *sql* and return a QueryResult-shaped dict (+ optional hints)."""
         result = run_sql(engine, sql)
-        return result.model_dump()
+        payload = result.model_dump()
+        hints = _query_hints(sql, result)
+        if hints:
+            payload["hints"] = hints
+        return payload
 
     # ------------------------------------------------------------------ #
     # Tool: export a query to a file (no row cap, extended timeout)
@@ -480,21 +592,45 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
         ).fetchall()
         return [r[0] for r in rows]
 
+    def _next_auto_name(flow: str) -> str:
+        """Return the first free auto name (r1, r2, …) in *flow* (caller holds ws_lock).
+
+        Removes the 'I have to think of a name' friction that pushed agents toward
+        run_query — extract/transform can be called with no name at all.
+        """
+        existing = set(_flow_result_names(flow))
+        i = 1
+        while f"r{i}" in existing:
+            i += 1
+        return f"r{i}"
+
+    def _head_sample(name: str, flow: str, n: int = _SAMPLE_ROWS) -> list[list]:
+        """Return up to *n* rows from *flow*.*name* as a list of lists (caller holds ws_lock).
+
+        Aligns positionally with the result's `columns`, mirroring run_query/peek so
+        extract/transform show their data in one call.
+        """
+        cur = workspace.execute(f'SELECT * FROM "{flow}"."{name}" LIMIT {n}')
+        return [[_to_python(v) for v in row] for row in cur.fetchall()]
+
     @mcp.tool(
         name="extract",
         description=(
             "Run a read-only SELECT against the SOURCE database (no row cap) and store the "
             "full result in the session workspace as a named table. Reuse it later with "
             "peek / transform without re-querying the source. "
-            "`name` must be a SQL identifier. `flow` (default 'default') is an isolated "
+            "`name` is optional — omit it and a name (r1, r2, …) is auto-assigned; if given "
+            "it must be a SQL identifier. `flow` (default 'default') is an isolated "
             "result namespace — give each concurrent line of analysis its own flow. "
-            "Replaces any existing result with the same name in that flow."
+            "Replaces any existing result with the same name in that flow. "
+            "The response includes a head sample so you see the data without a follow-up peek."
         ),
     )
-    def _extract(sql: str, name: str, flow: str = default_flow) -> dict:
-        """Pull a source-DB query into *flow* as table *name*."""
-        _validate_name(name)
+    def _extract(sql: str, name: str | None = None, flow: str = default_flow) -> dict:
+        """Pull a source-DB query into *flow* as table *name* (auto-named if omitted)."""
         _validate_name(flow, "flow name")
+        if name is not None:
+            _validate_name(name)
         # run_sql applies the read-only guard and pulls all rows (max_rows=None).
         # This source pull is the slow part and runs OUTSIDE the lock so parallel
         # save_result calls overlap on the source DB.
@@ -503,6 +639,8 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
         tmp = f"_save_src_{uuid4().hex}"  # unique so concurrent saves never clobber
         with ws_lock:
             _ensure_flow(flow)
+            if name is None:
+                name = _next_auto_name(flow)
             workspace.register(tmp, df)
             try:
                 workspace.execute(
@@ -511,11 +649,13 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
             finally:
                 workspace.unregister(tmp)
             columns = _workspace_columns(name, flow)
+            sample = _head_sample(name, flow)
         return {
             "name": name,
             "flow": flow,
             "row_count": result.row_count,
             "columns": columns,
+            "sample": sample,
             "elapsed_s": round(result.elapsed_s or 0.0, 3),
         }
 
@@ -566,18 +706,23 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
             "Run read-only DuckDB SQL over the named results in a flow and store its full "
             "output (NO row cap) under a new name in that same flow — unlike peek, "
             "which is capped at 1000 rows. This is how you build analyses step by step: "
-            "each result feeds the next. `name`/`flow` must be SQL identifiers. "
+            "each result feeds the next. `name` is optional — omit it and a name (r1, r2, …) "
+            "is auto-assigned; if given it (and `flow`) must be a SQL identifier. "
             "Replaces any existing result with that name in the flow. "
+            "The response includes a head sample so you see the output immediately. "
             "Calls within the same flow are sequential — use separate flows for parallel analysis."
         ),
     )
-    def _transform(sql: str, name: str, flow: str = default_flow) -> dict:
-        """Transform cached results into a new table *name* in the same *flow*."""
-        _validate_name(name)
+    def _transform(sql: str, name: str | None = None, flow: str = default_flow) -> dict:
+        """Transform cached results into a new table *name* (auto-named if omitted)."""
         _validate_name(flow, "flow name")
+        if name is not None:
+            _validate_name(name)
         guard.assert_read_only(sql, "duckdb")
         with ws_lock:
             _ensure_flow(flow)
+            if name is None:
+                name = _next_auto_name(flow)
             workspace.execute(f"SET search_path = '{flow}'")
             t0 = time.perf_counter()
             try:
@@ -592,11 +737,13 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
                 f'SELECT COUNT(*) FROM "{flow}"."{name}"'
             ).fetchone()[0]
             columns = _workspace_columns(name, flow)
+            sample = _head_sample(name, flow)
         return {
             "name": name,
             "flow": flow,
             "row_count": int(row_count),
             "columns": columns,
+            "sample": sample,
             "elapsed_s": round(time.perf_counter() - t0, 3),
         }
 

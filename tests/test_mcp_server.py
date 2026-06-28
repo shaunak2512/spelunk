@@ -230,6 +230,53 @@ class TestDescribeQueryTool:
 
 
 # --------------------------------------------------------------------------- #
+# run_query nudges (Lever A + D): evidence-gated hints toward flows / describe_query
+# --------------------------------------------------------------------------- #
+
+class TestRunQueryHints:
+    """run_query appends `hints` only when runtime facts justify a different tool."""
+
+    def test_repeat_source_query_nudges_flow(self, mcp_server):
+        sql = "SELECT * FROM orders WHERE amount > 0"
+        for _ in range(2):
+            _run(mcp_server.call_tool("run_query", {"sql": sql}))
+        third = _run(mcp_server.call_tool("run_query", {"sql": sql}))
+        hints = third.structured_content.get("hints", [])
+        assert any("extract" in h.lower() for h in hints), (
+            f"Expected a flow nudge on the 3rd repeat, got: {hints}"
+        )
+
+    def test_first_query_has_no_repeat_nudge(self, mcp_server):
+        data = _run(mcp_server.call_tool(
+            "run_query", {"sql": "SELECT * FROM customers"})).structured_content
+        hints = data.get("hints", [])
+        assert not any("times this session" in h for h in hints), (
+            f"A single query should not trigger the repeat nudge, got: {hints}"
+        )
+
+    def test_manual_aggregate_nudges_describe_query(self, mcp_server):
+        data = _run(mcp_server.call_tool(
+            "run_query",
+            {"sql": "SELECT AVG(amount), MIN(amount), MAX(amount) FROM orders"},
+        )).structured_content
+        hints = data.get("hints", [])
+        assert any("describe_query" in h for h in hints), (
+            f"Expected a describe_query nudge for summary aggregation, got: {hints}"
+        )
+
+    def test_group_by_frequency_not_flagged_as_aggregate(self, mcp_server):
+        # A GROUP BY frequency table is a legitimate run_query use — no describe_query nudge.
+        data = _run(mcp_server.call_tool(
+            "run_query",
+            {"sql": "SELECT status, COUNT(*) FROM orders GROUP BY status"},
+        )).structured_content
+        hints = data.get("hints", [])
+        assert not any("describe_query" in h for h in hints), (
+            f"GROUP BY should not trigger the describe_query nudge, got: {hints}"
+        )
+
+
+# --------------------------------------------------------------------------- #
 # Session workspace: named results round-trip
 # --------------------------------------------------------------------------- #
 
@@ -246,6 +293,40 @@ class TestSessionWorkspace:
         assert data["row_count"] == 3
         col_names = [c["name"] for c in data["columns"]]
         assert "name" in col_names and "city" in col_names
+
+    def test_extract_returns_head_sample(self, mcp_server):
+        result = _run(mcp_server.call_tool(
+            "extract", {"sql": "SELECT * FROM customers", "name": "cust"}))
+        data = result.structured_content
+        assert "sample" in data, f"Expected a head sample, got keys: {list(data.keys())}"
+        assert len(data["sample"]) == 3, "sample should hold all 3 customers (under the cap)"
+        # each sample row aligns positionally with the reported columns
+        assert len(data["sample"][0]) == len(data["columns"])
+
+    def test_extract_auto_names_when_omitted(self, mcp_server):
+        data = _run(mcp_server.call_tool(
+            "extract", {"sql": "SELECT * FROM customers"})).structured_content
+        assert data["name"] == "r1", f"Expected auto name 'r1', got: {data['name']}"
+        # a second auto-named extract must not clobber the first
+        data2 = _run(mcp_server.call_tool(
+            "extract", {"sql": "SELECT * FROM orders"})).structured_content
+        assert data2["name"] == "r2", f"Expected auto name 'r2', got: {data2['name']}"
+
+    def test_transform_returns_head_sample(self, mcp_server):
+        _run(mcp_server.call_tool(
+            "extract", {"sql": "SELECT * FROM orders", "name": "ord"}))
+        data = _run(mcp_server.call_tool(
+            "transform",
+            {"sql": "SELECT status, COUNT(*) AS n FROM ord GROUP BY status", "name": "by_status"},
+        )).structured_content
+        assert "sample" in data and len(data["sample"]) >= 1
+
+    def test_transform_auto_names_when_omitted(self, mcp_server):
+        _run(mcp_server.call_tool(
+            "extract", {"sql": "SELECT * FROM orders", "name": "ord"}))
+        data = _run(mcp_server.call_tool(
+            "transform", {"sql": "SELECT * FROM ord"})).structured_content
+        assert data["name"] == "r1", f"Expected auto name 'r1', got: {data['name']}"
 
     def test_list_results_reports_saved_table(self, mcp_server):
         _run(mcp_server.call_tool(
