@@ -191,16 +191,16 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
             "connection). Calls across different flows are parallel-safe. Give each "
             "concurrent line of analysis its own flow.\n\n"
             "Worked example — pull once from the source, then query it locally in a flow:\n"
-            "  save_result('SELECT id, name FROM artist', 'art', flow='artists')\n"
+            "  extract('SELECT id, name FROM artist', 'art', flow='artists')\n"
             "  query_results('SELECT COUNT(*) FROM art', flow='artists')\n\n"
             "### Tools\n"
-            "- `save_result(sql, name, flow?)` — run a SELECT against the SOURCE database "
-            "(no row cap) and store the full result in the flow as table `name`. Use this "
+            "- `extract(sql, name, flow?)` — pull a SELECT from the SOURCE database "
+            "(no row cap) into the flow as table `name`. Use this "
             "to pull a slice once and reuse it.\n"
             "- `query_results(sql, flow?)` — inspect cached results (capped at 1000 rows). "
-            "Use save_result_from to compute over the full set without truncation. "
+            "Use transform to compute over the full set without truncation. "
             "Sequential within a flow.\n"
-            "- `save_result_from(sql, name, flow?)` — materialize a query over cached results "
+            "- `transform(sql, name, flow?)` — materialize a query over cached results "
             "as a new named table (no row cap). Build step-by-step: each result feeds the next. "
             "Sequential within a flow.\n"
             "- `list_results(flow?)` — list saved results in a flow with their columns, "
@@ -236,8 +236,8 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
             "use it instead of writing manual aggregation queries.\n"
             "6. For multi-step analysis — caching an expensive pull, combining several "
             "source queries, or building intermediate results — switch to the session "
-            "workspace: `save_result` to cache a source query, then `query_results` / "
-            "`save_result_from` to build on it locally without re-hitting the source. When "
+            "workspace: `extract` to cache a source query, then `query_results` / "
+            "`transform` to build on it locally without re-hitting the source. When "
             "running several independent analyses at once, give each its own `flow` (see "
             "the Session workspace section), and `drop_flow` to clean up when done.\n\n"
             "## Constraints\n"
@@ -481,18 +481,18 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
         return [r[0] for r in rows]
 
     @mcp.tool(
-        name="save_result",
+        name="extract",
         description=(
             "Run a read-only SELECT against the SOURCE database (no row cap) and store the "
             "full result in the session workspace as a named table. Reuse it later with "
-            "query_results / save_result_from without re-querying the source. "
+            "query_results / transform without re-querying the source. "
             "`name` must be a SQL identifier. `flow` (default 'default') is an isolated "
             "result namespace — give each concurrent line of analysis its own flow. "
             "Replaces any existing result with the same name in that flow."
         ),
     )
-    def _save_result(sql: str, name: str, flow: str = default_flow) -> dict:
-        """Materialize a source-DB query into *flow* as table *name*."""
+    def _extract(sql: str, name: str, flow: str = default_flow) -> dict:
+        """Pull a source-DB query into *flow* as table *name*."""
         _validate_name(name)
         _validate_name(flow, "flow name")
         # run_sql applies the read-only guard and pulls all rows (max_rows=None).
@@ -523,7 +523,7 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
         name="query_results",
         description=(
             "Execute read-only DuckDB SQL over the named results in a flow. "
-            "CAPPED AT 1000 ROWS — use save_result_from to compute on the full set without "
+            "CAPPED AT 1000 ROWS — use transform to compute on the full set without "
             "truncation, or export_result to write it to a file. "
             "Reference results by bare name (e.g. `FROM my_result`), or qualify across "
             "flows as \"<flow>\".\"<name>\". `flow` (default 'default') selects the namespace. "
@@ -561,7 +561,7 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
         }
 
     @mcp.tool(
-        name="save_result_from",
+        name="transform",
         description=(
             "Run read-only DuckDB SQL over the named results in a flow and store its full "
             "output (NO row cap) under a new name in that same flow — unlike query_results, "
@@ -571,8 +571,8 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
             "Calls within the same flow are sequential — use separate flows for parallel analysis."
         ),
     )
-    def _save_result_from(sql: str, name: str, flow: str = default_flow) -> dict:
-        """Materialize a *flow* query under a new table *name* in the same flow."""
+    def _transform(sql: str, name: str, flow: str = default_flow) -> dict:
+        """Transform cached results into a new table *name* in the same *flow*."""
         _validate_name(name)
         _validate_name(flow, "flow name")
         guard.assert_read_only(sql, "duckdb")

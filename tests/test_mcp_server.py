@@ -234,11 +234,11 @@ class TestDescribeQueryTool:
 # --------------------------------------------------------------------------- #
 
 class TestSessionWorkspace:
-    """save_result -> list_results -> query_results -> save_result_from -> export."""
+    """extract -> list_results -> query_results -> transform -> export."""
 
-    def test_save_result_caches_source_query(self, mcp_server):
+    def test_extract_caches_source_query(self, mcp_server):
         result = _run(mcp_server.call_tool(
-            "save_result",
+            "extract",
             {"sql": "SELECT * FROM customers", "name": "cust"},
         ))
         data = result.structured_content
@@ -249,7 +249,7 @@ class TestSessionWorkspace:
 
     def test_list_results_reports_saved_table(self, mcp_server):
         _run(mcp_server.call_tool(
-            "save_result", {"sql": "SELECT * FROM customers", "name": "cust"}))
+            "extract", {"sql": "SELECT * FROM customers", "name": "cust"}))
         result = _run(mcp_server.call_tool("list_results", {}))
         data = result.structured_content
         names = {r["name"] for r in data["results"]}
@@ -259,18 +259,18 @@ class TestSessionWorkspace:
 
     def test_query_results_reads_named_table(self, mcp_server):
         _run(mcp_server.call_tool(
-            "save_result", {"sql": "SELECT * FROM customers", "name": "cust"}))
+            "extract", {"sql": "SELECT * FROM customers", "name": "cust"}))
         result = _run(mcp_server.call_tool(
             "query_results", {"sql": "SELECT name FROM cust ORDER BY id"}))
         data = result.structured_content
         names = [row[0] for row in data["rows"]]
         assert names == ["Ada", "Linus", "Grace"]
 
-    def test_save_result_from_builds_on_prior_result(self, mcp_server):
+    def test_transform_builds_on_prior_result(self, mcp_server):
         _run(mcp_server.call_tool(
-            "save_result", {"sql": "SELECT * FROM orders", "name": "ord"}))
+            "extract", {"sql": "SELECT * FROM orders", "name": "ord"}))
         out = _run(mcp_server.call_tool(
-            "save_result_from",
+            "transform",
             {"sql": "SELECT status, COUNT(*) AS n FROM ord GROUP BY status", "name": "by_status"},
         ))
         data = out.structured_content
@@ -282,7 +282,7 @@ class TestSessionWorkspace:
 
     def test_query_results_rejects_writes(self, mcp_server):
         _run(mcp_server.call_tool(
-            "save_result", {"sql": "SELECT * FROM customers", "name": "cust"}))
+            "extract", {"sql": "SELECT * FROM customers", "name": "cust"}))
         with pytest.raises(Exception):
             _run(mcp_server.call_tool(
                 "query_results", {"sql": "DROP TABLE cust"}))
@@ -290,7 +290,7 @@ class TestSessionWorkspace:
     def test_query_results_missing_result_names_available(self, mcp_server):
         """Referencing a non-existent result should surface what IS available."""
         _run(mcp_server.call_tool(
-            "save_result", {"sql": "SELECT * FROM customers", "name": "cust"}))
+            "extract", {"sql": "SELECT * FROM customers", "name": "cust"}))
         with pytest.raises(Exception) as exc_info:
             _run(mcp_server.call_tool(
                 "query_results", {"sql": "SELECT * FROM nonexistent"}))
@@ -299,7 +299,7 @@ class TestSessionWorkspace:
 
     def test_query_results_response_includes_row_cap(self, mcp_server):
         _run(mcp_server.call_tool(
-            "save_result", {"sql": "SELECT * FROM customers", "name": "cust"}))
+            "extract", {"sql": "SELECT * FROM customers", "name": "cust"}))
         result = _run(mcp_server.call_tool(
             "query_results", {"sql": "SELECT * FROM cust"}))
         data = result.structured_content
@@ -309,11 +309,11 @@ class TestSessionWorkspace:
     def test_invalid_name_rejected(self, mcp_server):
         with pytest.raises(Exception):
             _run(mcp_server.call_tool(
-                "save_result", {"sql": "SELECT * FROM customers", "name": "bad name; DROP"}))
+                "extract", {"sql": "SELECT * FROM customers", "name": "bad name; DROP"}))
 
     def test_export_result_writes_parquet(self, mcp_server, tmp_path):
         _run(mcp_server.call_tool(
-            "save_result", {"sql": "SELECT * FROM customers", "name": "cust"}))
+            "extract", {"sql": "SELECT * FROM customers", "name": "cust"}))
         out_path = str(tmp_path / "cust.parquet")
         result = _run(mcp_server.call_tool(
             "export_result", {"name": "cust", "format": "parquet", "path": out_path}))
@@ -328,10 +328,10 @@ class TestFlowsAndCleanup:
 
     def test_same_name_in_different_flows_isolated(self, mcp_server):
         """Two flows using the same result name must not clobber each other."""
-        _run(mcp_server.call_tool("save_result", {
+        _run(mcp_server.call_tool("extract", {
             "sql": "SELECT * FROM customers WHERE city = 'London'",
             "name": "step1", "flow": "flow_a"}))
-        _run(mcp_server.call_tool("save_result", {
+        _run(mcp_server.call_tool("extract", {
             "sql": "SELECT * FROM customers",
             "name": "step1", "flow": "flow_b"}))
         a = _run(mcp_server.call_tool(
@@ -344,14 +344,14 @@ class TestFlowsAndCleanup:
         assert a_count < b_count, "flow_a/step1 should be a strict subset; flows leaked"
 
     def test_list_results_scoped_to_flow(self, mcp_server):
-        _run(mcp_server.call_tool("save_result", {
+        _run(mcp_server.call_tool("extract", {
             "sql": "SELECT * FROM customers", "name": "only_a", "flow": "flow_a"}))
         listed = _run(mcp_server.call_tool("list_results", {"flow": "flow_b"}))
         names = {r["name"] for r in listed.structured_content["results"]}
         assert "only_a" not in names, "flow_b listing leaked flow_a's result"
 
     def test_cross_flow_qualified_reference(self, mcp_server):
-        _run(mcp_server.call_tool("save_result", {
+        _run(mcp_server.call_tool("extract", {
             "sql": "SELECT * FROM customers", "name": "src", "flow": "flow_a"}))
         # From flow_b, read flow_a's result by qualifying it.
         out = _run(mcp_server.call_tool("query_results", {
@@ -359,7 +359,7 @@ class TestFlowsAndCleanup:
         assert out.structured_content["rows"][0][0] == 3
 
     def test_drop_result_removes_one(self, mcp_server):
-        _run(mcp_server.call_tool("save_result", {
+        _run(mcp_server.call_tool("extract", {
             "sql": "SELECT * FROM customers", "name": "tmp"}))
         dropped = _run(mcp_server.call_tool("drop_result", {"name": "tmp"}))
         assert dropped.structured_content["dropped"] is True
@@ -372,9 +372,9 @@ class TestFlowsAndCleanup:
         assert dropped.structured_content["dropped"] is False
 
     def test_drop_flow_removes_all(self, mcp_server):
-        _run(mcp_server.call_tool("save_result", {
+        _run(mcp_server.call_tool("extract", {
             "sql": "SELECT * FROM customers", "name": "a", "flow": "doomed"}))
-        _run(mcp_server.call_tool("save_result", {
+        _run(mcp_server.call_tool("extract", {
             "sql": "SELECT * FROM orders", "name": "b", "flow": "doomed"}))
         result = _run(mcp_server.call_tool("drop_flow", {"flow": "doomed"}))
         assert result.structured_content["dropped_results"] == 2
@@ -387,7 +387,7 @@ class TestFlowsAndCleanup:
             _run(mcp_server.call_tool("drop_flow", {"flow": "main"}))
 
     def test_list_flows_reports_counts(self, mcp_server):
-        _run(mcp_server.call_tool("save_result", {
+        _run(mcp_server.call_tool("extract", {
             "sql": "SELECT * FROM customers", "name": "x", "flow": "pipe1"}))
         flows = {f["flow"]: f["result_count"]
                  for f in _run(mcp_server.call_tool("list_flows", {})).structured_content["flows"]}
@@ -415,7 +415,7 @@ class TestBuildServerContract:
         tool_names = {t.name for t in tools}
         assert tool_names == {
             "run_query", "export_query", "describe_query",
-            "save_result", "query_results", "save_result_from",
+            "extract", "query_results", "transform",
             "list_results", "export_result",
             "drop_result", "drop_flow", "list_flows",
         }, f"Unexpected tools: {tool_names}"
