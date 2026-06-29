@@ -85,6 +85,13 @@ views named bare) and `db://{table}` (columns, PK, sample, row count).
 - **Read-only** = `ATTACH (READ_ONLY)` + the sqlglot guard on every query; the server constructs the
   `CREATE TABLE` DDL itself, so agent SQL is SELECT-only.
 
+- **Tools run on worker threads:** FastMCP runs each sync tool off the event loop
+  (`anyio.to_thread`). DuckDB lazily imports numpy/pandas on the first result fetch, and that
+  C-extension import deadlocks if it first happens on a worker thread under the running asyncio
+  loop (Windows) — the tool call then hangs forever. `DuckSession.open()` calls
+  `_warm_native_imports()` on the main thread to pre-load them. Don't add other lazy C-extension
+  imports to the tool hot path without warming them the same way.
+
 **Frozen contract:** `spelunk/core/types.py` — `TableInfo` / `TableDescription` / `ColumnInfo` are
 shared by the resources; treat changes as barrier-level.
 
