@@ -236,21 +236,50 @@ class TestDescribeQueryTool:
 class TestRunQueryHints:
     """run_query appends `hints` only when runtime facts justify a different tool."""
 
-    def test_repeat_source_query_nudges_flow(self, mcp_server):
+    def test_repeat_costly_derivation_nudges_flow(self, mcp_server, monkeypatch):
+        # The repeat nudge requires both recurrence AND accumulated cost. Test DB
+        # queries are sub-millisecond, so drop the cost gate to 0 to exercise the
+        # recurrence path: the same derivation run 3x should nudge toward a flow.
+        from spelunk.mcp import server as server_mod
+        monkeypatch.setattr(server_mod, "_REPEAT_ELAPSED_S", 0.0)
         sql = "SELECT * FROM orders WHERE amount > 0"
         for _ in range(2):
             _run(mcp_server.call_tool("run_query", {"sql": sql}))
         third = _run(mcp_server.call_tool("run_query", {"sql": sql}))
         hints = third.structured_content.get("hints", [])
-        assert any("extract" in h.lower() for h in hints), (
-            f"Expected a flow nudge on the 3rd repeat, got: {hints}"
+        assert any("derivation" in h for h in hints), (
+            f"Expected a flow nudge on the 3rd costly repeat, got: {hints}"
+        )
+
+    def test_same_derivation_different_literals_counts_as_repeat(self, mcp_server, monkeypatch):
+        # Queries differing only in WHERE literals are one derivation: the era-rollup
+        # pattern. Three value ranges over the same shape should still nudge.
+        from spelunk.mcp import server as server_mod
+        monkeypatch.setattr(server_mod, "_REPEAT_ELAPSED_S", 0.0)
+        for hi in (10, 20, 30):
+            third = _run(mcp_server.call_tool(
+                "run_query", {"sql": f"SELECT * FROM orders WHERE amount > {hi}"}))
+        hints = third.structured_content.get("hints", [])
+        assert any("derivation" in h for h in hints), (
+            f"Expected differing-literal repeats to share a derivation, got: {hints}"
+        )
+
+    def test_fast_repeat_is_not_nudged(self, mcp_server):
+        # The actual bug being fixed: re-running a fast, small query should NOT nudge,
+        # because a flow would only add overhead. The default cost gate suppresses it.
+        sql = "SELECT * FROM orders WHERE amount > 0"
+        for _ in range(4):
+            last = _run(mcp_server.call_tool("run_query", {"sql": sql}))
+        hints = last.structured_content.get("hints", [])
+        assert not any("derivation" in h for h in hints), (
+            f"Fast repeated queries should not trigger the flow nudge, got: {hints}"
         )
 
     def test_first_query_has_no_repeat_nudge(self, mcp_server):
         data = _run(mcp_server.call_tool(
             "run_query", {"sql": "SELECT * FROM customers"})).structured_content
         hints = data.get("hints", [])
-        assert not any("times this session" in h for h in hints), (
+        assert not any("derivation" in h for h in hints), (
             f"A single query should not trigger the repeat nudge, got: {hints}"
         )
 

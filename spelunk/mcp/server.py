@@ -7,11 +7,13 @@ No model, no loop — Claude Code is the agent.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import threading
 import time
+from collections import OrderedDict
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -115,22 +117,56 @@ def _validate_name(name: str, kind: str = "result name") -> str:
 # Runtime-nudge thresholds for run_query. Kept conservative so a hint fires only
 # when a flow genuinely pays off — over-firing trains the agent to ignore them, the
 # exact failure mode these nudges exist to fix.
-_SLOW_QUERY_S = 2.0   # a source pull slower than this is worth caching if reused
-_REPEAT_HINT_AT = 3   # Nth query of the same source table-set triggers a flow nudge
-_SAMPLE_ROWS = 5      # head-sample size returned by extract / transform
+_SLOW_QUERY_S = 2.0       # a source pull slower than this is worth caching if reused
+_REPEAT_HINT_AT = 3       # Nth run of the same derivation before a flow nudge fires
+_REPEAT_ELAPSED_S = 1.5   # ...AND only once those runs have cost this much wall-time
+_LEDGER_MAX = 512         # cap on tracked derivations (LRU-evicted)
+_SAMPLE_ROWS = 5          # head-sample size returned by extract / transform
 
 
 def _source_tables(sql: str, dialect: str) -> frozenset[str]:
     """Return the set of base table names referenced in *sql* (lowercased).
 
-    Used to detect when the agent re-queries the same source repeatedly. Returns an
-    empty set on unparseable SQL — better no nudge than a wrong one.
+    Used only to name the tables in the repeat nudge message. Returns an empty set
+    on unparseable SQL — better no nudge than a wrong one.
     """
     try:
         tree = sqlglot.parse_one(sql, read=dialect)
     except SqlglotError:
         return frozenset()
     return frozenset(t.name.lower() for t in tree.find_all(exp.Table) if t.name)
+
+
+def _strip_literal(node: "exp.Expression") -> "exp.Expression":
+    """Replace a literal leaf with a fixed placeholder; pass other nodes through."""
+    if isinstance(node, exp.Literal):
+        return exp.Literal.string("?")
+    return node
+
+
+def _derivation_id(sql: str, dialect: str) -> str | None:
+    """Fingerprint a query's *derivation shape* — the join/projection structure with
+    literal filter values stripped out.
+
+    Two queries that differ only in their `WHERE`/`HAVING`/`LIMIT` literals hash to
+    the same id, so the same `cards JOIN sets` rollup run over 1990-1995 and over
+    2015-2020 counts as one recurring derivation (the era-rollup pattern). Identifier
+    case and whitespace are normalized away too. Returns None on unparseable SQL so
+    the caller simply skips the repeat nudge rather than firing a wrong one.
+
+    This is intentionally a coarse shape match: it answers "is this the same slice
+    being recomputed?", not "would this cost the same?" — don't reuse it for costing.
+    """
+    try:
+        tree = sqlglot.parse_one(sql, read=dialect)
+    except SqlglotError:
+        return None
+    canon = tree.transform(_strip_literal)
+    try:
+        rendered = canon.sql(dialect=dialect, normalize=True)
+    except Exception:
+        rendered = canon.sql(dialect=dialect)
+    return hashlib.sha1(rendered.lower().encode("utf-8")).hexdigest()
 
 
 def _is_summary_aggregate(sql: str, dialect: str) -> bool:
@@ -194,10 +230,13 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
     # OUTSIDE this lock, so parallel flows still overlap where it actually matters.
     ws_lock = threading.Lock()
 
-    # run_query nudge state: count queries per source table-set to spot the
-    # antipattern of re-pulling the same source instead of caching it in a flow.
+    # run_query nudge state: a ledger of query *derivations* (normalized-AST
+    # fingerprints), each tracking how often it has run and the wall-time it has
+    # cost. The repeat nudge fires only when a derivation both recurs AND has burned
+    # real time — fast/small repeats stay silent, which is the case that trained
+    # agents to ignore the hint. LRU-bounded so a long session can't leak memory.
     run_query_lock = threading.Lock()
-    source_hits: dict[frozenset[str], int] = {}
+    derivation_ledger: "OrderedDict[str, dict]" = OrderedDict()
 
     mcp = FastMCP(
         "spelunk",
@@ -340,39 +379,83 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
     # ------------------------------------------------------------------ #
     # Tool: run a read-only SQL query
     # ------------------------------------------------------------------ #
+    def _true_row_count(sql: str) -> int | None:
+        """Best-effort full row count for a truncated query; None if it errors.
+
+        Wraps the query in COUNT(*) through the same read-only guard. Only worth
+        calling when the original query was fast — see the truncation branch below.
+        """
+        try:
+            counted = run_sql(engine, f"SELECT COUNT(*) AS n FROM ({sql}) AS _spelunk_full", max_rows=1)
+        except Exception:
+            return None
+        if counted.rows:
+            try:
+                return int(counted.rows[0][0])
+            except (TypeError, ValueError):
+                return None
+        return None
+
     def _query_hints(sql: str, result) -> list[str]:
         """Evidence-gated nudges toward flows / describe_query for a run_query call.
 
-        Fires only on observed runtime facts (slow pull, truncation, repeated source,
-        manual summary aggregation) so the cheap path stays unflagged when it's right.
+        Fires only on observed runtime facts (slow pull, truncation, repeated *and
+        costly* derivation, manual summary aggregation) so the cheap path stays
+        unflagged when it's right.
         """
         hints: list[str] = []
 
-        tables = _source_tables(sql, dialect_name)
-        count = 0
-        if tables:
+        # Track this derivation's recurrence and accumulated cost. Keyed by AST
+        # shape (not raw table set) so unrelated queries sharing a table don't
+        # collide and so re-runs over different filter values count as one slice.
+        deriv = _derivation_id(sql, dialect_name)
+        repeat_count = 0
+        repeat_elapsed = 0.0
+        if deriv is not None:
             with run_query_lock:
-                count = source_hits.get(tables, 0) + 1
-                source_hits[tables] = count
+                entry = derivation_ledger.get(deriv)
+                if entry is None:
+                    if len(derivation_ledger) >= _LEDGER_MAX:
+                        derivation_ledger.popitem(last=False)  # evict LRU
+                    entry = {"count": 0, "total_elapsed_s": 0.0, "tables": _source_tables(sql, dialect_name)}
+                entry["count"] += 1
+                entry["total_elapsed_s"] += result.elapsed_s or 0.0
+                derivation_ledger[deriv] = entry
+                derivation_ledger.move_to_end(deriv)
+                repeat_count = entry["count"]
+                repeat_elapsed = entry["total_elapsed_s"]
+                repeat_tables = entry["tables"]
 
-        if (result.elapsed_s or 0.0) >= _SLOW_QUERY_S:
+        slow = (result.elapsed_s or 0.0) >= _SLOW_QUERY_S
+        if slow:
             hints.append(
                 f"This query took {result.elapsed_s:.1f}s. If you'll query this data "
                 "again, `extract` it into a flow once and run follow-ups locally with "
                 "`peek` / `transform` instead of re-hitting the source."
             )
         if result.truncated:
+            # Report the true size when the query was cheap enough that a second
+            # COUNT(*) pass is affordable; on a slow query, skip it rather than
+            # double the cost.
+            extent = "the first 1000 rows"
+            if not slow:
+                true_n = _true_row_count(sql)
+                if true_n is not None:
+                    extent = f"1000 of {true_n} rows"
             hints.append(
-                "Result was clipped to the 1000-row cap. To compute over the FULL set, "
-                "`extract` it into a flow and use `transform` (uncapped), or `export_query` "
-                "to write it to a file."
+                f"⚠ TRUNCATED: you are seeing only {extent} — aggregates or "
+                "conclusions drawn from this output may be WRONG. To work over the FULL "
+                "set, `extract` it into a flow and use `transform` (uncapped), or "
+                "`export_query` to write it to a file."
             )
-        if count >= _REPEAT_HINT_AT:
-            tbl = ", ".join(sorted(tables))
+        # Repeat nudge: recurs >= N times AND has cost real time. Suppressed when the
+        # slow hint already fired this call — they recommend the same fix.
+        if not slow and repeat_count >= _REPEAT_HINT_AT and repeat_elapsed >= _REPEAT_ELAPSED_S:
+            tbl = ", ".join(sorted(repeat_tables)) if repeat_tables else "this slice"
             hints.append(
-                f"You've queried {tbl} {count} times this session. Consider `extract`-ing "
-                "it into a flow once, then `peek` / `transform` locally to avoid repeated "
-                "source round-trips."
+                f"You've run this derivation {repeat_count} times ({repeat_elapsed:.1f}s "
+                f"total over {tbl}). `extract` it into a flow once, then `peek` / "
+                "`transform` locally to avoid repeated source round-trips."
             )
         if _is_summary_aggregate(sql, dialect_name):
             hints.append(
@@ -386,7 +469,9 @@ def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
         description=(
             "Execute a read-only SQL query against the database. "
             "Writes (INSERT/UPDATE/DELETE/DDL) are rejected. "
-            "Results are capped at 1000 rows."
+            "Results are capped at 1000 rows — for full result sets, slices you'll "
+            "query more than once, or the same derivation run repeatedly, prefer "
+            "`extract` then `peek` / `transform`."
         ),
     )
     def _run_query(sql: str) -> dict:
