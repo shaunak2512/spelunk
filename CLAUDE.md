@@ -107,6 +107,14 @@ an ephemeral (non-durable) workspace. `--dsn` is a back-compat alias for one `--
 `.spelunk_session/` is gitignored. A `.mcp.json` wires Claude Code to a local source (paths are
 machine-specific; edit before use).
 
+**Tool-call logging:** every tool call appends one JSON line (ts, tool, args, outcome, result
+summary, duration_ms) for usage analysis — wired by the `@_logged` decorator in `mcp/server.py`,
+which preserves each function's signature so FastMCP's schema is unchanged. `--tool-log` controls
+the sink: a file path, `-` for stderr, or `off` to disable. Default: `<session-dir>/tool-calls.jsonl`
+when `--session-dir` is set, else stderr — never stdout (that's the stdio MCP transport). Library
+callers of `build_server(session)` log nowhere unless passed `tool_log=`. The JSONL is queryable by
+Spelunk itself via `read_json_auto(...)`.
+
 ## After making a change
 
 1. `uv run --extra dev python -m pytest -q` — green.

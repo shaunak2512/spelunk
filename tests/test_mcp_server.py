@@ -101,6 +101,41 @@ class TestOtherTools:
         assert res["row_count"] == 3
 
 
+class TestToolLogging:
+    def test_each_call_logs_one_json_line(self, sqlite_file, csv_file, tmp_path):
+        log_path = tmp_path / "tool-calls.jsonl"
+        session = DuckSession.open([f"shop={sqlite_file}", f"orders={csv_file}"])
+        server = build_server(session, tool_log=str(log_path))
+        try:
+            _run(server.call_tool("query", {"sql": "SELECT * FROM orders", "name": "o"}))
+            _run(server.call_tool("catalog", {}))
+        finally:
+            session.close()
+
+        lines = [json.loads(line) for line in log_path.read_text().splitlines()]
+        assert [r["tool"] for r in lines] == ["query", "catalog"]
+        q = lines[0]
+        assert q["outcome"] == "ok"
+        assert q["args"]["name"] == "o"
+        assert q["result"]["row_count"] == 3
+        assert isinstance(q["duration_ms"], (int, float))
+
+    def test_failed_call_logs_error_outcome(self, sqlite_file, tmp_path):
+        log_path = tmp_path / "tool-calls.jsonl"
+        session = DuckSession.open([f"shop={sqlite_file}"])
+        server = build_server(session, tool_log=str(log_path))
+        try:
+            with pytest.raises(Exception):
+                _run(server.call_tool("query", {"sql": "DELETE FROM x", "name": "x"}))
+        finally:
+            session.close()
+
+        rec = json.loads(log_path.read_text().splitlines()[-1])
+        assert rec["tool"] == "query"
+        assert rec["outcome"] == "error"
+        assert rec["error"]
+
+
 class TestFallbackToolGating:
     def test_import_remote_registered_with_fallback(self, sqlite_file):
         # An mssql:// DSN can't actually connect, but build_source defers the connect to a
