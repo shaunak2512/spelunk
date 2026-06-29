@@ -52,6 +52,20 @@ _SAMPLE_ROWS = 5
 _LARGE_MATERIALIZE = 100_000
 
 
+def _warm_native_imports() -> None:
+    """Force DuckDB's lazy ``numpy``/``pandas`` import to happen on the *main* thread.
+
+    DuckDB imports numpy/pandas lazily the first time a result is fetched (its Python
+    result-conversion path). When that first import lands on a FastMCP worker thread — the
+    MCP server runs sync tools off the event loop via ``anyio.to_thread`` — loading numpy's
+    compiled ``multiarray`` extension deadlocks under the running asyncio proactor loop on
+    Windows, so the tool call never returns. Importing them here, on the main thread at
+    ``open()`` time, means the worker thread only ever sees already-loaded modules.
+    """
+    import numpy  # noqa: F401
+    import pandas  # noqa: F401
+
+
 def _validate_name(name: str, kind: str = "result name") -> str:
     if not _NAME_RE.match(name or ""):
         raise ValueError(
@@ -135,6 +149,7 @@ class DuckSession:
         stderr. The session stays fully functional; its results just don't persist or share
         with the instance that holds the lock.
         """
+        _warm_native_imports()
         tmpdir: tempfile.TemporaryDirectory | None = None
         if session_dir is not None:
             base = os.path.abspath(session_dir)
