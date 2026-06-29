@@ -50,3 +50,38 @@ def sample_db(tmp_path) -> str:
     con.commit()
     con.close()
     return f"sqlite:///{db.as_posix()}"
+
+
+@pytest.fixture
+def sqlite_file(sample_db) -> str:
+    """The sample DB as a raw filesystem path (for DuckSession source specs)."""
+    return sample_db[len("sqlite:///"):]
+
+
+@pytest.fixture
+def csv_file(tmp_path) -> str:
+    """A small CSV of orders, returned as a filesystem path."""
+    import csv
+
+    p = tmp_path / "orders.csv"
+    with p.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["oid", "customer_id", "amount"])
+        for row in [(1, 1, 120.5), (2, 1, 75.0), (3, 2, 250.0)]:
+            w.writerow(row)
+    return str(p)
+
+
+@pytest.fixture
+def parquet_file(tmp_path) -> str:
+    """A small Parquet file, written via DuckDB itself (no pyarrow needed)."""
+    import duckdb
+
+    p = tmp_path / "regions.parquet"
+    con = duckdb.connect()
+    con.execute(
+        "COPY (SELECT * FROM (VALUES ('Sydney', 'NSW'), ('Melbourne', 'VIC')) AS t(city, state)) "
+        f"TO '{str(p).replace(chr(92), '/')}' (FORMAT PARQUET)"
+    )
+    con.close()
+    return str(p)

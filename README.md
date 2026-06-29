@@ -1,62 +1,62 @@
 # Spelunk
 
-A lean, **vendor-agnostic** harness that lets a *cheap* model match an *expensive* one on real-schema
-SQL — **measured on BIRD, not claimed.**
-
-Full design: [`database-agent-harness-build-spec.md`](database-agent-harness-build-spec.md).
-Build backlog (wave-ordered): [`TASKS.md`](TASKS.md).
-
-## Layout
-
-| Path | Role |
-|---|---|
-| `spelunk/core` | Agent-agnostic tools library — `connect`, `list_objects`, `describe`, `run_sql`, guards. **No LLM, no protocol.** |
-| `spelunk/agent` | LangGraph exploration agent (the eval / standalone front-end). |
-| `spelunk/rag` | Schema retrieval (top-k tables for a question). |
-| `spelunk/mcp` | Optional MCP server front-end — reuses `core` verbatim. Includes a flow-based DuckDB session workspace for multi-step analysis. |
-| `spelunk/eval` | BIRD dataset, scoring, reporting + **frozen data schemas**. |
-| `tests` | Acceptance tests — the definition of done for each module. |
+A **multi-source DuckDB query + transformation-pipeline MCP server.** Point it at files
+(CSV/Parquet/JSON/Excel) and databases (SQLite/PostgreSQL/MySQL), and an agent like Claude Code
+can query across all of them — and build step-by-step pipelines — through one DuckDB engine.
 
 ## Architecture in one line
 
-One `core/` tools library; two thin front-ends over it — your own LangGraph agent (for the benchmark)
-and an MCP server (so Claude Code can drive the same tools). The core is **assembled** from
-SQLAlchemy + sqlglot + DuckDB, not invented.
+A single DuckDB session is both the query engine and the workspace: every source is `ATTACH`ed
+(databases) or scanned (files) into one connection, so one query can join a Parquet file to a
+Postgres table to a result you built two steps ago — all in DuckDB SQL.
 
-## MCP session workspace
+| Path | Role |
+|---|---|
+| `spelunk/core/duck.py` | `DuckSession` — the one DuckDB connection: query / profile / export / catalog / drop + introspection. |
+| `spelunk/core/sources.py` | Source registry — maps a spec to a DuckDB attach/scan; SQLAlchemy fallback for SQL Server. |
+| `spelunk/core/guard.py` | sqlglot AST safety: read-only enforcement (`assert_read_only`). |
+| `spelunk/core/connection.py`, `query.py`, `introspect.py` | Retained SQLAlchemy path, used only by the SQL Server / exotic `import_remote` fallback. |
+| `spelunk/mcp/server.py` | Thin FastMCP wrapper over `DuckSession`. |
+| `tests` | Acceptance tests. |
 
-The MCP server ships a flow-based DuckDB workspace that lets an agent cache source-database results
-locally and build multi-step analyses without re-querying the source.
+## Tools
 
 ```
-extract(sql, name, flow?)   # pull a source-DB SELECT (no row cap) into a named local table
-peek(sql, flow?)            # read-only DuckDB query over cached results (capped 1000 rows)
-transform(sql, name, flow?) # materialize a DuckDB query as a new table (no row cap)
-list_results(flow?)         # list saved results with schema + row counts
-export_result(name, fmt, path, flow?)  # write to parquet / csv / json
-drop_result(name, flow?)    # delete a single intermediate
-drop_flow(flow)             # delete an entire analysis namespace
-list_flows()                # see all active flows
+query(sql, name, flow?)     # run a read-only SELECT over sources + results; store the full
+                            #   result as table `name` for immediate reuse. The ONE tool for
+                            #   looking and building — every result is named and chainable.
+profile(sql, flow?)         # per-column stats (null_rate, min/max/mean/std, percentiles, top/freq)
+export(target, fmt, path)   # write a saved result name OR a full SELECT to csv/json/parquet
+catalog(flow?)              # list flows, or the results in one flow
+drop(name?, flow?)          # drop one result, or a whole flow
+import_remote(sql, name)    # (only with a SQL Server source) pull a SELECT into the workspace
 ```
 
-A **flow** is an isolated DuckDB schema. Give each concurrent line of analysis its own flow;
-steps within a flow are sequential, steps across flows are parallel-safe.
+Discovery resources: `db://tables` (queryable source objects) and `db://{table}` (columns, PK,
+sample, row count). A **flow** is an isolated result namespace (a DuckDB schema); give each
+concurrent line of analysis its own flow.
 
-Start the server with an optional durable workspace:
+## Run it
 
 ```bash
-python -m spelunk.mcp.server --dsn sqlite:///path/to.db --session-dir .spelunk_session
+python -m spelunk.mcp.server \
+  --source sales=./data/sales.parquet \
+  --source sqlite:///path/to/app.db \
+  --session-dir .spelunk_session          # omit for an ephemeral (non-durable) workspace
 ```
 
-A `.mcp.json` in the repo root provides a ready-made Claude Code configuration (edit the paths for
-your machine before use).
+Sources auto-detect by extension/scheme; prefix with `name=` to set the catalog/view name.
+Optional resource guards: `--memory-limit 4GB`, `--temp-dir <dir>`, `--max-temp-size 50GB`.
+DuckDB is out-of-core, so a source larger than RAM is the normal case — scans read on demand and
+buffering operators spill to the temp directory.
+
+A `.mcp.json` in the repo root wires Claude Code to a local source (edit the paths for your
+machine before use).
 
 ## Dev
 
 ```bash
 uv sync --extra dev
-uv run pytest        # core/agent/eval tests; Wave-0 leaves are RED until implemented (TDD baseline)
+uv run --extra dev python -m pytest -q
+uv run --extra dev ruff check spelunk/
 ```
-
-`tests/test_schemas.py` should pass immediately (the frozen data schemas work); the `core` tests are
-the red targets that Wave 1/2 agents turn green.

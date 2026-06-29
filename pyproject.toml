@@ -1,31 +1,23 @@
 [project]
 name = "spelunk"
 version = "0.0.1"
-description = "A vendor-agnostic harness that lets a cheap model match an expensive one on real-schema SQL."
+description = "A multi-source DuckDB query + transformation-pipeline MCP server."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "sqlalchemy>=2.0",
+    "duckdb>=1.5",
     "sqlglot>=25.0",
-    "duckdb>=1.0",
+    "fastmcp>=2.0",
     "pydantic>=2.7",
-    "pyyaml>=6.0",
-    "numpy>=1.26",
-    "langgraph>=0.2",
-    "langchain>=0.3",
-    "langchain-core>=0.3",
-    "langchain-anthropic>=0.2",
-    "langchain-openai>=0.2",
     "pandas>=2.2",
-    "matplotlib>=3.8",
+    "sqlalchemy>=2.0",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "pytest-cov", "ruff"]
-mcp = ["fastmcp>=2.0"]
-# Drivers for connecting to existing server databases. SQL Server's pyodbc also
-# needs a system ODBC driver (e.g. "ODBC Driver 18 for SQL Server"); pymssql is a
-# no-ODBC alternative usable via a mssql+pymssql:// DSN.
+dev = ["pytest>=8.0", "pytest-cov", "ruff", "pyarrow>=15.0"]
+# Drivers for the SQL Server / exotic fallback path (import_remote). DuckDB attaches
+# SQLite/PostgreSQL/MySQL natively, so those need no extra drivers here. SQL Server's
+# pyodbc also needs a system ODBC driver (e.g. "ODBC Driver 18 for SQL Server").
 servers = ["psycopg[binary]>=3.1", "pymysql>=1.1", "pyodbc>=5.0"]
 
 [build-system]

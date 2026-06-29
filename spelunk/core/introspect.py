@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 import sqlalchemy as sa
-from sqlalchemy import inspect, text
+from sqlalchemy import inspect
 
 from .types import ColumnInfo, ColumnProfile, ForeignKey, IndexInfo, TableDescription, TableInfo
 

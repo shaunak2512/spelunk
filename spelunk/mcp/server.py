@@ -1,1005 +1,202 @@
-"""MCP front-end for Spelunk — exposes core introspect + query over FastMCP.
+"""MCP front-end for Spelunk — a multi-source DuckDB query + transformation-pipeline server.
 
-Usage (stdio, for Claude Code via .mcp.json):
-    python -m spelunk.mcp.server --dsn sqlite:///path/to.db
+One DuckDB session ([core/duck.py]) is both the query engine and the workspace: files and
+attached databases live in it alongside the flow results, so a single ``query`` can join any
+of them. No model, no loop — Claude Code is the agent.
 
-No model, no loop — Claude Code is the agent.
+Usage (stdio, for Claude Code via .mcp.json)::
+
+    python -m spelunk.mcp.server --source ./data/sales.parquet --source sqlite:///app.db \
+        --session-dir .spelunk_session
 """
 from __future__ import annotations
 
-import hashlib
+import argparse
 import json
-import os
-import re
-import threading
-import time
-from collections import OrderedDict
-from typing import TYPE_CHECKING, Any
-from uuid import uuid4
 
-import sqlglot
-from sqlglot import exp
-from sqlglot.errors import SqlglotError
-from sqlalchemy import text as _sa_text
-
-import pandas as pd
 from fastmcp import FastMCP
 
-from spelunk.core import guard
-from spelunk.core.introspect import describe, list_objects
-from spelunk.core.query import run_sql
-
-if TYPE_CHECKING:
-    from sqlalchemy.engine import Engine
+from spelunk.core.duck import DuckSession
 
 
-# Dialects that support STDDEV (or equivalent) as a plain aggregate function.
-_STDDEV_DIALECTS = {"postgresql", "mysql", "mariadb", "mssql", "oracle", "duckdb"}
-# Different engines spell the function differently.
-_STDDEV_FN: dict[str, str] = {"mssql": "STDEV", "mysql": "STD", "mariadb": "STD"}
-# Dialects without a built-in STDDEV; compute population std via SQRT(ABS(AVG(x²) - AVG(x)²)).
-_MANUAL_STDDEV_DIALECTS = {"sqlite"}
+def build_server(session: DuckSession) -> FastMCP:
+    """Build a FastMCP instance wired to an open :class:`DuckSession`.
 
-# Dialects with PERCENTILE_CONT as an ordered-set aggregate (returns a scalar in
-# a plain SELECT).  MySQL/SQL Server expose it only as a window function, which
-# can't be mixed cleanly with other aggregates, so we omit them here.
-_PERCENTILE_DIALECTS = {"postgresql", "oracle", "duckdb"}
-
-
-def _quote_col(name: str, dialect: str) -> str:
-    """Return a properly-quoted column identifier for the given dialect."""
-    if dialect in ("mysql", "mariadb"):
-        return f"`{name.replace('`', '``')}`"
-    return f'"{name.replace(chr(34), chr(34) * 2)}"'
-
-
-def _detect_numeric(columns: list[str], rows: list[list]) -> set[str]:
-    """Classify columns as numeric by inspecting the first non-null sample value."""
-    from decimal import Decimal
-    numeric: set[str] = set()
-    for idx, col in enumerate(columns):
-        for row in rows:
-            val = row[idx]
-            if val is not None:
-                if isinstance(val, (int, float, Decimal)) and not isinstance(val, bool):
-                    numeric.add(col)
-                break  # first non-null value determines the type
-    return numeric
-
-
-def _to_python(v: Any) -> Any:
-    """Convert a DB driver value to a JSON-serialisable Python type."""
-    if v is None:
-        return None
-    import math
-    from decimal import Decimal
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, float) and math.isnan(v):
-        return None
-    if isinstance(v, Decimal):
-        f = float(v)
-        return None if math.isnan(f) else f
-    if isinstance(v, (int, float)):
-        return v
-    try:
-        return v.item()  # numpy scalar — export_query still uses pandas
-    except AttributeError:
-        return str(v)
-
-
-_DIALECT_LABELS = {
-    "sqlite": "SQLite",
-    "postgresql": "PostgreSQL",
-    "mysql": "MySQL",
-    "mssql": "SQL Server",
-}
-
-# Valid workspace result names: SQL-identifier-safe so they can be interpolated
-# into CREATE TABLE / quoted references without injection risk. This is also why
-# the LLM addresses results by NAME, never by filesystem path.
-_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
-
-# Schemas the workspace must never create tables in or drop — DuckDB's own.
-_RESERVED_SCHEMAS = frozenset({"main", "information_schema", "pg_catalog", "system", "temp"})
-
-
-def _validate_name(name: str, kind: str = "result name") -> str:
-    """Raise ValueError unless *name* is a safe SQL identifier; return it otherwise."""
-    if not _NAME_RE.match(name or ""):
-        raise ValueError(
-            f"Invalid {kind} {name!r}. Use a SQL identifier: letters, digits, "
-            "and underscores, starting with a letter or underscore (max 63 chars)."
-        )
-    return name
-
-
-# Runtime-nudge thresholds for run_query. Kept conservative so a hint fires only
-# when a flow genuinely pays off — over-firing trains the agent to ignore them, the
-# exact failure mode these nudges exist to fix.
-_SLOW_QUERY_S = 2.0       # a source pull slower than this is worth caching if reused
-_REPEAT_HINT_AT = 3       # Nth run of the same derivation before a flow nudge fires
-_REPEAT_ELAPSED_S = 1.5   # ...AND only once those runs have cost this much wall-time
-_LEDGER_MAX = 512         # cap on tracked derivations (LRU-evicted)
-_SAMPLE_ROWS = 5          # head-sample size returned by extract / transform
-
-
-def _source_tables(sql: str, dialect: str) -> frozenset[str]:
-    """Return the set of base table names referenced in *sql* (lowercased).
-
-    Used only to name the tables in the repeat nudge message. Returns an empty set
-    on unparseable SQL — better no nudge than a wrong one.
+    Registers the ``db://`` discovery resources and five tools — ``query``, ``profile``,
+    ``export``, ``catalog``, ``drop`` — plus ``import_remote`` when a SQLAlchemy-only source
+    (e.g. SQL Server) is configured.
     """
-    try:
-        tree = sqlglot.parse_one(sql, read=dialect)
-    except SqlglotError:
-        return frozenset()
-    return frozenset(t.name.lower() for t in tree.find_all(exp.Table) if t.name)
-
-
-def _strip_literal(node: "exp.Expression") -> "exp.Expression":
-    """Replace a literal leaf with a fixed placeholder; pass other nodes through."""
-    if isinstance(node, exp.Literal):
-        return exp.Literal.string("?")
-    return node
-
-
-def _derivation_id(sql: str, dialect: str) -> str | None:
-    """Fingerprint a query's *derivation shape* — the join/projection structure with
-    literal filter values stripped out.
-
-    Two queries that differ only in their `WHERE`/`HAVING`/`LIMIT` literals hash to
-    the same id, so the same `cards JOIN sets` rollup run over 1990-1995 and over
-    2015-2020 counts as one recurring derivation (the era-rollup pattern). Identifier
-    case and whitespace are normalized away too. Returns None on unparseable SQL so
-    the caller simply skips the repeat nudge rather than firing a wrong one.
-
-    This is intentionally a coarse shape match: it answers "is this the same slice
-    being recomputed?", not "would this cost the same?" — don't reuse it for costing.
-    """
-    try:
-        tree = sqlglot.parse_one(sql, read=dialect)
-    except SqlglotError:
-        return None
-    canon = tree.transform(_strip_literal)
-    try:
-        rendered = canon.sql(dialect=dialect, normalize=True)
-    except Exception:
-        rendered = canon.sql(dialect=dialect)
-    return hashlib.sha1(rendered.lower().encode("utf-8")).hexdigest()
-
-
-def _is_summary_aggregate(sql: str, dialect: str) -> bool:
-    """True if *sql* computes summary aggregates over one table with no GROUP BY.
-
-    That is exactly what describe_query does in a single call, so it's the clearest
-    case for nudging describe_query. Frequency tables (GROUP BY) are left alone —
-    those are a legitimate run_query use.
-    """
-    try:
-        tree = sqlglot.parse_one(sql, read=dialect)
-    except SqlglotError:
-        return False
-    if not isinstance(tree, exp.Select):
-        return False
-    if len(list(tree.find_all(exp.Table))) != 1:
-        return False
-    if tree.args.get("group") is not None:
-        return False
-    return tree.find(exp.AggFunc) is not None
-
-
-def build_server(engine: "Engine", session_dir: str | None = None) -> FastMCP:
-    """Build and return a FastMCP instance wired to *engine*.
-
-    Registers:
-    - Resource  ``db://tables``        — lists all tables/views (wraps list_objects).
-    - Template  ``db://{table}``       — describes one table (wraps describe).
-    - Tool      ``run_query(sql)``     — executes a read-only SQL query (wraps run_sql).
-    - Tools     ``extract`` / ``transform`` / ``peek`` /
-      ``list_results`` / ``export_result`` — a session-scoped DuckDB workspace for
-      caching source-DB results under a name and querying/joining them locally.
-
-    *session_dir*, when given, roots a durable workspace (``workspace.duckdb`` under
-    it) so named results survive restarts. When omitted, the workspace is an
-    ephemeral in-memory DuckDB that lives only for the server process.
-    """
-    dialect_name = engine.dialect.name
-    dialect_label = _DIALECT_LABELS.get(dialect_name, dialect_name)
-
-    # --- session workspace: a DuckDB database addressed by result name --- #
-    # With session_dir -> a durable file; without -> in-memory (ephemeral, and
-    # naturally isolated so multiple servers in one process never lock-conflict).
-    import duckdb
-
-    if session_dir is not None:
-        session_path = os.path.abspath(session_dir)
-        os.makedirs(session_path, exist_ok=True)
-        workspace = duckdb.connect(os.path.join(session_path, "workspace.duckdb"))
-    else:
-        workspace = duckdb.connect()
-
-    # Each flow is a DuckDB schema, so parallel pipelines can't collide on names
-    # and a whole pipeline tears down with one DROP SCHEMA. The default flow is the
-    # schema "default"; ensure it exists up front so list_flows always shows it.
-    default_flow = "default"
-    workspace.execute(f'CREATE SCHEMA IF NOT EXISTS "{default_flow}"')
-
-    # A single DuckDBPyConnection isn't safe for concurrent use, so serialize every
-    # workspace touch. The slow part — source-DB pulls in save_result — happens
-    # OUTSIDE this lock, so parallel flows still overlap where it actually matters.
-    ws_lock = threading.Lock()
-
-    # run_query nudge state: a ledger of query *derivations* (normalized-AST
-    # fingerprints), each tracking how often it has run and the wall-time it has
-    # cost. The repeat nudge fires only when a derivation both recurs AND has burned
-    # real time — fast/small repeats stay silent, which is the case that trained
-    # agents to ignore the hint. LRU-bounded so a long session can't leak memory.
-    run_query_lock = threading.Lock()
-    derivation_ledger: "OrderedDict[str, dict]" = OrderedDict()
+    source_list = ", ".join(f"{s.name} ({s.kind})" for s in session.sources) or "(none configured)"
+    has_fallback = bool(session.fallback_sources)
 
     mcp = FastMCP(
         "spelunk",
         instructions=(
-            f"Spelunk exposes a connected {dialect_label} database for read-only exploration and querying.\n\n"
-            "## Resources\n"
-            "- `db://tables` — call this first to get a JSON array of all tables and views "
-            "(each entry has `name`, `kind`, and `row_count`).\n"
-            "- `db://{table}` — describe a single table by name: columns with types and nullability, "
-            "primary key, foreign-key relationships, a few sample rows, and per-column value profiles. "
-            "Use this to understand schema details before writing SQL.\n\n"
-            "## Tools\n"
-            "- `run_query(sql)` — execute a read-only SELECT query and get back rows as a list of dicts. "
-            "Results are capped at 1 000 rows. Writes (INSERT/UPDATE/DELETE/DDL/PRAGMA writes) are "
-            "blocked at the AST level and will raise an error.\n"
-            "- `export_query(sql, format, path, timeout_s?)` — run a query with no row cap and write "
-            "the full result to a file. Supported formats: `csv`, `json`, `parquet` (parquet requires "
-            "pyarrow). `path` is an absolute or relative file path; parent directories are created "
-            "automatically. Default timeout is 300 s.\n"
-            "- `describe_query(sql)` — profile every column in the query result using "
-            "SQL aggregates pushed to the database. "
-            "Numeric columns return non_null_count, null_rate, min, max, mean, std — "
-            "plus p25/p50/p75/p95 on databases with ordered-set PERCENTILE_CONT "
-            "(PostgreSQL, Oracle, DuckDB). "
-            "Text/object columns return non_null_count, null_rate, unique, "
-            "top (most-frequent value), freq (its count). "
-            "Use this instead of writing manual aggregation queries.\n\n"
-            "## Choosing a tool\n"
-            "- One-off look, or a quick query against a fast database → `run_query`. "
-            "Do NOT reach for flows when the source responds quickly and you won't "
-            "reuse the result; the staging overhead isn't worth it. The cheap path is "
-            "the right path here.\n"
-            "- Switch to a FLOW (`extract`, then `peek` / `transform`) when ANY of these hold:\n"
-            "  - the source pull is slow or expensive AND you'll query that slice more than once;\n"
-            "  - you need the FULL result set (`run_query` caps at 1000 rows);\n"
-            "  - you're chaining two or more derivations (filter → aggregate → join), each "
-            "step building on the last;\n"
-            "  - you're combining several source queries together locally.\n"
-            "  `extract` and `transform` return a head sample, so caching costs one call and "
-            "you still see your data immediately; `name` is optional (auto-assigned if omitted). "
-            "Caching once and querying locally beats re-issuing the same source query.\n"
-            "- Column distributions / summary stats (min/max/mean/std/percentiles, top value) "
-            "→ `describe_query`, not hand-written aggregation SQL.\n\n"
-            "## Session workspace (named results)\n"
-            "A local DuckDB workspace lets you cache results from the source database "
-            "under a name and then query, join, and transform them locally — without "
-            "re-hitting the source DB. Results are addressed by NAME, never by file path.\n\n"
-            "Results live in a FLOW: an independent, named workspace (its own namespace). "
-            "Every workspace tool takes an optional `flow` (default `\"default\"`). Use one "
-            "flow per concurrent line of analysis so their results never collide — even when "
-            "they share the same result name. NOTE: a spelunk flow is just a result "
-            "namespace in this database; it is NOT an orchestration or control-flow "
-            "'pipeline'. If asked to run several analyses in parallel, give each its own "
+            "Spelunk is a single DuckDB engine over all your data sources. Files (CSV/Parquet/"
+            "JSON/Excel) and attached databases (SQLite/PostgreSQL/MySQL) live in one DuckDB "
+            "session together with your saved results, so one query can join across all of "
+            f"them. All SQL is DuckDB SQL. Configured sources: {source_list}.\n\n"
+            "## Discover\n"
+            "- `db://tables` — JSON array of queryable source objects. Attached-database tables "
+            "are named `<source>.<table>` (paste-ready); file sources appear as a bare view name.\n"
+            "- `db://{table}` — describe one object: columns, types, primary key, a sample, and "
+            "a row count. Read this before writing SQL.\n\n"
+            "## Query and build\n"
+            "- `query(sql, name, flow?)` — run a read-only SELECT over sources AND saved results, "
+            "and store the FULL result as table `name` in the flow (no row cap). Returns the "
+            "result's columns, true row_count, and a head sample. This is the ONE tool for both "
+            "looking and building: every result is named and immediately reusable — reference it "
+            "by `name` in your next query. `name` is required; reuse a scratch name (e.g. `tmp`) "
+            "for throwaways, or `drop` them. Reference attached DB tables as \"<source>\".\"<table>\", "
+            "files and prior results by bare name.\n"
+            "- `profile(sql, flow?)` — per-column stats (null_rate, min/max/mean/std, "
+            "p25/p50/p75/p95 for numerics; unique/top/freq for text) over the full result. Use "
+            "this instead of writing manual aggregation queries.\n"
+            "- `export(target, format, path, flow?)` — write a saved result name OR a full SELECT "
+            "to csv/json/parquet (no row cap).\n"
+            + (
+                "- `import_remote(sql, name, flow?)` — a SQL Server / SQLAlchemy-only source can't "
+                "be attached, so pull a SELECT from it into the flow as table `name`, then query "
+                "that table normally.\n"
+                if has_fallback
+                else ""
+            )
+            + "\n## Organize with flows\n"
+            "A *flow* is an isolated result namespace (a DuckDB schema; default `\"default\"`). "
+            "Give each concurrent line of analysis its own `flow` so results never collide. "
+            "Reference a result in another flow as \"<flow>\".\"<name>\".\n"
+            "- `catalog()` — list flows and their result counts; `catalog(flow)` — list the "
+            "results in a flow with columns and row counts.\n"
+            "- `drop(name, flow?)` — drop one result; `drop(flow=...)` with no name — drop a whole "
             "flow.\n\n"
-            "PARALLEL RULE: calls within the same flow are sequential (single DuckDB "
-            "connection). Calls across different flows are parallel-safe. Give each "
-            "concurrent line of analysis its own flow.\n\n"
-            "Worked example — pull once from the source, then query it locally in a flow:\n"
-            "  extract('SELECT id, name FROM artist', 'art', flow='artists')\n"
-            "  peek('SELECT COUNT(*) FROM art', flow='artists')\n\n"
-            "### Tools\n"
-            "- `extract(sql, name?, flow?)` — pull a SELECT from the SOURCE database "
-            "(no row cap) into the flow as table `name`. Use this to pull a slice once and "
-            "reuse it. `name` is optional (auto-assigned if omitted); the response includes a "
-            "head sample so you see the data without a follow-up call.\n"
-            "- `peek(sql, flow?)` — inspect cached results (capped at 1000 rows). "
-            "Use transform to compute over the full set without truncation. "
-            "Sequential within a flow.\n"
-            "- `transform(sql, name?, flow?)` — materialize a query over cached results "
-            "as a new named table (no row cap). Build step-by-step: each result feeds the next. "
-            "`name` is optional (auto-assigned if omitted); the response includes a head sample. "
-            "Sequential within a flow.\n"
-            "- `list_results(flow?)` — list saved results in a flow with their columns, "
-            "types, and row counts so you know what you can build on.\n"
-            "- `export_result(name, format, path, flow?)` — write a saved result to a file "
-            "(parquet/csv/json) when you want a durable artifact.\n"
-            "- `drop_result(name, flow?)` — delete a single intermediate you no longer need.\n"
-            "- `drop_flow(flow)` — delete an entire flow (all its results) in one call.\n"
-            "- `list_flows()` — list active flows and how many results each holds.\n\n"
-            "### Running several analyses at once\n"
-            "Give each line of analysis its own `flow` so their intermediates stay separate "
-            "(see PARALLEL RULE above — steps within a flow are sequential). "
-            "Within a flow, `peek` / `save_result_from` resolve bare result names "
-            "automatically. To combine results across flows, fully-qualify each name as "
-            "`\"<flow>\".\"<name>\"` — for example, joining a result from flow `q1` with one "
-            "from flow `q2`:\n"
-            "  peek('SELECT * FROM \"q1\".\"loans\" a "
-            "JOIN \"q2\".\"loans\" b ON a.region = b.region')\n\n"
-            "### Lifecycle\n"
-            "Flows persist for the life of the server (and across restarts when a session "
-            "directory is configured), and remain available across turns until you remove "
-            "them. Use `list_flows()` to see what exists, `drop_result` to drop a single "
-            "intermediate, and `drop_flow` to tidy up an entire analysis when you're done "
-            "with it.\n\n"
-            "## Recommended workflow\n"
-            "1. Read `db://tables` to discover what tables exist.\n"
-            "2. Read `db://{table}` for each table relevant to the question — pay attention to "
-            "foreign keys to understand join paths and to column profiles for value distributions.\n"
-            "3. Draft a SELECT query. Prefer explicit column lists over `SELECT *`.\n"
-            "4. Call `run_query` with your SQL. If the result is empty or unexpected, inspect the "
-            "sample rows from step 2 and adjust.\n"
-            "5. Call `describe_query` to profile the distribution of any result set — "
-            "use it instead of writing manual aggregation queries.\n"
-            "6. For multi-step analysis — caching an expensive pull, combining several "
-            "source queries, or building intermediate results — switch to the session "
-            "workspace: `extract` to cache a source query, then `peek` / "
-            "`transform` to build on it locally without re-hitting the source. When "
-            "running several independent analyses at once, give each its own `flow` (see "
-            "the Session workspace section), and `drop_flow` to clean up when done.\n\n"
-            "## Constraints\n"
-            "- All queries must be read-only SELECT statements (CTEs are fine).\n"
-            "- `run_query` is capped at 1 000 rows; use `export_query` for full result sets.\n"
-            "- `describe_query` aggregates over the full query result set — no row cap.\n"
-            f"- The connected database is {dialect_label} — write SQL in its dialect."
+            "## Notes\n"
+            "- All queries are read-only SELECTs (CTEs fine); writes/DDL are rejected at the AST "
+            "level. The server materializes your SELECT as a table for you — don't write CREATE/"
+            "INSERT yourself.\n"
+            "- The head sample is a preview; the full result is the saved table — `profile` or "
+            "query it for the whole set, or `export` it to a file.\n"
+            "- Sources are read on demand (DuckDB pushes filters/projections down); filter or "
+            "aggregate before materializing rather than copying a whole large table."
         ),
     )
 
-    # ------------------------------------------------------------------ #
-    # Resource: list all tables
-    # ------------------------------------------------------------------ #
-    @mcp.resource("db://tables", name="list_tables", description="List all tables and views in the database.")
+    # --- Resources: source discovery ------------------------------------------------ #
+    @mcp.resource("db://tables", name="list_tables", description="List queryable source objects (attached-DB tables + file views).")
     def _list_tables() -> str:
-        """Return a JSON array of {name, kind, row_count} objects."""
-        objects = list_objects(engine)
-        return json.dumps([obj.model_dump() for obj in objects])
+        return json.dumps([obj.model_dump() for obj in session.list_objects()])
 
-    # ------------------------------------------------------------------ #
-    # Resource template: describe a single table
-    # ------------------------------------------------------------------ #
-    @mcp.resource(
-        "db://{table}",
-        name="describe_table",
-        description="Describe a table: columns, primary key, foreign keys, sample rows, and column profile.",
-    )
+    @mcp.resource("db://{table}", name="describe_table", description="Describe one source object: columns, primary key, sample rows, row count.")
     def _describe_table(table: str) -> str:
-        """Return a JSON object describing *table*."""
-        desc = describe(engine, table)
-        return desc.model_dump_json()
+        return session.describe(table).model_dump_json()
 
-    # ------------------------------------------------------------------ #
-    # Tool: run a read-only SQL query
-    # ------------------------------------------------------------------ #
-    def _true_row_count(sql: str) -> int | None:
-        """Best-effort full row count for a truncated query; None if it errors.
-
-        Wraps the query in COUNT(*) through the same read-only guard. Only worth
-        calling when the original query was fast — see the truncation branch below.
-        """
-        try:
-            counted = run_sql(engine, f"SELECT COUNT(*) AS n FROM ({sql}) AS _spelunk_full", max_rows=1)
-        except Exception:
-            return None
-        if counted.rows:
-            try:
-                return int(counted.rows[0][0])
-            except (TypeError, ValueError):
-                return None
-        return None
-
-    def _query_hints(sql: str, result) -> list[str]:
-        """Evidence-gated nudges toward flows / describe_query for a run_query call.
-
-        Fires only on observed runtime facts (slow pull, truncation, repeated *and
-        costly* derivation, manual summary aggregation) so the cheap path stays
-        unflagged when it's right.
-        """
-        hints: list[str] = []
-
-        # Track this derivation's recurrence and accumulated cost. Keyed by AST
-        # shape (not raw table set) so unrelated queries sharing a table don't
-        # collide and so re-runs over different filter values count as one slice.
-        deriv = _derivation_id(sql, dialect_name)
-        repeat_count = 0
-        repeat_elapsed = 0.0
-        if deriv is not None:
-            with run_query_lock:
-                entry = derivation_ledger.get(deriv)
-                if entry is None:
-                    if len(derivation_ledger) >= _LEDGER_MAX:
-                        derivation_ledger.popitem(last=False)  # evict LRU
-                    entry = {"count": 0, "total_elapsed_s": 0.0, "tables": _source_tables(sql, dialect_name)}
-                entry["count"] += 1
-                entry["total_elapsed_s"] += result.elapsed_s or 0.0
-                derivation_ledger[deriv] = entry
-                derivation_ledger.move_to_end(deriv)
-                repeat_count = entry["count"]
-                repeat_elapsed = entry["total_elapsed_s"]
-                repeat_tables = entry["tables"]
-
-        slow = (result.elapsed_s or 0.0) >= _SLOW_QUERY_S
-        if slow:
-            hints.append(
-                f"This query took {result.elapsed_s:.1f}s. If you'll query this data "
-                "again, `extract` it into a flow once and run follow-ups locally with "
-                "`peek` / `transform` instead of re-hitting the source."
-            )
-        if result.truncated:
-            # Report the true size when the query was cheap enough that a second
-            # COUNT(*) pass is affordable; on a slow query, skip it rather than
-            # double the cost.
-            extent = "the first 1000 rows"
-            if not slow:
-                true_n = _true_row_count(sql)
-                if true_n is not None:
-                    extent = f"1000 of {true_n} rows"
-            hints.append(
-                f"⚠ TRUNCATED: you are seeing only {extent} — aggregates or "
-                "conclusions drawn from this output may be WRONG. To work over the FULL "
-                "set, `extract` it into a flow and use `transform` (uncapped), or "
-                "`export_query` to write it to a file."
-            )
-        # Repeat nudge: recurs >= N times AND has cost real time. Suppressed when the
-        # slow hint already fired this call — they recommend the same fix.
-        if not slow and repeat_count >= _REPEAT_HINT_AT and repeat_elapsed >= _REPEAT_ELAPSED_S:
-            tbl = ", ".join(sorted(repeat_tables)) if repeat_tables else "this slice"
-            hints.append(
-                f"You've run this derivation {repeat_count} times ({repeat_elapsed:.1f}s "
-                f"total over {tbl}). `extract` it into a flow once, then `peek` / "
-                "`transform` locally to avoid repeated source round-trips."
-            )
-        if _is_summary_aggregate(sql, dialect_name):
-            hints.append(
-                "This looks like manual summary aggregation. `describe_query(sql)` returns "
-                "per-column min/max/mean/std (and percentiles where supported) in one call."
-            )
-        return hints
-
+    # --- Tools ----------------------------------------------------------------------- #
     @mcp.tool(
-        name="run_query",
+        name="query",
         description=(
-            "Execute a read-only SQL query against the database. "
-            "Writes (INSERT/UPDATE/DELETE/DDL) are rejected. "
-            "Results are capped at 1000 rows — for full result sets, slices you'll "
-            "query more than once, or the same derivation run repeatedly, prefer "
-            "`extract` then `peek` / `transform`."
+            "Run a read-only DuckDB SELECT over sources and saved results, and store the full "
+            "result (no row cap) as table `name` in the flow for immediate reuse. Returns "
+            "columns, true row_count, and a head sample. `name` is required. Reference attached "
+            "DB tables as \"<source>\".\"<table>\"; files and prior results by bare name. Writes/DDL "
+            "are rejected."
         ),
     )
-    def _run_query(sql: str) -> dict:
-        """Execute *sql* and return a QueryResult-shaped dict (+ optional hints)."""
-        result = run_sql(engine, sql)
-        payload = result.model_dump()
-        hints = _query_hints(sql, result)
-        if hints:
-            payload["hints"] = hints
-        return payload
+    def _query(sql: str, name: str, flow: str = "default") -> dict:
+        return session.query(sql, name, flow)
 
-    # ------------------------------------------------------------------ #
-    # Tool: export a query to a file (no row cap, extended timeout)
-    # ------------------------------------------------------------------ #
     @mcp.tool(
-        name="export_query",
+        name="profile",
         description=(
-            "Execute a read-only SQL query and export the full result set to a file. "
-            "No row limit is enforced — use this for large result sets. "
-            "Supported formats: csv, json, parquet (parquet requires pyarrow). "
-            "Parent directories are created automatically. "
-            "Writes (INSERT/UPDATE/DELETE/DDL) are rejected."
+            "Run a SELECT and return per-column statistics over the full result, computed in "
+            "DuckDB. Numerics: non_null_count, null_rate, min, max, mean, std, p25/p50/p75/p95. "
+            "Text: non_null_count, null_rate, unique, top, freq. No row cap."
         ),
     )
-    def _export_query(sql: str, format: str, path: str, timeout_s: int = 300) -> dict:
-        """Run *sql* and write all rows to *path* in *format* (csv/json/parquet)."""
-        fmt = format.lower().strip()
-        if fmt not in ("csv", "json", "parquet"):
-            raise ValueError(f"Unsupported format {fmt!r}. Choose csv, json, or parquet.")
+    def _profile(sql: str, flow: str = "default") -> dict:
+        return session.profile(sql, flow)
 
-        result = run_sql(engine, sql, max_rows=None, timeout_s=timeout_s)
-        df = pd.DataFrame(result.rows, columns=result.columns)
-
-        abs_path = os.path.abspath(path)
-        parent = os.path.dirname(abs_path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-
-        if fmt == "csv":
-            df.to_csv(abs_path, index=False)
-        elif fmt == "json":
-            df.to_json(abs_path, orient="records", indent=2, force_ascii=False)
-        elif fmt == "parquet":
-            import duckdb
-            # DuckDB accepts forward slashes on Windows; escape any literal quotes.
-            safe_path = abs_path.replace("\\", "/").replace("'", "''")
-            with duckdb.connect() as dconn:
-                dconn.register("_export", df)
-                dconn.execute(f"COPY _export TO '{safe_path}' (FORMAT PARQUET)")
-
-        return {
-            "path": abs_path,
-            "format": fmt,
-            "row_count": result.row_count,
-            "columns": result.columns,
-            "elapsed_s": round(result.elapsed_s, 3),
-        }
-
-    # ------------------------------------------------------------------ #
-    # Tool: profile every column of a query result
-    # ------------------------------------------------------------------ #
     @mcp.tool(
-        name="describe_query",
+        name="export",
         description=(
-            "Run a SQL query and return per-column statistics computed in the database. "
-            "Numeric columns: non_null_count, null_rate, min, max, mean, std"
-            " — plus p25/p50/p75/p95 on databases with ordered-set PERCENTILE_CONT "
-            "(PostgreSQL, Oracle, DuckDB). "
-            "Text/object columns: non_null_count, null_rate, unique, "
-            "top (most-frequent value), freq (its count). "
-            "Aggregates run over the full result set of the query — no row cap."
+            "Write a saved result (by name, e.g. `joined` or \"src\".\"orders\") OR a full SELECT "
+            "to a file. Formats: csv, json, parquet. Parent directories are created. No row cap."
         ),
     )
-    def _describe_query(sql: str) -> dict:
-        t0 = time.perf_counter()
+    def _export(target: str, format: str, path: str, flow: str = "default") -> dict:
+        return session.export(target, format, path, flow)
 
-        # Probe: run with a small LIMIT to discover column names and types.
-        # run_sql handles the read-only guard and LIMIT injection.
-        probe = run_sql(engine, sql, max_rows=10)
-        columns = probe.columns
+    @mcp.tool(
+        name="catalog",
+        description=(
+            "With no argument: list active flows and how many results each holds. With a flow: "
+            "list that flow's saved results with their columns, types, and row counts."
+        ),
+    )
+    def _catalog(flow: str | None = None) -> dict:
+        return session.catalog(flow)
 
-        if not columns:
-            return {"row_count": 0, "elapsed_s": 0.0, "columns": {}}
+    @mcp.tool(
+        name="drop",
+        description=(
+            "Delete a saved result (give `name`) or an entire flow and all its results (give "
+            "only `flow`). Idempotent; cannot drop reserved schemas."
+        ),
+    )
+    def _drop(name: str | None = None, flow: str = "default") -> dict:
+        return session.drop(name, flow)
 
-        numeric_cols = _detect_numeric(columns, probe.rows)
-        object_col_list = [c for c in columns if c not in numeric_cols]
-
-        # Build a single aggregate SELECT over the full query result.
-        # agg_meta tracks (col, stat) in the same positional order as select_parts
-        # so we can unpack the result row by index without relying on aliases.
-        select_parts: list[str] = ["COUNT(*)"]
-        agg_meta: list[tuple[str, str]] = [("_total", "_total")]
-
-        for col in columns:
-            qc = _quote_col(col, dialect_name)
-
-            select_parts.append(
-                f"1.0 * (COUNT(*) - COUNT({qc})) / NULLIF(COUNT(*), 0)"
-            )
-            agg_meta.append((col, "null_rate"))
-
-            select_parts.append(f"COUNT({qc})")
-            agg_meta.append((col, "non_null_count"))
-
-            if col in numeric_cols:
-                select_parts.append(f"MIN({qc})")
-                agg_meta.append((col, "min"))
-                select_parts.append(f"MAX({qc})")
-                agg_meta.append((col, "max"))
-                select_parts.append(f"AVG({qc})")
-                agg_meta.append((col, "mean"))
-
-                if dialect_name in _STDDEV_DIALECTS:
-                    fn = _STDDEV_FN.get(dialect_name, "STDDEV")
-                    select_parts.append(f"{fn}({qc})")
-                    agg_meta.append((col, "std"))
-                elif dialect_name in _MANUAL_STDDEV_DIALECTS:
-                    select_parts.append(
-                        f"SQRT(ABS(AVG({qc} * {qc}) - AVG({qc}) * AVG({qc})))"
-                    )
-                    agg_meta.append((col, "std"))
-
-                if dialect_name in _PERCENTILE_DIALECTS:
-                    for pct, label in (
-                        (0.25, "p25"), (0.50, "p50"), (0.75, "p75"), (0.95, "p95")
-                    ):
-                        select_parts.append(
-                            f"PERCENTILE_CONT({pct}) WITHIN GROUP (ORDER BY {qc})"
-                        )
-                        agg_meta.append((col, label))
-            else:
-                select_parts.append(f"COUNT(DISTINCT {qc})")
-                agg_meta.append((col, "unique"))
-
-        agg_sql = (
-            f"SELECT {', '.join(select_parts)} "
-            f"FROM ({sql}) AS _spelunk_q"
+    if has_fallback:
+        @mcp.tool(
+            name="import_remote",
+            description=(
+                "Pull a read-only SELECT from a SQL Server / SQLAlchemy-only source (which DuckDB "
+                "cannot attach) into the flow as table `name`, then query it normally. No row cap."
+            ),
         )
-
-        with engine.connect() as conn:
-            agg_row = list(conn.execute(_sa_text(agg_sql)).fetchone())
-
-            col_stats: dict[str, dict[str, Any]] = {col: {} for col in columns}
-            total_rows = int(agg_row[0])
-
-            for i, (col, stat) in enumerate(agg_meta):
-                if col == "_total":
-                    continue
-                val = _to_python(agg_row[i])
-                if isinstance(val, float):
-                    val = round(val, 6)
-                col_stats[col][stat] = val
-
-            # Top/freq for object columns: one lightweight GROUP BY per column.
-            for col in object_col_list:
-                qc = _quote_col(col, dialect_name)
-                top_sql = (
-                    f"SELECT {qc}, COUNT(*) AS _spelunk_freq "
-                    f"FROM ({sql}) AS _spelunk_top "
-                    f"WHERE {qc} IS NOT NULL "
-                    f"GROUP BY {qc} "
-                    f"ORDER BY _spelunk_freq DESC "
-                    f"LIMIT 1"
-                )
-                top_row = conn.execute(_sa_text(top_sql)).fetchone()
-                if top_row:
-                    col_stats[col]["top"] = _to_python(top_row[0])
-                    col_stats[col]["freq"] = int(top_row[1])
-                else:
-                    col_stats[col]["top"] = None
-                    col_stats[col]["freq"] = 0
-
-        return {
-            "row_count": total_rows,
-            "elapsed_s": round(time.perf_counter() - t0, 3),
-            "columns": col_stats,
-        }
-
-    # ------------------------------------------------------------------ #
-    # Session workspace: named results in a local DuckDB database.
-    # Each flow is a schema, so parallel pipelines stay isolated and tear
-    # down independently. Every workspace touch holds ws_lock.
-    # ------------------------------------------------------------------ #
-    def _ensure_flow(flow: str) -> None:
-        """Create the flow's schema if absent (caller holds ws_lock)."""
-        workspace.execute(f'CREATE SCHEMA IF NOT EXISTS "{flow}"')
-
-    def _workspace_columns(name: str, flow: str) -> list[dict[str, str]]:
-        """Return [{name, type}] for a result in *flow* (caller holds ws_lock)."""
-        rows = workspace.execute(
-            "SELECT column_name, data_type FROM information_schema.columns "
-            "WHERE table_schema = ? AND table_name = ? ORDER BY ordinal_position",
-            [flow, name],
-        ).fetchall()
-        return [{"name": c, "type": t} for c, t in rows]
-
-    def _flow_result_names(flow: str) -> list[str]:
-        """Return all result names in *flow* (caller holds ws_lock)."""
-        rows = workspace.execute(
-            "SELECT table_name FROM information_schema.tables "
-            "WHERE table_schema = ? ORDER BY table_name",
-            [flow],
-        ).fetchall()
-        return [r[0] for r in rows]
-
-    def _next_auto_name(flow: str) -> str:
-        """Return the first free auto name (r1, r2, …) in *flow* (caller holds ws_lock).
-
-        Removes the 'I have to think of a name' friction that pushed agents toward
-        run_query — extract/transform can be called with no name at all.
-        """
-        existing = set(_flow_result_names(flow))
-        i = 1
-        while f"r{i}" in existing:
-            i += 1
-        return f"r{i}"
-
-    def _head_sample(name: str, flow: str, n: int = _SAMPLE_ROWS) -> list[list]:
-        """Return up to *n* rows from *flow*.*name* as a list of lists (caller holds ws_lock).
-
-        Aligns positionally with the result's `columns`, mirroring run_query/peek so
-        extract/transform show their data in one call.
-        """
-        cur = workspace.execute(f'SELECT * FROM "{flow}"."{name}" LIMIT {n}')
-        return [[_to_python(v) for v in row] for row in cur.fetchall()]
-
-    @mcp.tool(
-        name="extract",
-        description=(
-            "Run a read-only SELECT against the SOURCE database (no row cap) and store the "
-            "full result in the session workspace as a named table. Reuse it later with "
-            "peek / transform without re-querying the source. "
-            "`name` is optional — omit it and a name (r1, r2, …) is auto-assigned; if given "
-            "it must be a SQL identifier. `flow` (default 'default') is an isolated "
-            "result namespace — give each concurrent line of analysis its own flow. "
-            "Replaces any existing result with the same name in that flow. "
-            "The response includes a head sample so you see the data without a follow-up peek."
-        ),
-    )
-    def _extract(sql: str, name: str | None = None, flow: str = default_flow) -> dict:
-        """Pull a source-DB query into *flow* as table *name* (auto-named if omitted)."""
-        _validate_name(flow, "flow name")
-        if name is not None:
-            _validate_name(name)
-        # run_sql applies the read-only guard and pulls all rows (max_rows=None).
-        # This source pull is the slow part and runs OUTSIDE the lock so parallel
-        # save_result calls overlap on the source DB.
-        result = run_sql(engine, sql, max_rows=None)
-        df = pd.DataFrame(result.rows, columns=result.columns)
-        tmp = f"_save_src_{uuid4().hex}"  # unique so concurrent saves never clobber
-        with ws_lock:
-            _ensure_flow(flow)
-            if name is None:
-                name = _next_auto_name(flow)
-            workspace.register(tmp, df)
-            try:
-                workspace.execute(
-                    f'CREATE OR REPLACE TABLE "{flow}"."{name}" AS SELECT * FROM {tmp}'
-                )
-            finally:
-                workspace.unregister(tmp)
-            columns = _workspace_columns(name, flow)
-            sample = _head_sample(name, flow)
-        return {
-            "name": name,
-            "flow": flow,
-            "row_count": result.row_count,
-            "columns": columns,
-            "sample": sample,
-            "elapsed_s": round(result.elapsed_s or 0.0, 3),
-        }
-
-    @mcp.tool(
-        name="peek",
-        description=(
-            "Execute read-only DuckDB SQL over the named results in a flow. "
-            "CAPPED AT 1000 ROWS — use transform to compute on the full set without "
-            "truncation, or export_result to write it to a file. "
-            "Reference results by bare name (e.g. `FROM my_result`), or qualify across "
-            "flows as \"<flow>\".\"<name>\". `flow` (default 'default') selects the namespace. "
-            "Calls within the same flow are sequential — use separate flows for parallel analysis."
-        ),
-    )
-    def _peek(sql: str, flow: str = default_flow) -> dict:
-        """Run a read-only DuckDB query over *flow* and return rows."""
-        _validate_name(flow, "flow name")
-        guard.assert_read_only(sql, "duckdb")
-        sql2 = guard.enforce_limit(sql, "duckdb", 1000)
-        with ws_lock:
-            _ensure_flow(flow)
-            workspace.execute(f"SET search_path = '{flow}'")
-            t0 = time.perf_counter()
-            try:
-                cur = workspace.execute(sql2)
-            except duckdb.CatalogException as exc:
-                available = _flow_result_names(flow)
-                raise ValueError(
-                    f"{exc}\nFlow {flow!r} contains: {available or ['(none)']}. "
-                    f"Call list_results(flow={flow!r}) to see saved results."
-                ) from exc
-            columns = [d[0] for d in cur.description] if cur.description else []
-            rows = [[_to_python(v) for v in row] for row in cur.fetchall()]
-            elapsed_s = time.perf_counter() - t0
-        return {
-            "columns": columns,
-            "rows": rows,
-            "row_count": len(rows),
-            "row_cap": 1000,
-            "truncated": len(rows) == 1000,
-            "elapsed_s": round(elapsed_s, 3),
-            "sql_executed": sql2,
-        }
-
-    @mcp.tool(
-        name="transform",
-        description=(
-            "Run read-only DuckDB SQL over the named results in a flow and store its full "
-            "output (NO row cap) under a new name in that same flow — unlike peek, "
-            "which is capped at 1000 rows. This is how you build analyses step by step: "
-            "each result feeds the next. `name` is optional — omit it and a name (r1, r2, …) "
-            "is auto-assigned; if given it (and `flow`) must be a SQL identifier. "
-            "Replaces any existing result with that name in the flow. "
-            "The response includes a head sample so you see the output immediately. "
-            "Calls within the same flow are sequential — use separate flows for parallel analysis."
-        ),
-    )
-    def _transform(sql: str, name: str | None = None, flow: str = default_flow) -> dict:
-        """Transform cached results into a new table *name* (auto-named if omitted)."""
-        _validate_name(flow, "flow name")
-        if name is not None:
-            _validate_name(name)
-        guard.assert_read_only(sql, "duckdb")
-        with ws_lock:
-            _ensure_flow(flow)
-            if name is None:
-                name = _next_auto_name(flow)
-            workspace.execute(f"SET search_path = '{flow}'")
-            t0 = time.perf_counter()
-            try:
-                workspace.execute(f'CREATE OR REPLACE TABLE "{flow}"."{name}" AS {sql}')
-            except duckdb.CatalogException as exc:
-                available = _flow_result_names(flow)
-                raise ValueError(
-                    f"{exc}\nFlow {flow!r} contains: {available or ['(none)']}. "
-                    f"Call list_results(flow={flow!r}) to see saved results."
-                ) from exc
-            row_count = workspace.execute(
-                f'SELECT COUNT(*) FROM "{flow}"."{name}"'
-            ).fetchone()[0]
-            columns = _workspace_columns(name, flow)
-            sample = _head_sample(name, flow)
-        return {
-            "name": name,
-            "flow": flow,
-            "row_count": int(row_count),
-            "columns": columns,
-            "sample": sample,
-            "elapsed_s": round(time.perf_counter() - t0, 3),
-        }
-
-    @mcp.tool(
-        name="list_results",
-        description=(
-            "List the named results in a flow (default 'default'), each with its columns, "
-            "types, and row count, so you know what you can query or build on."
-        ),
-    )
-    def _list_results(flow: str = default_flow) -> dict:
-        """Return all results in *flow* with schema and row counts."""
-        _validate_name(flow, "flow name")
-        with ws_lock:
-            _ensure_flow(flow)
-            tables = workspace.execute(
-                "SELECT table_name FROM information_schema.tables "
-                "WHERE table_schema = ? ORDER BY table_name",
-                [flow],
-            ).fetchall()
-            results = []
-            for (tname,) in tables:
-                row_count = workspace.execute(
-                    f'SELECT COUNT(*) FROM "{flow}"."{tname}"'
-                ).fetchone()[0]
-                results.append({
-                    "name": tname,
-                    "row_count": int(row_count),
-                    "columns": _workspace_columns(tname, flow),
-                })
-        return {"flow": flow, "results": results}
-
-    @mcp.tool(
-        name="export_result",
-        description=(
-            "Write a named result from a flow to a file for a durable artifact. "
-            "Supported formats: csv, json, parquet. `path` is an absolute or relative file "
-            "path; parent directories are created automatically."
-        ),
-    )
-    def _export_result(name: str, format: str, path: str, flow: str = default_flow) -> dict:
-        """Export result *name* from *flow* to *path* in *format* via DuckDB COPY."""
-        _validate_name(name)
-        _validate_name(flow, "flow name")
-        fmt = format.lower().strip()
-        copy_opts = {
-            "parquet": "(FORMAT PARQUET)",
-            "csv": "(FORMAT CSV, HEADER)",
-            "json": "(FORMAT JSON)",
-        }
-        if fmt not in copy_opts:
-            raise ValueError(f"Unsupported format {fmt!r}. Choose csv, json, or parquet.")
-
-        abs_path = os.path.abspath(path)
-        parent = os.path.dirname(abs_path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        # DuckDB accepts forward slashes on Windows; escape any literal quotes.
-        safe_path = abs_path.replace("\\", "/").replace("'", "''")
-        with ws_lock:
-            workspace.execute(
-                f'COPY "{flow}"."{name}" TO \'{safe_path}\' {copy_opts[fmt]}'
-            )
-            row_count = workspace.execute(
-                f'SELECT COUNT(*) FROM "{flow}"."{name}"'
-            ).fetchone()[0]
-        return {
-            "path": abs_path,
-            "format": fmt,
-            "name": name,
-            "flow": flow,
-            "row_count": int(row_count),
-        }
-
-    @mcp.tool(
-        name="drop_result",
-        description=(
-            "Delete a single named result from a flow when you no longer need it. "
-            "No error if it doesn't exist. Returns whether a result was actually removed."
-        ),
-    )
-    def _drop_result(name: str, flow: str = default_flow) -> dict:
-        """Drop result *name* from *flow* (idempotent)."""
-        _validate_name(name)
-        _validate_name(flow, "flow name")
-        with ws_lock:
-            existed = workspace.execute(
-                "SELECT COUNT(*) FROM information_schema.tables "
-                "WHERE table_schema = ? AND table_name = ?",
-                [flow, name],
-            ).fetchone()[0] > 0
-            workspace.execute(f'DROP TABLE IF EXISTS "{flow}"."{name}"')
-        return {"name": name, "flow": flow, "dropped": bool(existed)}
-
-    @mcp.tool(
-        name="drop_flow",
-        description=(
-            "Delete an entire flow and every result in it in one call — use this to clean "
-            "up a finished analysis. Cannot drop DuckDB's reserved schemas."
-        ),
-    )
-    def _drop_flow(flow: str) -> dict:
-        """Drop the whole *flow* schema and its results (idempotent)."""
-        _validate_name(flow, "flow name")
-        if flow in _RESERVED_SCHEMAS:
-            raise ValueError(f"Cannot drop reserved schema {flow!r}.")
-        with ws_lock:
-            dropped = workspace.execute(
-                "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ?",
-                [flow],
-            ).fetchone()[0]
-            workspace.execute(f'DROP SCHEMA IF EXISTS "{flow}" CASCADE')
-        return {"flow": flow, "dropped_results": int(dropped)}
-
-    @mcp.tool(
-        name="list_flows",
-        description=(
-            "List the active flows in the workspace and how many results each holds. "
-            "Use this to see what flows exist and what can be cleaned up."
-        ),
-    )
-    def _list_flows() -> dict:
-        """Return every user flow (schema) with its result count."""
-        with ws_lock:
-            placeholders = ", ".join("?" for _ in _RESERVED_SCHEMAS)
-            schemas = workspace.execute(
-                "SELECT schema_name FROM information_schema.schemata "
-                f"WHERE schema_name NOT IN ({placeholders}) ORDER BY schema_name",
-                list(_RESERVED_SCHEMAS),
-            ).fetchall()
-            flows = []
-            for (sname,) in schemas:
-                count = workspace.execute(
-                    "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ?",
-                    [sname],
-                ).fetchone()[0]
-                flows.append({"flow": sname, "result_count": int(count)})
-        return {"flows": flows}
+        def _import_remote(sql: str, name: str, flow: str = "default") -> dict:
+            return session.import_remote(sql, name, flow)
 
     return mcp
 
 
-# --------------------------------------------------------------------------- #
-# __main__ entry-point (stdio transport for Claude Code via .mcp.json)
-# --------------------------------------------------------------------------- #
 def main() -> None:
-    """CLI entry point: read --dsn, build server, serve over stdio."""
-    import argparse
-
-    from spelunk.core.connection import connect
-
+    """CLI entry point: build a DuckSession from --source specs, serve over stdio."""
     parser = argparse.ArgumentParser(
-        description="Spelunk MCP server — exposes spelunk.core over the MCP protocol."
+        description="Spelunk MCP server — one DuckDB engine over files and databases."
     )
     parser.add_argument(
-        "--dsn",
-        required=True,
-        help="SQLAlchemy DSN, e.g. sqlite:///path/to.db",
+        "--source",
+        action="append",
+        default=[],
+        metavar="SPEC",
+        help=(
+            "A data source, repeatable. A file path (.csv/.parquet/.json/.xlsx), a SQLite file, "
+            "or a sqlite:// / postgresql:// / mysql:// / mssql:// DSN. Prefix with name= to set "
+            "the source name, e.g. sales=./sales.parquet."
+        ),
     )
+    parser.add_argument("--dsn", default=None, help="Alias for a single --source (back-compat).")
     parser.add_argument(
         "--session-dir",
         default=None,
-        help=(
-            "Directory for a durable session workspace (workspace.duckdb holding named "
-            "results that survive restarts). Omit for an ephemeral in-memory workspace."
-        ),
+        help="Directory for a durable workspace (results survive restarts). Omit for ephemeral.",
     )
+    parser.add_argument("--memory-limit", default=None, help="DuckDB memory_limit, e.g. 4GB.")
+    parser.add_argument("--temp-dir", default=None, help="Directory for DuckDB spill files.")
+    parser.add_argument("--max-temp-size", default=None, help="Cap on spill size, e.g. 50GB.")
     args = parser.parse_args()
 
-    engine = connect(args.dsn)
-    server = build_server(engine, session_dir=args.session_dir)
+    specs = list(args.source)
+    if args.dsn:
+        specs.append(args.dsn)
+
+    session = DuckSession.open(
+        specs,
+        session_dir=args.session_dir,
+        memory_limit=args.memory_limit,
+        temp_dir=args.temp_dir,
+        max_temp_size=args.max_temp_size,
+    )
+    server = build_server(session)
     server.run(transport="stdio")
 
 

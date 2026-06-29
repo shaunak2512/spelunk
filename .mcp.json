@@ -5,8 +5,8 @@
       "args": [
         "-m",
         "spelunk.mcp.server",
-        "--dsn",
-        "sqlite:///C:/Users/shaun/repo/spelunk/data/bird/dev_20240627/dev_databases/financial/financial.sqlite",
+        "--source",
+        "pitchfork=C:\\Users\\shaun\\repo\\spelunk\\sample data\\pitchfork_review.sqlite",
         "--session-dir",
         "C:/Users/shaun/repo/spelunk/.spelunk_session"
       ]
