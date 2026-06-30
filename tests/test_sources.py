@@ -90,3 +90,26 @@ class TestAttachAll:
         sources.attach_all(con, [f"shop={sqlite_file}"])
         with pytest.raises(duckdb.Error):
             con.execute('INSERT INTO "shop"."customers" VALUES (99, \'X\', \'Y\', \'2024-01-01\')')
+
+
+class TestTeardownSql:
+    def test_file_drops_view(self):
+        src = sources.build_source("orders=./data/orders.csv")
+        assert sources.teardown_sql(src) == ['DROP VIEW IF EXISTS main."orders"']
+
+    def test_attached_db_detaches(self, sqlite_file):
+        src = sources.build_source(f"shop={sqlite_file}")
+        assert sources.teardown_sql(src) == ['DETACH "shop"']
+
+    def test_fallback_has_no_sql(self):
+        src = sources.Source(name="remote", kind="fallback", locator="x")
+        assert sources.teardown_sql(src) == []
+
+    def test_teardown_undoes_attach(self, sqlite_file):
+        con = duckdb.connect()
+        (src,) = sources.attach_all(con, [f"shop={sqlite_file}"])
+        con.execute('SELECT COUNT(*) FROM "shop"."customers"')  # attached
+        for stmt in sources.teardown_sql(src):
+            con.execute(stmt)
+        with pytest.raises(duckdb.Error):
+            con.execute('SELECT COUNT(*) FROM "shop"."customers"')  # detached

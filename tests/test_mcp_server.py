@@ -136,6 +136,35 @@ class TestToolLogging:
         assert rec["error"]
 
 
+class TestAddSourceGating:
+    def test_tools_absent_without_flag(self, mcp_server):
+        names = {t.name for t in _run(mcp_server.list_tools())}
+        assert "add_source" not in names and "remove_source" not in names
+
+    def test_tools_present_with_flag(self, sqlite_file):
+        session = DuckSession.open([f"shop={sqlite_file}"])
+        try:
+            names = {t.name for t in _run(build_server(session, allow_add_source=True).list_tools())}
+            assert {"add_source", "remove_source"} <= names
+            # import_remote is registered too, since a fallback source can now be added at runtime.
+            assert "import_remote" in names
+        finally:
+            session.close()
+
+    def test_add_then_query_then_remove(self, sqlite_file, parquet_file):
+        session = DuckSession.open([f"shop={sqlite_file}"])
+        server = build_server(session, allow_add_source=True)
+        try:
+            added = _run(server.call_tool("add_source", {"spec": f"regions={parquet_file}"})).structured_content
+            assert added["name"] == "regions"
+            data = _run(server.call_tool("query", {"sql": "SELECT * FROM regions", "name": "r"})).structured_content
+            assert data["row_count"] == 2
+            removed = _run(server.call_tool("remove_source", {"name": "regions"})).structured_content
+            assert removed["removed"] is True
+        finally:
+            session.close()
+
+
 class TestFallbackToolGating:
     def test_import_remote_registered_with_fallback(self, sqlite_file):
         # An mssql:// DSN can't actually connect, but build_source defers the connect to a

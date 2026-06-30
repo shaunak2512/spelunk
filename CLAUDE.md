@@ -64,7 +64,8 @@ One row-returning tool (`query`) owns every SELECT; inspection lives on the reso
 | `export(target, format, path, flow?)` | Write a saved result name **or** a full SELECT to csv/json/parquet. |
 | `catalog(flow?)` | No arg → list flows + counts; with a flow → its results. |
 | `drop(name?, flow?)` | Drop one result, or a whole flow (name omitted). |
-| `import_remote(sql, name, flow?)` | **Only registered when a SQL Server / SQLAlchemy-only source is configured** — DuckDB can't attach it, so pull a SELECT in, then query the table. |
+| `import_remote(sql, name, flow?)` | **Only registered when a SQL Server / SQLAlchemy-only source is configured** (or `--allow-add-source`, since one can be added at runtime) — DuckDB can't attach it, so pull a SELECT in, then query the table. |
+| `add_source(spec)` / `remove_source(name)` | **Only registered with `--allow-add-source`** — attach/detach a file or DB at runtime (`spec` is the same grammar as `--source`). Connection-global: a source is visible in **every flow**, not flow-scoped (DuckDB `ATTACH` can't be per-schema). Isolation comes from the process-per-agent model. |
 
 Resources: `db://tables` (queryable objects — attached-DB tables named `<source>.<table>`, file
 views named bare) and `db://{table}` (columns, PK, sample, row count).
@@ -105,6 +106,12 @@ python -m spelunk.mcp.server --source sales=./data/sales.parquet --source sqlite
 name). Optional guards: `--memory-limit`, `--temp-dir`, `--max-temp-size`. `--dsn` is a back-compat
 alias for one `--source`. A `.mcp.json` wires Claude Code to a local source (paths are
 machine-specific; edit before use).
+
+**`--allow-add-source` (off by default):** registers the `add_source` / `remove_source` tools so the
+agent can attach and detach sources at runtime. This lets the agent read **any** file or database the
+server process can reach (including DSNs with embedded credentials), so only enable it for a trusted
+setup — and it's sound precisely *because* of the process-per-agent default: each agent's server is
+its own process, so an add/remove touches only that agent's isolated connection and never another's.
 
 **Per-process workspace (the default):** `--session-dir` is a *root* (default `./.spelunk_session`,
 created if missing, gitignored) and **each server process gets its own durable workspace** at

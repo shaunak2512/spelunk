@@ -118,6 +118,44 @@ class TestFlows:
             session.drop(flow="main")
 
 
+class TestSourceManagement:
+    def test_add_file_source_then_query(self, session, parquet_file):
+        res = session.add_source(f"regions={parquet_file}")
+        assert res["name"] == "regions" and res["kind"] == "file"
+        assert [o["name"] for o in res["objects"]] == ["regions"]
+        # Queryable in any flow, by bare view name.
+        r = session.query("SELECT city FROM regions ORDER BY city", "cities", flow="other")
+        assert [row[0] for row in r["sample"]] == ["Melbourne", "Sydney"]
+
+    def test_add_db_source_lists_its_tables(self, session, sqlite_file):
+        res = session.add_source(f"shop2={sqlite_file}")
+        assert res["kind"] == "sqlite"
+        assert "shop2.customers" in [o["name"] for o in res["objects"]]
+        assert "shop2.customers" in [o.name for o in session.list_objects()]
+
+    def test_remove_source_detaches(self, session, parquet_file):
+        session.add_source(f"regions={parquet_file}")
+        out = session.remove_source("regions")
+        assert out == {"name": "regions", "kind": "file", "removed": True}
+        assert "regions" not in [s.name for s in session.sources]
+        with pytest.raises(ValueError, match="does not exist"):  # query wraps the CatalogException
+            session.query("SELECT * FROM regions", "x")
+
+    def test_remove_startup_source(self, session):
+        # remove-any: a source configured at open() can be detached too.
+        assert session.remove_source("orders")["removed"] is True
+        with pytest.raises(ValueError, match="does not exist"):
+            session.query("SELECT * FROM orders", "x")
+
+    def test_add_duplicate_name_rejected(self, session, parquet_file):
+        with pytest.raises(ValueError, match="already in use"):
+            session.add_source(f"orders={parquet_file}")  # 'orders' already configured
+
+    def test_remove_unknown_name_raises(self, session):
+        with pytest.raises(ValueError, match="No source named"):
+            session.remove_source("nope")
+
+
 class TestExport:
     def test_export_result_name(self, session, tmp_path):
         session.query("SELECT * FROM orders", "o")

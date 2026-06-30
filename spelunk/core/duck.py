@@ -288,6 +288,50 @@ class DuckSession:
         """Sources reachable only via SQLAlchemy (SQL Server / exotic) — for import_remote."""
         return [s for s in self.sources if s.kind == "fallback"]
 
+    # ------------------------------------------------------------------ sources ------- #
+    def add_source(self, spec: str) -> dict:
+        """Attach a new data source at runtime (the same ``spec`` grammar as ``--source``).
+
+        Builds the source (a ``fallback`` spec opens its SQLAlchemy engine here, off the lock),
+        rejects a name that collides with an existing source or the workspace catalog, then runs
+        its setup SQL and registers it. The source becomes queryable in *every* flow of this
+        session — sources are connection-global, not flow-scoped. Returns the source's name,
+        kind, and the objects it made queryable.
+        """
+        src = sources_mod.build_source(spec)  # off-lock: fallback specs connect here
+        existing = {s.name for s in self.sources}
+        if src.name in existing or src.name == self._catalog:
+            raise ValueError(
+                f"Source name {src.name!r} is already in use "
+                f"(sources: {sorted(existing) or ['(none)']}; workspace catalog: {self._catalog!r}). "
+                "Prefix the spec with a different name, e.g. mydata=<spec>."
+            )
+        with self._lock:
+            for stmt in src.setup_sql:  # on failure, nothing is appended — self.sources unchanged
+                self._con.execute(stmt)
+            self.sources.append(src)
+            objects = [obj.model_dump() for obj in self._objects_for_source(src)]
+        return {"name": src.name, "kind": src.kind, "objects": objects}
+
+    def remove_source(self, name: str) -> dict:
+        """Detach a source added at runtime or configured at startup; idempotent on the SQL.
+
+        Runs the source's teardown (``DETACH`` / ``DROP VIEW``), disposes a fallback engine,
+        and forgets it. Affects this session's connection only — under the process-per-agent
+        model that's the agent's own isolated workspace. Raises if no such source exists.
+        """
+        src = next((s for s in self.sources if s.name == name), None)
+        if src is None:
+            known = sorted(s.name for s in self.sources)
+            raise ValueError(f"No source named {name!r}. Configured sources: {known or ['(none)']}.")
+        with self._lock:
+            for stmt in sources_mod.teardown_sql(src):
+                self._con.execute(stmt)
+            self.sources.remove(src)
+        if src.engine is not None:
+            src.engine.dispose()
+        return {"name": src.name, "kind": src.kind, "removed": True}
+
     # ------------------------------------------------------------------ internals ----- #
     def _set_search_path(self, flow: str) -> None:
         """Resolve bare names against the flow first, then `main` (file-source views)."""
@@ -563,21 +607,31 @@ class DuckSession:
         out: list[TableInfo] = []
         with self._lock:
             for src in self.sources:
-                if src.kind == "file":
-                    out.append(TableInfo(name=src.name, kind="view", row_count=self._safe_count(src.name)))
-                elif src.kind in ("sqlite", "postgres", "mysql"):
-                    rows = self._con.execute(
-                        "SELECT table_name, table_type FROM information_schema.tables "
-                        "WHERE table_catalog = ? ORDER BY table_name",
-                        [src.name],
-                    ).fetchall()
-                    for tname, ttype in rows:
-                        qualified = f"{src.name}.{tname}"
-                        kind = "view" if "VIEW" in (ttype or "").upper() else "table"
-                        rc = self._safe_count(_quote_qualified(qualified)) if src.kind == "sqlite" else None
-                        out.append(TableInfo(name=qualified, kind=kind, row_count=rc))
-                # fallback sources aren't queryable in place; surfaced via import_remote only.
+                out.extend(self._objects_for_source(src))
         return out
+
+    def _objects_for_source(self, src: "Source") -> list[TableInfo]:
+        """The queryable objects a single source contributes (caller holds ``_lock``).
+
+        A file source is one bare view; an attached database contributes its tables/views as
+        ``<source>.<table>``. Fallback sources aren't queryable in place (import_remote only).
+        """
+        if src.kind == "file":
+            return [TableInfo(name=src.name, kind="view", row_count=self._safe_count(src.name))]
+        if src.kind in ("sqlite", "postgres", "mysql"):
+            rows = self._con.execute(
+                "SELECT table_name, table_type FROM information_schema.tables "
+                "WHERE table_catalog = ? ORDER BY table_name",
+                [src.name],
+            ).fetchall()
+            objs: list[TableInfo] = []
+            for tname, ttype in rows:
+                qualified = f"{src.name}.{tname}"
+                kind = "view" if "VIEW" in (ttype or "").upper() else "table"
+                rc = self._safe_count(_quote_qualified(qualified)) if src.kind == "sqlite" else None
+                objs.append(TableInfo(name=qualified, kind=kind, row_count=rc))
+            return objs
+        return []
 
     def describe(self, table: str) -> TableDescription:
         """Describe one source object: columns, primary key, a sample, and a row count.

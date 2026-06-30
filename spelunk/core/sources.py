@@ -131,6 +131,20 @@ def build_source(spec: str) -> Source:
     return Source(name=name, kind="fallback", locator=locator, engine=connect(locator, read_only=True))
 
 
+def teardown_sql(src: Source) -> list[str]:
+    """Statements that undo a source's :attr:`Source.setup_sql` — the inverse of attaching.
+
+    A ``file`` source drops its ``main`` view; an attached database is ``DETACH``ed. A
+    ``fallback`` source has no DuckDB object (its SQLAlchemy engine is disposed by the caller),
+    so this returns no statements. Used by ``DuckSession.remove_source``.
+    """
+    if src.kind == "file":
+        return [f'DROP VIEW IF EXISTS main."{src.name}"']
+    if src.kind in _ATTACH_EXT:
+        return [f'DETACH "{src.name}"']
+    return []
+
+
 def attach_all(con: "duckdb.DuckDBPyConnection", specs: Iterable[str]) -> list[Source]:
     """Build every source and run its ``setup_sql`` on *con*; return the registered sources.
 

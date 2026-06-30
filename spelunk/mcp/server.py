@@ -33,8 +33,8 @@ _tool_logger.propagate = False
 
 # Args worth recording verbatim (SQL kept full — that's the point of the log); long head samples
 # and row payloads are summarised, never dumped.
-_LOGGED_ARGS = ("sql", "name", "flow", "target", "format", "path")
-_LOGGED_RESULT_FIELDS = ("name", "flow", "row_count", "format", "path", "dropped_results")
+_LOGGED_ARGS = ("sql", "name", "flow", "target", "format", "path", "spec")
+_LOGGED_RESULT_FIELDS = ("name", "flow", "row_count", "format", "path", "dropped_results", "kind")
 
 
 def _configure_tool_logging(tool_log: str | None) -> None:
@@ -110,7 +110,9 @@ def _logged(fn):
     return wrapper
 
 
-def build_server(session: DuckSession, tool_log: str | None = None) -> FastMCP:
+def build_server(
+    session: DuckSession, tool_log: str | None = None, *, allow_add_source: bool = False
+) -> FastMCP:
     """Build a FastMCP instance wired to an open :class:`DuckSession`.
 
     Registers the ``db://`` discovery resources and five tools — ``query``, ``profile``,
@@ -119,11 +121,19 @@ def build_server(session: DuckSession, tool_log: str | None = None) -> FastMCP:
 
     ``tool_log`` controls per-call logging: a file path writes JSON lines there, ``"-"`` writes
     them to stderr, and ``None`` (the default) is silent.
+
+    ``allow_add_source`` (off by default) additionally registers ``add_source`` / ``remove_source``
+    so the agent can attach and detach files and databases at runtime. This lets the agent reach
+    any file/DB the host process can — only enable it for a trusted, process-per-agent setup. It
+    also registers ``import_remote`` unconditionally, since a SQL Server source can now appear after
+    startup.
     """
     _configure_tool_logging(tool_log)
 
     source_list = ", ".join(f"{s.name} ({s.kind})" for s in session.sources) or "(none configured)"
     has_fallback = bool(session.fallback_sources)
+    # A fallback source can be added at runtime once add_source is enabled, so register the puller.
+    register_import_remote = has_fallback or allow_add_source
 
     mcp = FastMCP(
         "spelunk",
@@ -155,6 +165,16 @@ def build_server(session: DuckSession, tool_log: str | None = None) -> FastMCP:
                 "be attached, so pull a SELECT from it into the flow as table `name`, then query "
                 "that table normally.\n"
                 if has_fallback
+                else ""
+            )
+            + (
+                "\n## Manage sources\n"
+                "- `add_source(spec)` — attach a new data source at runtime. `spec` is a file path "
+                "(.csv/.parquet/.json/.xlsx), a SQLite file, or a sqlite:// / postgresql:// / "
+                "mysql:// / mssql:// DSN; prefix with `name=` to set the source name (e.g. "
+                "`sales=./sales.parquet`). The source becomes queryable in every flow.\n"
+                "- `remove_source(name)` — detach a source by its name. Affects this session only.\n"
+                if allow_add_source
                 else ""
             )
             + "\n## Organize with flows\n"
@@ -245,7 +265,7 @@ def build_server(session: DuckSession, tool_log: str | None = None) -> FastMCP:
     def _drop(name: str | None = None, flow: str = "default") -> dict:
         return session.drop(name, flow)
 
-    if has_fallback:
+    if register_import_remote:
         @mcp.tool(
             name="import_remote",
             description=(
@@ -256,6 +276,33 @@ def build_server(session: DuckSession, tool_log: str | None = None) -> FastMCP:
         @_logged
         def _import_remote(sql: str, name: str, flow: str = "default") -> dict:
             return session.import_remote(sql, name, flow)
+
+    if allow_add_source:
+        @mcp.tool(
+            name="add_source",
+            description=(
+                "Attach a new data source at runtime, then query it like any configured source. "
+                "`spec` is a file path (.csv/.parquet/.json/.xlsx), a SQLite file, or a sqlite:// / "
+                "postgresql:// / mysql:// / mssql:// DSN; prefix with `name=` to set the source name "
+                "(e.g. `sales=./sales.parquet`). Returns the source name, kind, and the objects it "
+                "made queryable. The source is visible in every flow of this session."
+            ),
+        )
+        @_logged
+        def _add_source(spec: str) -> dict:
+            return session.add_source(spec)
+
+        @mcp.tool(
+            name="remove_source",
+            description=(
+                "Detach a data source by its name (as shown by `add_source` or in `db://tables`), "
+                "removing it from this session. Idempotent on the underlying detach; errors only if "
+                "no source has that name."
+            ),
+        )
+        @_logged
+        def _remove_source(name: str) -> dict:
+            return session.remove_source(name)
 
     return mcp
 
@@ -307,6 +354,16 @@ def main() -> None:
             "No-op with --shared-workspace."
         ),
     )
+    parser.add_argument(
+        "--allow-add-source",
+        action="store_true",
+        help=(
+            "Register the add_source / remove_source tools so the agent can attach and detach "
+            "data sources at runtime. This lets the agent read any file/database the server "
+            "process can reach — only enable it for a trusted, process-per-agent setup. Off by "
+            "default."
+        ),
+    )
     parser.add_argument("--memory-limit", default=None, help="DuckDB memory_limit, e.g. 4GB.")
     parser.add_argument("--temp-dir", default=None, help="Directory for DuckDB spill files.")
     parser.add_argument("--max-temp-size", default=None, help="Cap on spill size, e.g. 50GB.")
@@ -347,7 +404,7 @@ def main() -> None:
     else:
         tool_log = "-"  # stderr
 
-    server = build_server(session, tool_log=tool_log)
+    server = build_server(session, tool_log=tool_log, allow_add_source=args.allow_add_source)
     server.run(transport="stdio")
 
 
