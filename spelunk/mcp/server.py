@@ -55,6 +55,7 @@ def _configure_tool_logging(tool_log: str | None) -> None:
     if tool_log == "-":
         handler = logging.StreamHandler()  # stderr
     else:
+        Path(tool_log).parent.mkdir(parents=True, exist_ok=True)  # create the log dir if missing
         handler = logging.FileHandler(tool_log, encoding="utf-8")
     handler.setFormatter(logging.Formatter("%(message)s"))
     _tool_logger.addHandler(handler)
@@ -278,8 +279,22 @@ def main() -> None:
     parser.add_argument("--dsn", default=None, help="Alias for a single --source (back-compat).")
     parser.add_argument(
         "--session-dir",
-        default=None,
-        help="Directory for a durable workspace (results survive restarts). Omit for ephemeral.",
+        default=".spelunk_session",
+        help=(
+            "Root directory for durable workspaces (created if missing). Each process gets its "
+            "own workspace at <session-dir>/<pid>-<rand>/ so concurrent servers never collide. "
+            "Default: ./.spelunk_session."
+        ),
+    )
+    parser.add_argument(
+        "--shared-workspace",
+        action="store_true",
+        help=(
+            "Use one shared <session-dir>/workspace.duckdb instead of a per-process subdir. "
+            "Results persist across restarts and are visible to a later server on the same dir, "
+            "but concurrent servers contend for the single-writer lock (only the first is "
+            "durable; the rest fall back to ephemeral)."
+        ),
     )
     parser.add_argument("--memory-limit", default=None, help="DuckDB memory_limit, e.g. 4GB.")
     parser.add_argument("--temp-dir", default=None, help="Directory for DuckDB spill files.")
@@ -300,22 +315,26 @@ def main() -> None:
     if args.dsn:
         specs.append(args.dsn)
 
+    session = DuckSession.open(
+        specs,
+        session_dir=args.session_dir,
+        per_process=not args.shared_workspace,
+        memory_limit=args.memory_limit,
+        temp_dir=args.temp_dir,
+        max_temp_size=args.max_temp_size,
+    )
+
+    # Resolve the tool-log AFTER open(): by default the durable dir is a per-process subdir
+    # chosen inside open(), so the default log belongs there, not under the --session-dir root.
     if args.tool_log == "off":
         tool_log: str | None = None
     elif args.tool_log:
         tool_log = args.tool_log
     elif args.session_dir:
-        tool_log = str(Path(args.session_dir) / "tool-calls.jsonl")
+        tool_log = str(Path(session.workspace_dir) / "tool-calls.jsonl")
     else:
         tool_log = "-"  # stderr
 
-    session = DuckSession.open(
-        specs,
-        session_dir=args.session_dir,
-        memory_limit=args.memory_limit,
-        temp_dir=args.temp_dir,
-        max_temp_size=args.max_temp_size,
-    )
     server = build_server(session, tool_log=tool_log)
     server.run(transport="stdio")
 

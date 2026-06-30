@@ -136,13 +136,39 @@ class TestExport:
 class TestPersistence:
     def test_durable_workspace_survives_reopen(self, sqlite_file, tmp_path):
         d = str(tmp_path / "sess")
-        s1 = DuckSession.open([f"shop={sqlite_file}"], session_dir=d)
+        s1 = DuckSession.open([f"shop={sqlite_file}"], session_dir=d, per_process=False)
         s1.query("SELECT * FROM \"shop\".\"customers\"", "kept", flow="work")
         s1.close()
-        s2 = DuckSession.open([f"shop={sqlite_file}"], session_dir=d)
+        s2 = DuckSession.open([f"shop={sqlite_file}"], session_dir=d, per_process=False)
         try:
             assert "kept" in [r["name"] for r in s2.catalog("work")["results"]]
         finally:
+            s2.close()
+
+    def test_per_process_workspaces_are_durable_and_isolated(self, sqlite_file, tmp_path):
+        """Two concurrent servers under one parent each get their OWN durable workspace.
+
+        No single-writer contention (distinct files), and results can't collide even when both
+        reuse the same result name in the same flow.
+        """
+        parent = str(tmp_path / "root")
+        # per_process is the DEFAULT — don't pass it.
+        s1 = DuckSession.open([f"shop={sqlite_file}"], session_dir=parent)
+        s2 = DuckSession.open([f"shop={sqlite_file}"], session_dir=parent)
+        try:
+            # Distinct durable subdirs under the shared parent — not an ephemeral fallback.
+            assert s1.workspace_dir != s2.workspace_dir
+            assert os.path.dirname(s1.workspace_dir) == os.path.abspath(parent)
+            assert os.path.exists(os.path.join(s1.workspace_dir, "workspace.duckdb"))
+            assert os.path.exists(os.path.join(s2.workspace_dir, "workspace.duckdb"))
+
+            # Same flow + same result name in each — they must not see each other's rows.
+            s1.query("SELECT 1 AS a", "tmp", flow="work")
+            s2.query("SELECT 2 AS a", "tmp", flow="work")
+            assert s1.query('SELECT a FROM "work"."tmp"', "r1")["sample"] == [[1]]
+            assert s2.query('SELECT a FROM "work"."tmp"', "r2")["sample"] == [[2]]
+        finally:
+            s1.close()
             s2.close()
 
     def test_locked_workspace_falls_back_to_ephemeral(self, sqlite_file, tmp_path, capsys):
@@ -169,7 +195,8 @@ class TestPersistence:
         holder = subprocess.Popen([_sys.executable, "-c", holder_code], stdout=subprocess.PIPE)
         try:
             assert holder.stdout.readline().strip() == b"LOCKED"  # wait until it holds the lock
-            s2 = DuckSession.open([f"shop={sqlite_file}"], session_dir=d)  # must NOT crash
+            # per_process=False to exercise the single-writer contention path.
+            s2 = DuckSession.open([f"shop={sqlite_file}"], session_dir=d, per_process=False)  # must NOT crash
             try:
                 assert "locked" in capsys.readouterr().err  # warned on stderr
                 assert s2.query("SELECT 1 AS a", "r")["sample"] == [[1]]  # fully usable

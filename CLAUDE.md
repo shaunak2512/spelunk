@@ -102,10 +102,22 @@ python -m spelunk.mcp.server --source sales=./data/sales.parquet --source sqlite
 ```
 
 `--source` is repeatable and auto-detects by extension/scheme (`name=` prefix sets the catalog/view
-name). Optional guards: `--memory-limit`, `--temp-dir`, `--max-temp-size`. Omit `--session-dir` for
-an ephemeral (non-durable) workspace. `--dsn` is a back-compat alias for one `--source`.
-`.spelunk_session/` is gitignored. A `.mcp.json` wires Claude Code to a local source (paths are
+name). Optional guards: `--memory-limit`, `--temp-dir`, `--max-temp-size`. `--dsn` is a back-compat
+alias for one `--source`. A `.mcp.json` wires Claude Code to a local source (paths are
 machine-specific; edit before use).
+
+**Per-process workspace (the default):** `--session-dir` is a *root* (default `./.spelunk_session`,
+created if missing, gitignored) and **each server process gets its own durable workspace** at
+`<session-dir>/<pid>-<rand>/workspace.duckdb` — so many concurrent servers never collide and never
+contend for a single-writer lock. The tool-log defaults alongside it
+(`<session-dir>/<pid>-<rand>/tool-calls.jsonl`, dir auto-created). Each run gets a fresh subdir —
+isolation, not a shared store across runs; subdirs accumulate under the root.
+`DuckSession.workspace_dir` is the resolved per-process dir.
+
+Pass `--shared-workspace` (CLI) / `per_process=False` (`DuckSession.open`) for the old single
+`<session-dir>/workspace.duckdb` that one caller can reopen across restarts — at the cost of
+single-writer contention (only the first concurrent server is durable, the rest fall back to
+ephemeral). `DuckSession.open(session_dir=None)` is still an ephemeral private temp workspace.
 
 **Tool-call logging:** every tool call appends one JSON line (ts, tool, args, outcome, result
 summary, duration_ms) for usage analysis — wired by the `@_logged` decorator in `mcp/server.py`,

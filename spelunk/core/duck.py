@@ -102,6 +102,14 @@ def _to_python(v: Any) -> Any:
         return str(v)
 
 
+def _process_workspace_id() -> str:
+    """A per-process, collision-free id for a workspace subdirectory.
+
+    PID makes it human-traceable to a running server; the random suffix keeps it unique even if
+    a PID is reused or two sessions open in one process (e.g. tests)."""
+    return f"{os.getpid()}-{uuid4().hex[:8]}"
+
+
 class DuckSession:
     """A single DuckDB connection wrapping sources + the flow workspace.
 
@@ -116,11 +124,13 @@ class DuckSession:
         sources: list["Source"],
         *,
         catalog: str,
+        workspace_dir: str,
         tmpdir: "tempfile.TemporaryDirectory | None" = None,
     ) -> None:
         self._con = con
         self.sources = sources
         self._catalog = catalog
+        self.workspace_dir = workspace_dir
         self._tmpdir = tmpdir
         self._lock = threading.Lock()
         self.default_flow = "default"
@@ -133,6 +143,7 @@ class DuckSession:
         specs: list[str] | None = None,
         *,
         session_dir: str | None = None,
+        per_process: bool = True,
         memory_limit: str | None = None,
         temp_dir: str | None = None,
         max_temp_size: str | None = None,
@@ -143,16 +154,26 @@ class DuckSession:
         ``<session_dir>/workspace.duckdb``; without it a private temp directory is used (still
         disk-backed, so large results page to disk — just not durable across restarts).
 
+        ``per_process`` (the DEFAULT) treats ``session_dir`` as a PARENT and gives each process
+        its OWN durable workspace at ``<session_dir>/<pid>-<rand>/workspace.duckdb``. This lets
+        many concurrent servers each have an isolated, durable workspace under one root — so
+        their results can never collide — instead of all contending for one single-writer file.
+        Pass ``per_process=False`` for one shared ``<session_dir>/workspace.duckdb`` that the
+        same caller can reopen across restarts (the old single-writer behaviour).
+
         A durable workspace is a single-writer DuckDB file (exclusive lock). If it's already
         held by another server instance — e.g. a second editor window on the same project — we
         DON'T crash this session: we fall back to a private ephemeral workspace and warn on
         stderr. The session stays fully functional; its results just don't persist or share
-        with the instance that holds the lock.
+        with the instance that holds the lock. (With ``per_process`` each process has its own
+        subdir, so this contention path is normally never hit.)
         """
         _warm_native_imports()
         tmpdir: tempfile.TemporaryDirectory | None = None
         if session_dir is not None:
             base = os.path.abspath(session_dir)
+            if per_process:
+                base = os.path.join(base, _process_workspace_id())
             os.makedirs(base, exist_ok=True)
             try:
                 con = duckdb.connect(os.path.join(base, "workspace.duckdb"))
@@ -185,7 +206,7 @@ class DuckSession:
         if specs:
             attached = sources_mod.attach_all(con, specs)
 
-        return cls(con, attached, catalog=catalog, tmpdir=tmpdir)
+        return cls(con, attached, catalog=catalog, workspace_dir=base, tmpdir=tmpdir)
 
     def close(self) -> None:
         with self._lock:

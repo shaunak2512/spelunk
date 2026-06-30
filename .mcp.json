@@ -8,9 +8,7 @@
         "--source",
         "pitchfork=C:\\Users\\shaun\\repo\\spelunk\\sample data\\pitchfork_review.sqlite",
         "--session-dir",
-        "C:/Users/shaun/repo/spelunk/.spelunk_session",
-        "--tool-log",
-        "C:/Users/shaun/repo/spelunk/.spelunk_session/tool-calls.jsonl"
+        "C:/Users/shaun/repo/spelunk/.spelunk_session"
       ]
     }
   }
