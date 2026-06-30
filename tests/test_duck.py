@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import os
+import time
 
+import duckdb
 import pytest
 
 from spelunk.core.duck import DuckSession
@@ -170,6 +172,67 @@ class TestPersistence:
         finally:
             s1.close()
             s2.close()
+
+    def test_per_process_keeps_only_n_recent_workspaces(self, sqlite_file, tmp_path):
+        """Opening reclaims stale per-process workspaces, keeping only the N most recent."""
+        parent = str(tmp_path / "root")
+        os.makedirs(parent, exist_ok=True)
+        old = time.time() - 86_400  # a day ago: past the sweep grace window
+        # Five stale, unlocked workspaces, oldest -> newest by mtime.
+        for i in range(5):
+            d = os.path.join(parent, f"00000-stale{i}")
+            os.makedirs(d)
+            duckdb.connect(os.path.join(d, "workspace.duckdb")).close()  # free (no live owner)
+            os.utime(d, (old + i, old + i))
+
+        s = DuckSession.open([f"shop={sqlite_file}"], session_dir=parent, keep_workspaces=3)
+        try:
+            remaining = {
+                d for d in os.listdir(parent)
+                if os.path.isfile(os.path.join(parent, d, "workspace.duckdb"))
+            }
+            # The fresh dir is newest (kept) plus the 2 newest stale dirs == 3 total.
+            assert len(remaining) == 3
+            assert os.path.basename(s.workspace_dir) in remaining
+            assert {"00000-stale4", "00000-stale3"} <= remaining  # 2 newest stale survive
+            assert "00000-stale0" not in remaining  # 3 oldest reclaimed
+        finally:
+            s.close()
+
+    def test_per_process_sweep_skips_live_workspace(self, sqlite_file, tmp_path):
+        """A stale-looking workspace still held by a LIVE (separate) process is never reclaimed.
+
+        Must use a subprocess to hold the lock: a second connection in this process would share
+        DuckDB's cached instance and never look locked.
+        """
+        import subprocess
+        import sys as _sys
+        import textwrap
+
+        parent = str(tmp_path / "root")
+        held = os.path.join(parent, "99999-held")
+        os.makedirs(held, exist_ok=True)
+        holder_code = textwrap.dedent(
+            f"""
+            import duckdb, os, time
+            _con = duckdb.connect(os.path.join({held!r}, "workspace.duckdb"))  # hold the lock
+            print("LOCKED", flush=True)
+            time.sleep(30)
+            """
+        )
+        holder = subprocess.Popen([_sys.executable, "-c", holder_code], stdout=subprocess.PIPE)
+        try:
+            assert holder.stdout.readline().strip() == b"LOCKED"
+            os.utime(held, (time.time() - 86_400, time.time() - 86_400))  # make it look stale
+            # keep=1 would target the held dir for reclaim, but it has a live owner -> skipped.
+            s = DuckSession.open([f"shop={sqlite_file}"], session_dir=parent, keep_workspaces=1)
+            try:
+                assert os.path.isfile(os.path.join(held, "workspace.duckdb"))
+            finally:
+                s.close()
+        finally:
+            holder.terminate()
+            holder.wait(timeout=10)
 
     def test_locked_workspace_falls_back_to_ephemeral(self, sqlite_file, tmp_path, capsys):
         """A second SERVER PROCESS on the same locked session_dir stays functional (ephemeral).

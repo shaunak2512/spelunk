@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import sys
 import tempfile
 import threading
@@ -110,6 +111,63 @@ def _process_workspace_id() -> str:
     return f"{os.getpid()}-{uuid4().hex[:8]}"
 
 
+# Per-process workspaces accumulate under the session root; on startup keep the N most recent and
+# reclaim older ones. Dirs younger than the grace window are never touched — a sibling may be
+# mid-startup and not yet holding its lock.
+_DEFAULT_KEEP_WORKSPACES = 3
+_SWEEP_GRACE_SECONDS = 60
+
+
+def _workspace_is_free(dir_path: str) -> bool:
+    """True if ``dir_path``'s workspace.duckdb is NOT held by a live server.
+
+    Probes by opening read-write: a live owner holds the single-writer lock so the connect
+    raises; a crashed/exited owner leaves an unlocked file (its WAL is just replayed) so it opens.
+    Read-write — not read_only — is deliberate: a read_only open of a DB with a pending WAL errors,
+    which would make us mistake a crashed orphan for a live owner and never reclaim it."""
+    try:
+        con = duckdb.connect(os.path.join(dir_path, "workspace.duckdb"))
+    except Exception:
+        return False
+    con.close()
+    return True
+
+
+def _reclaim_old_workspaces(parent: str, keep: int, *, exclude: str) -> list[str]:
+    """Delete all but the ``keep`` most-recent per-process workspace subdirs under ``parent``.
+
+    Best-effort GC: only removes dirs that have no live owner, are older than the grace window,
+    and are not ``exclude`` (this process's own dir). Never raises — losing a race to a concurrent
+    server just leaves a dir for the next sweep. Returns the dirs actually removed."""
+    try:
+        dirs = [
+            os.path.join(parent, d)
+            for d in os.listdir(parent)
+            if os.path.isfile(os.path.join(parent, d, "workspace.duckdb"))
+        ]
+    except OSError:
+        return []
+    dirs.sort(key=lambda p: os.path.getmtime(p), reverse=True)  # newest first
+    now = time.time()
+    removed: list[str] = []
+    for path in dirs[keep:]:  # keep the N newest (this process's fresh dir is among them)
+        if os.path.abspath(path) == os.path.abspath(exclude):
+            continue
+        try:
+            if now - os.path.getmtime(path) < _SWEEP_GRACE_SECONDS:
+                continue
+        except OSError:
+            continue
+        if not _workspace_is_free(path):
+            continue
+        try:
+            shutil.rmtree(path)
+            removed.append(path)
+        except OSError:
+            pass
+    return removed
+
+
 class DuckSession:
     """A single DuckDB connection wrapping sources + the flow workspace.
 
@@ -144,6 +202,7 @@ class DuckSession:
         *,
         session_dir: str | None = None,
         per_process: bool = True,
+        keep_workspaces: int = _DEFAULT_KEEP_WORKSPACES,
         memory_limit: str | None = None,
         temp_dir: str | None = None,
         max_temp_size: str | None = None,
@@ -161,6 +220,10 @@ class DuckSession:
         Pass ``per_process=False`` for one shared ``<session_dir>/workspace.duckdb`` that the
         same caller can reopen across restarts (the old single-writer behaviour).
 
+        In ``per_process`` mode, opening also reclaims stale workspaces: the ``keep_workspaces``
+        most recent subdirs survive (including the one just created) and older ones with no live
+        owner are deleted. ``keep_workspaces <= 0`` disables the sweep (keep everything).
+
         A durable workspace is a single-writer DuckDB file (exclusive lock). If it's already
         held by another server instance — e.g. a second editor window on the same project — we
         DON'T crash this session: we fall back to a private ephemeral workspace and warn on
@@ -170,14 +233,17 @@ class DuckSession:
         """
         _warm_native_imports()
         tmpdir: tempfile.TemporaryDirectory | None = None
+        pp_parent: str | None = None  # the session root to sweep, only when per_process succeeds
         if session_dir is not None:
             base = os.path.abspath(session_dir)
             if per_process:
+                pp_parent = base
                 base = os.path.join(base, _process_workspace_id())
             os.makedirs(base, exist_ok=True)
             try:
                 con = duckdb.connect(os.path.join(base, "workspace.duckdb"))
             except duckdb.IOException as exc:
+                pp_parent = None  # fell back to ephemeral — no per-process tree to sweep
                 tmpdir = tempfile.TemporaryDirectory(prefix="spelunk_ws_")
                 base = tmpdir.name
                 con = duckdb.connect(os.path.join(base, "workspace.duckdb"))
@@ -205,6 +271,9 @@ class DuckSession:
         attached: list[Source] = []
         if specs:
             attached = sources_mod.attach_all(con, specs)
+
+        if pp_parent is not None and keep_workspaces > 0:
+            _reclaim_old_workspaces(pp_parent, keep_workspaces, exclude=base)
 
         return cls(con, attached, catalog=catalog, workspace_dir=base, tmpdir=tmpdir)
 

@@ -296,6 +296,17 @@ def main() -> None:
             "durable; the rest fall back to ephemeral)."
         ),
     )
+    parser.add_argument(
+        "--keep-workspaces",
+        type=int,
+        default=3,
+        metavar="N",
+        help=(
+            "On startup, keep the N most recent per-process workspaces under --session-dir and "
+            "reclaim older ones with no live owner. Default: 3. 0 or less keeps everything. "
+            "No-op with --shared-workspace."
+        ),
+    )
     parser.add_argument("--memory-limit", default=None, help="DuckDB memory_limit, e.g. 4GB.")
     parser.add_argument("--temp-dir", default=None, help="Directory for DuckDB spill files.")
     parser.add_argument("--max-temp-size", default=None, help="Cap on spill size, e.g. 50GB.")
@@ -319,6 +330,7 @@ def main() -> None:
         specs,
         session_dir=args.session_dir,
         per_process=not args.shared_workspace,
+        keep_workspaces=args.keep_workspaces,
         memory_limit=args.memory_limit,
         temp_dir=args.temp_dir,
         max_temp_size=args.max_temp_size,

@@ -111,8 +111,18 @@ created if missing, gitignored) and **each server process gets its own durable w
 `<session-dir>/<pid>-<rand>/workspace.duckdb` — so many concurrent servers never collide and never
 contend for a single-writer lock. The tool-log defaults alongside it
 (`<session-dir>/<pid>-<rand>/tool-calls.jsonl`, dir auto-created). Each run gets a fresh subdir —
-isolation, not a shared store across runs; subdirs accumulate under the root.
-`DuckSession.workspace_dir` is the resolved per-process dir.
+isolation, not a shared store across runs. `DuckSession.workspace_dir` is the resolved per-process
+dir.
+
+**Workspace GC:** to stop per-process subdirs accumulating, `open()` sweeps on startup — it keeps
+the `--keep-workspaces N` most recent (default 3, including the one just created) and reclaims older
+subdirs that have no *live* owner. Liveness is the DuckDB file lock: the sweep probes each candidate
+with a read-write `connect` (a live server holds the single-writer lock → skip; a crashed/exited one
+opens → delete). This is cross-process only — two sessions in one process share DuckDB's cached
+instance, so a sweep can't detect an in-process holder (irrelevant in production: each server is its
+own process). Dirs younger than a 60s grace window are never touched (a sibling may be mid-startup,
+lock not yet held). `--keep-workspaces 0` (or `<=0`) disables the sweep. The tool-log lives inside
+the workspace dir, so it's reclaimed with it — route `--tool-log` elsewhere to retain history.
 
 Pass `--shared-workspace` (CLI) / `per_process=False` (`DuckSession.open`) for the old single
 `<session-dir>/workspace.duckdb` that one caller can reopen across restarts — at the cost of
