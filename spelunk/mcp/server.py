@@ -1,375 +1,426 @@
-"""MCP front-end for Spelunk — exposes core introspect + query over FastMCP.
+"""MCP front-end for Spelunk — a multi-source DuckDB query + transformation-pipeline server.
 
-Usage (stdio, for Claude Code via .mcp.json):
-    python -m spelunk.mcp.server --dsn sqlite:///path/to.db
+One DuckDB session ([core/duck.py]) is both the query engine and the workspace: files and
+attached databases live in it alongside the flow results, so a single ``query`` can join any
+of them. No model, no loop — Claude Code is the agent.
 
-No model, no loop — Claude Code is the agent.
+Usage (stdio, for Claude Code via .mcp.json)::
+
+    python -m spelunk.mcp.server --source ./data/sales.parquet --source sqlite:///app.db \
+        --session-dir .spelunk_session
 """
 from __future__ import annotations
 
+import argparse
+import functools
+import inspect
 import json
-import os
+import logging
+import re
 import time
-from typing import TYPE_CHECKING, Any
+from datetime import datetime, timezone
+from pathlib import Path
 
-from sqlalchemy import text as _sa_text
-
-import pandas as pd
 from fastmcp import FastMCP
 
-from spelunk.core.introspect import describe, list_objects
-from spelunk.core.query import run_sql
+from spelunk.core.duck import DuckSession
 
-if TYPE_CHECKING:
-    from sqlalchemy.engine import Engine
+# One JSON line per tool call lands here so agent usage can be analysed offline. Handlers are
+# (re)attached by _configure_tool_logging; until then a NullHandler keeps library/test use silent.
+_tool_logger = logging.getLogger("spelunk.toolcalls")
+_tool_logger.addHandler(logging.NullHandler())
+_tool_logger.setLevel(logging.INFO)
+_tool_logger.propagate = False
 
+# Args worth recording verbatim (SQL kept full — that's the point of the log); long head samples
+# and row payloads are summarised, never dumped.
+_LOGGED_ARGS = ("sql", "name", "flow", "target", "format", "path", "spec")
+_LOGGED_RESULT_FIELDS = ("name", "flow", "row_count", "format", "path", "dropped_results", "kind")
 
-# Dialects that support STDDEV (or equivalent) as a plain aggregate function.
-_STDDEV_DIALECTS = {"postgresql", "mysql", "mariadb", "mssql", "oracle", "duckdb"}
-# Different engines spell the function differently.
-_STDDEV_FN: dict[str, str] = {"mssql": "STDEV", "mysql": "STD", "mariadb": "STD"}
-# Dialects without a built-in STDDEV; compute population std via SQRT(ABS(AVG(x²) - AVG(x)²)).
-_MANUAL_STDDEV_DIALECTS = {"sqlite"}
-
-# Dialects with PERCENTILE_CONT as an ordered-set aggregate (returns a scalar in
-# a plain SELECT).  MySQL/SQL Server expose it only as a window function, which
-# can't be mixed cleanly with other aggregates, so we omit them here.
-_PERCENTILE_DIALECTS = {"postgresql", "oracle", "duckdb"}
-
-
-def _quote_col(name: str, dialect: str) -> str:
-    """Return a properly-quoted column identifier for the given dialect."""
-    if dialect in ("mysql", "mariadb"):
-        return f"`{name.replace('`', '``')}`"
-    return f'"{name.replace(chr(34), chr(34) * 2)}"'
+# add_source accepts DSNs that can embed credentials (postgresql://user:pw@host/db); strip the
+# userinfo (user:pass@) before the spec is written to the on-disk tool-call log.
+_DSN_CREDENTIALS_RE = re.compile(r"//[^/@\s]+@")
 
 
-def _detect_numeric(columns: list[str], rows: list[list]) -> set[str]:
-    """Classify columns as numeric by inspecting the first non-null sample value."""
-    from decimal import Decimal
-    numeric: set[str] = set()
-    for idx, col in enumerate(columns):
-        for row in rows:
-            val = row[idx]
-            if val is not None:
-                if isinstance(val, (int, float, Decimal)) and not isinstance(val, bool):
-                    numeric.add(col)
-                break  # first non-null value determines the type
-    return numeric
+def _redact(value: object) -> object:
+    """Mask userinfo (user:pass@) in DSN-like strings so credentials never reach the log."""
+    if isinstance(value, str):
+        return _DSN_CREDENTIALS_RE.sub("//***@", value)
+    return value
 
 
-def _to_python(v: Any) -> Any:
-    """Convert a DB driver value to a JSON-serialisable Python type."""
-    if v is None:
-        return None
-    import math
-    from decimal import Decimal
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, float) and math.isnan(v):
-        return None
-    if isinstance(v, Decimal):
-        f = float(v)
-        return None if math.isnan(f) else f
-    if isinstance(v, (int, float)):
-        return v
-    try:
-        return v.item()  # numpy scalar — export_query still uses pandas
-    except AttributeError:
-        return str(v)
+def _configure_tool_logging(tool_log: str | None) -> None:
+    """Point the tool-call logger at a JSONL file, stderr (``"-"``), or nowhere (``None``).
 
-
-_DIALECT_LABELS = {
-    "sqlite": "SQLite",
-    "postgresql": "PostgreSQL",
-    "mysql": "MySQL",
-    "mssql": "SQL Server",
-}
-
-
-def build_server(engine: "Engine") -> FastMCP:
-    """Build and return a FastMCP instance wired to *engine*.
-
-    Registers:
-    - Resource  ``db://tables``        — lists all tables/views (wraps list_objects).
-    - Template  ``db://{table}``       — describes one table (wraps describe).
-    - Tool      ``run_query(sql)``     — executes a read-only SQL query (wraps run_sql).
+    Idempotent: clears prior handlers so repeated ``build_server`` calls (e.g. in tests) don't
+    stack duplicates. Never logs to stdout — that channel is the stdio MCP transport.
     """
-    dialect_name = engine.dialect.name
-    dialect_label = _DIALECT_LABELS.get(dialect_name, dialect_name)
+    for handler in list(_tool_logger.handlers):
+        _tool_logger.removeHandler(handler)
+        handler.close()
+
+    if tool_log is None:
+        _tool_logger.addHandler(logging.NullHandler())
+        return
+
+    handler: logging.Handler
+    if tool_log == "-":
+        handler = logging.StreamHandler()  # stderr
+    else:
+        Path(tool_log).parent.mkdir(parents=True, exist_ok=True)  # create the log dir if missing
+        handler = logging.FileHandler(tool_log, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    _tool_logger.addHandler(handler)
+
+
+def _summarize_result(result: object) -> dict:
+    """Compact, log-safe view of a tool result — counts and identifiers, not full row data."""
+    if not isinstance(result, dict):
+        return {"type": type(result).__name__}
+    summary = {k: result[k] for k in _LOGGED_RESULT_FIELDS if k in result}
+    cols = result.get("columns")
+    if isinstance(cols, (list, dict)):
+        summary["column_count"] = len(cols)
+    return summary
+
+
+def _logged(fn):
+    """Wrap a tool function so each call emits one structured JSON line to ``_tool_logger``.
+
+    Records timestamp, tool name, the salient arguments, outcome (ok/error), a result summary,
+    and wall-clock duration. ``functools.wraps`` + the original signature are preserved so
+    FastMCP still derives the correct tool schema. The tool name is the function name minus its
+    leading underscore (``_query`` → ``query``).
+    """
+    tool_name = fn.__name__.lstrip("_")
+    sig = inspect.signature(fn)
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        bound = sig.bind(*args, **kwargs)
+        bound.apply_defaults()
+        record: dict = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "tool": tool_name,
+            "args": {
+                k: (_redact(v) if k == "spec" else v)
+                for k, v in bound.arguments.items()
+                if k in _LOGGED_ARGS
+            },
+        }
+        start = time.perf_counter()
+        try:
+            result = fn(*args, **kwargs)
+        except Exception as exc:
+            record["outcome"] = "error"
+            record["error"] = f"{type(exc).__name__}: {exc}"
+            record["duration_ms"] = round((time.perf_counter() - start) * 1000, 1)
+            _tool_logger.info(json.dumps(record, default=str))
+            raise
+        record["outcome"] = "ok"
+        record["result"] = _summarize_result(result)
+        record["duration_ms"] = round((time.perf_counter() - start) * 1000, 1)
+        _tool_logger.info(json.dumps(record, default=str))
+        return result
+
+    return wrapper
+
+
+def build_server(
+    session: DuckSession, tool_log: str | None = None, *, allow_add_source: bool = False
+) -> FastMCP:
+    """Build a FastMCP instance wired to an open :class:`DuckSession`.
+
+    Registers the ``db://`` discovery resources and five tools — ``query``, ``profile``,
+    ``export``, ``catalog``, ``drop`` — plus ``import_remote`` when a SQLAlchemy-only source
+    (e.g. SQL Server) is configured.
+
+    ``tool_log`` controls per-call logging: a file path writes JSON lines there, ``"-"`` writes
+    them to stderr, and ``None`` (the default) is silent.
+
+    ``allow_add_source`` (off by default) additionally registers ``add_source`` / ``remove_source``
+    so the agent can attach and detach files and databases at runtime. This lets the agent reach
+    any file/DB the host process can — only enable it for a trusted, process-per-agent setup. It
+    also registers ``import_remote`` unconditionally, since a SQL Server source can now appear after
+    startup.
+    """
+    _configure_tool_logging(tool_log)
+
+    source_list = ", ".join(f"{s.name} ({s.kind})" for s in session.sources) or "(none configured)"
+    has_fallback = bool(session.fallback_sources)
+    # A fallback source can be added at runtime once add_source is enabled, so register the puller.
+    register_import_remote = has_fallback or allow_add_source
 
     mcp = FastMCP(
         "spelunk",
         instructions=(
-            f"Spelunk exposes a connected {dialect_label} database for read-only exploration and querying.\n\n"
-            "## Resources\n"
-            "- `db://tables` — call this first to get a JSON array of all tables and views "
-            "(each entry has `name`, `kind`, and `row_count`).\n"
-            "- `db://{table}` — describe a single table by name: columns with types and nullability, "
-            "primary key, foreign-key relationships, a few sample rows, and per-column value profiles. "
-            "Use this to understand schema details before writing SQL.\n\n"
-            "## Tools\n"
-            "- `run_query(sql)` — execute a read-only SELECT query and get back rows as a list of dicts. "
-            "Results are capped at 1 000 rows. Writes (INSERT/UPDATE/DELETE/DDL/PRAGMA writes) are "
-            "blocked at the AST level and will raise an error.\n"
-            "- `export_query(sql, format, path, timeout_s?)` — run a query with no row cap and write "
-            "the full result to a file. Supported formats: `csv`, `json`, `parquet` (parquet requires "
-            "pyarrow). `path` is an absolute or relative file path; parent directories are created "
-            "automatically. Default timeout is 300 s.\n"
-            "- `describe_query(sql)` — profile every column in the query result using "
-            "SQL aggregates pushed to the database. "
-            "Numeric columns return non_null_count, null_rate, min, max, mean, std — "
-            "plus p25/p50/p75/p95 on databases with ordered-set PERCENTILE_CONT "
-            "(PostgreSQL, Oracle, DuckDB). "
-            "Text/object columns return non_null_count, null_rate, unique, "
-            "top (most-frequent value), freq (its count). "
-            "Use this instead of writing manual aggregation queries.\n\n"
-            "## Recommended workflow\n"
-            "1. Read `db://tables` to discover what tables exist.\n"
-            "2. Read `db://{table}` for each table relevant to the question — pay attention to "
-            "foreign keys to understand join paths and to column profiles for value distributions.\n"
-            "3. Draft a SELECT query. Prefer explicit column lists over `SELECT *`.\n"
-            "4. Call `run_query` with your SQL. If the result is empty or unexpected, inspect the "
-            "sample rows from step 2 and adjust.\n"
-            "5. Call `describe_query` to profile the distribution of any result set — "
-            "use it instead of writing manual aggregation queries.\n\n"
-            "## Constraints\n"
-            "- All queries must be read-only SELECT statements (CTEs are fine).\n"
-            "- `run_query` is capped at 1 000 rows; use `export_query` for full result sets.\n"
-            "- `describe_query` aggregates over the full query result set — no row cap.\n"
-            f"- The connected database is {dialect_label} — write SQL in its dialect."
-        ),
-    )
-
-    # ------------------------------------------------------------------ #
-    # Resource: list all tables
-    # ------------------------------------------------------------------ #
-    @mcp.resource("db://tables", name="list_tables", description="List all tables and views in the database.")
-    def _list_tables() -> str:
-        """Return a JSON array of {name, kind, row_count} objects."""
-        objects = list_objects(engine)
-        return json.dumps([obj.model_dump() for obj in objects])
-
-    # ------------------------------------------------------------------ #
-    # Resource template: describe a single table
-    # ------------------------------------------------------------------ #
-    @mcp.resource(
-        "db://{table}",
-        name="describe_table",
-        description="Describe a table: columns, primary key, foreign keys, sample rows, and column profile.",
-    )
-    def _describe_table(table: str) -> str:
-        """Return a JSON object describing *table*."""
-        desc = describe(engine, table)
-        return desc.model_dump_json()
-
-    # ------------------------------------------------------------------ #
-    # Tool: run a read-only SQL query
-    # ------------------------------------------------------------------ #
-    @mcp.tool(
-        name="run_query",
-        description=(
-            "Execute a read-only SQL query against the database. "
-            "Writes (INSERT/UPDATE/DELETE/DDL) are rejected. "
-            "Results are capped at 1000 rows."
-        ),
-    )
-    def _run_query(sql: str) -> dict:
-        """Execute *sql* and return a QueryResult-shaped dict."""
-        result = run_sql(engine, sql)
-        return result.model_dump()
-
-    # ------------------------------------------------------------------ #
-    # Tool: export a query to a file (no row cap, extended timeout)
-    # ------------------------------------------------------------------ #
-    @mcp.tool(
-        name="export_query",
-        description=(
-            "Execute a read-only SQL query and export the full result set to a file. "
-            "No row limit is enforced — use this for large result sets. "
-            "Supported formats: csv, json, parquet (parquet requires pyarrow). "
-            "Parent directories are created automatically. "
-            "Writes (INSERT/UPDATE/DELETE/DDL) are rejected."
-        ),
-    )
-    def _export_query(sql: str, format: str, path: str, timeout_s: int = 300) -> dict:
-        """Run *sql* and write all rows to *path* in *format* (csv/json/parquet)."""
-        fmt = format.lower().strip()
-        if fmt not in ("csv", "json", "parquet"):
-            raise ValueError(f"Unsupported format {fmt!r}. Choose csv, json, or parquet.")
-
-        result = run_sql(engine, sql, max_rows=None, timeout_s=timeout_s)
-        df = pd.DataFrame(result.rows, columns=result.columns)
-
-        abs_path = os.path.abspath(path)
-        parent = os.path.dirname(abs_path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-
-        if fmt == "csv":
-            df.to_csv(abs_path, index=False)
-        elif fmt == "json":
-            df.to_json(abs_path, orient="records", indent=2, force_ascii=False)
-        elif fmt == "parquet":
-            import duckdb
-            # DuckDB accepts forward slashes on Windows; escape any literal quotes.
-            safe_path = abs_path.replace("\\", "/").replace("'", "''")
-            with duckdb.connect() as dconn:
-                dconn.register("_export", df)
-                dconn.execute(f"COPY _export TO '{safe_path}' (FORMAT PARQUET)")
-
-        return {
-            "path": abs_path,
-            "format": fmt,
-            "row_count": result.row_count,
-            "columns": result.columns,
-            "elapsed_s": round(result.elapsed_s, 3),
-        }
-
-    # ------------------------------------------------------------------ #
-    # Tool: profile every column of a query result
-    # ------------------------------------------------------------------ #
-    @mcp.tool(
-        name="describe_query",
-        description=(
-            "Run a SQL query and return per-column statistics computed in the database. "
-            "Numeric columns: non_null_count, null_rate, min, max, mean, std"
-            " — plus p25/p50/p75/p95 on databases with ordered-set PERCENTILE_CONT "
-            "(PostgreSQL, Oracle, DuckDB). "
-            "Text/object columns: non_null_count, null_rate, unique, "
-            "top (most-frequent value), freq (its count). "
-            "Aggregates run over the full result set of the query — no row cap."
-        ),
-    )
-    def _describe_query(sql: str) -> dict:
-        t0 = time.perf_counter()
-
-        # Probe: run with a small LIMIT to discover column names and types.
-        # run_sql handles the read-only guard and LIMIT injection.
-        probe = run_sql(engine, sql, max_rows=10)
-        columns = probe.columns
-
-        if not columns:
-            return {"row_count": 0, "elapsed_s": 0.0, "columns": {}}
-
-        numeric_cols = _detect_numeric(columns, probe.rows)
-        object_col_list = [c for c in columns if c not in numeric_cols]
-
-        # Build a single aggregate SELECT over the full query result.
-        # agg_meta tracks (col, stat) in the same positional order as select_parts
-        # so we can unpack the result row by index without relying on aliases.
-        select_parts: list[str] = ["COUNT(*)"]
-        agg_meta: list[tuple[str, str]] = [("_total", "_total")]
-
-        for col in columns:
-            qc = _quote_col(col, dialect_name)
-
-            select_parts.append(
-                f"1.0 * (COUNT(*) - COUNT({qc})) / NULLIF(COUNT(*), 0)"
+            "Spelunk is a single DuckDB engine over all your data sources. Files (CSV/Parquet/"
+            "JSON/Excel) and attached databases (SQLite/PostgreSQL/MySQL) live in one DuckDB "
+            "session together with your saved results, so one query can join across all of "
+            f"them. All SQL is DuckDB SQL. Configured sources: {source_list}.\n\n"
+            "## Discover\n"
+            "- `db://tables` — JSON array of queryable source objects. Attached-database tables "
+            "are named `<source>.<table>` (paste-ready); file sources appear as a bare view name.\n"
+            "- `db://{table}` — describe one object: columns, types, primary key, a sample, and "
+            "a row count. Read this before writing SQL.\n\n"
+            "## Query and build\n"
+            "- `query(sql, name, flow?)` — run a read-only SELECT over sources AND saved results, "
+            "and store the FULL result as table `name` in the flow (no row cap). Returns the "
+            "result's columns, true row_count, and a head sample. This is the ONE tool for both "
+            "looking and building: every result is named and immediately reusable — reference it "
+            "by `name` in your next query. `name` is required; reuse a scratch name (e.g. `tmp`) "
+            "for throwaways, or `drop` them. Reference attached DB tables as \"<source>\".\"<table>\", "
+            "files and prior results by bare name.\n"
+            "- `profile(sql, flow?)` — per-column stats (null_rate, min/max/mean/std, "
+            "p25/p50/p75/p95 for numerics; unique/top/freq for text) over the full result. Use "
+            "this instead of writing manual aggregation queries.\n"
+            "- `export(target, format, path, flow?)` — write a saved result name OR a full SELECT "
+            "to csv/json/parquet (no row cap).\n"
+            + (
+                "- `import_remote(sql, name, flow?)` — a SQL Server / SQLAlchemy-only source can't "
+                "be attached, so pull a SELECT from it into the flow as table `name`, then query "
+                "that table normally.\n"
+                if has_fallback
+                else ""
             )
-            agg_meta.append((col, "null_rate"))
+            + (
+                "\n## Manage sources\n"
+                "- `add_source(spec)` — attach a new data source at runtime. `spec` is a file path "
+                "(.csv/.parquet/.json/.xlsx), a SQLite file, or a sqlite:// / postgresql:// / "
+                "mysql:// / mssql:// DSN; prefix with `name=` to set the source name (e.g. "
+                "`sales=./sales.parquet`). The source becomes queryable in every flow.\n"
+                "- `remove_source(name)` — detach a source by its name. Affects this session only.\n"
+                if allow_add_source
+                else ""
+            )
+            + "\n## Organize with flows\n"
+            "A *flow* is an isolated result namespace (a DuckDB schema; default `\"default\"`). "
+            "Give each concurrent line of analysis its own `flow` so results never collide. "
+            "Reference a result in another flow as \"<flow>\".\"<name>\".\n"
+            "- `catalog()` — list flows and their result counts; `catalog(flow)` — list the "
+            "results in a flow with columns and row counts.\n"
+            "- `drop(name, flow?)` — drop one result; `drop(flow=...)` with no name — drop a whole "
+            "flow.\n\n"
+            "## Notes\n"
+            "- All queries are read-only SELECTs (CTEs fine); writes/DDL are rejected at the AST "
+            "level. The server materializes your SELECT as a table for you — don't write CREATE/"
+            "INSERT yourself.\n"
+            "- The head sample is a preview; the full result is the saved table — `profile` or "
+            "query it for the whole set, or `export` it to a file.\n"
+            "- Sources are read on demand (DuckDB pushes filters/projections down); filter or "
+            "aggregate before materializing rather than copying a whole large table."
+        ),
+    )
 
-            select_parts.append(f"COUNT({qc})")
-            agg_meta.append((col, "non_null_count"))
+    # --- Resources: source discovery ------------------------------------------------ #
+    @mcp.resource("db://tables", name="list_tables", description="List queryable source objects (attached-DB tables + file views).")
+    def _list_tables() -> str:
+        return json.dumps([obj.model_dump() for obj in session.list_objects()])
 
-            if col in numeric_cols:
-                select_parts.append(f"MIN({qc})")
-                agg_meta.append((col, "min"))
-                select_parts.append(f"MAX({qc})")
-                agg_meta.append((col, "max"))
-                select_parts.append(f"AVG({qc})")
-                agg_meta.append((col, "mean"))
+    @mcp.resource("db://{table}", name="describe_table", description="Describe one source object: columns, primary key, sample rows, row count.")
+    def _describe_table(table: str) -> str:
+        return session.describe(table).model_dump_json()
 
-                if dialect_name in _STDDEV_DIALECTS:
-                    fn = _STDDEV_FN.get(dialect_name, "STDDEV")
-                    select_parts.append(f"{fn}({qc})")
-                    agg_meta.append((col, "std"))
-                elif dialect_name in _MANUAL_STDDEV_DIALECTS:
-                    select_parts.append(
-                        f"SQRT(ABS(AVG({qc} * {qc}) - AVG({qc}) * AVG({qc})))"
-                    )
-                    agg_meta.append((col, "std"))
+    # --- Tools ----------------------------------------------------------------------- #
+    @mcp.tool(
+        name="query",
+        description=(
+            "Run a read-only DuckDB SELECT over sources and saved results, and store the full "
+            "result (no row cap) as table `name` in the flow for immediate reuse. Returns "
+            "columns, true row_count, and a head sample. `name` is required. Reference attached "
+            "DB tables as \"<source>\".\"<table>\"; files and prior results by bare name. Writes/DDL "
+            "are rejected."
+        ),
+    )
+    @_logged
+    def _query(sql: str, name: str, flow: str = "default") -> dict:
+        return session.query(sql, name, flow)
 
-                if dialect_name in _PERCENTILE_DIALECTS:
-                    for pct, label in (
-                        (0.25, "p25"), (0.50, "p50"), (0.75, "p75"), (0.95, "p95")
-                    ):
-                        select_parts.append(
-                            f"PERCENTILE_CONT({pct}) WITHIN GROUP (ORDER BY {qc})"
-                        )
-                        agg_meta.append((col, label))
-            else:
-                select_parts.append(f"COUNT(DISTINCT {qc})")
-                agg_meta.append((col, "unique"))
+    @mcp.tool(
+        name="profile",
+        description=(
+            "Run a SELECT and return per-column statistics over the full result, computed in "
+            "DuckDB. Numerics: non_null_count, null_rate, min, max, mean, std, p25/p50/p75/p95. "
+            "Text: non_null_count, null_rate, unique, top, freq. No row cap."
+        ),
+    )
+    @_logged
+    def _profile(sql: str, flow: str = "default") -> dict:
+        return session.profile(sql, flow)
 
-        agg_sql = (
-            f"SELECT {', '.join(select_parts)} "
-            f"FROM ({sql}) AS _spelunk_q"
+    @mcp.tool(
+        name="export",
+        description=(
+            "Write a saved result (by name, e.g. `joined` or \"src\".\"orders\") OR a full SELECT "
+            "to a file. Formats: csv, json, parquet. Parent directories are created. No row cap."
+        ),
+    )
+    @_logged
+    def _export(target: str, format: str, path: str, flow: str = "default") -> dict:
+        return session.export(target, format, path, flow)
+
+    @mcp.tool(
+        name="catalog",
+        description=(
+            "With no argument: list active flows and how many results each holds. With a flow: "
+            "list that flow's saved results with their columns, types, and row counts."
+        ),
+    )
+    @_logged
+    def _catalog(flow: str | None = None) -> dict:
+        return session.catalog(flow)
+
+    @mcp.tool(
+        name="drop",
+        description=(
+            "Delete a saved result (give `name`) or an entire flow and all its results (give "
+            "only `flow`). Idempotent; cannot drop reserved schemas."
+        ),
+    )
+    @_logged
+    def _drop(name: str | None = None, flow: str = "default") -> dict:
+        return session.drop(name, flow)
+
+    if register_import_remote:
+        @mcp.tool(
+            name="import_remote",
+            description=(
+                "Pull a read-only SELECT from a SQL Server / SQLAlchemy-only source (which DuckDB "
+                "cannot attach) into the flow as table `name`, then query it normally. No row cap."
+            ),
         )
+        @_logged
+        def _import_remote(sql: str, name: str, flow: str = "default") -> dict:
+            return session.import_remote(sql, name, flow)
 
-        with engine.connect() as conn:
-            agg_row = list(conn.execute(_sa_text(agg_sql)).fetchone())
+    if allow_add_source:
+        @mcp.tool(
+            name="add_source",
+            description=(
+                "Attach a new data source at runtime, then query it like any configured source. "
+                "`spec` is a file path (.csv/.parquet/.json/.xlsx), a SQLite file, or a sqlite:// / "
+                "postgresql:// / mysql:// / mssql:// DSN; prefix with `name=` to set the source name "
+                "(e.g. `sales=./sales.parquet`). Returns the source name, kind, and the objects it "
+                "made queryable. The source is visible in every flow of this session."
+            ),
+        )
+        @_logged
+        def _add_source(spec: str) -> dict:
+            return session.add_source(spec)
 
-            col_stats: dict[str, dict[str, Any]] = {col: {} for col in columns}
-            total_rows = int(agg_row[0])
-
-            for i, (col, stat) in enumerate(agg_meta):
-                if col == "_total":
-                    continue
-                val = _to_python(agg_row[i])
-                if isinstance(val, float):
-                    val = round(val, 6)
-                col_stats[col][stat] = val
-
-            # Top/freq for object columns: one lightweight GROUP BY per column.
-            for col in object_col_list:
-                qc = _quote_col(col, dialect_name)
-                top_sql = (
-                    f"SELECT {qc}, COUNT(*) AS _spelunk_freq "
-                    f"FROM ({sql}) AS _spelunk_top "
-                    f"WHERE {qc} IS NOT NULL "
-                    f"GROUP BY {qc} "
-                    f"ORDER BY _spelunk_freq DESC "
-                    f"LIMIT 1"
-                )
-                top_row = conn.execute(_sa_text(top_sql)).fetchone()
-                if top_row:
-                    col_stats[col]["top"] = _to_python(top_row[0])
-                    col_stats[col]["freq"] = int(top_row[1])
-                else:
-                    col_stats[col]["top"] = None
-                    col_stats[col]["freq"] = 0
-
-        return {
-            "row_count": total_rows,
-            "elapsed_s": round(time.perf_counter() - t0, 3),
-            "columns": col_stats,
-        }
+        @mcp.tool(
+            name="remove_source",
+            description=(
+                "Detach a data source by its name (as shown by `add_source` or in `db://tables`), "
+                "removing it from this session. Idempotent on the underlying detach; errors only if "
+                "no source has that name."
+            ),
+        )
+        @_logged
+        def _remove_source(name: str) -> dict:
+            return session.remove_source(name)
 
     return mcp
 
 
-# --------------------------------------------------------------------------- #
-# __main__ entry-point (stdio transport for Claude Code via .mcp.json)
-# --------------------------------------------------------------------------- #
 def main() -> None:
-    """CLI entry point: read --dsn, build server, serve over stdio."""
-    import argparse
-
-    from spelunk.core.connection import connect
-
+    """CLI entry point: build a DuckSession from --source specs, serve over stdio."""
     parser = argparse.ArgumentParser(
-        description="Spelunk MCP server — exposes spelunk.core over the MCP protocol."
+        description="Spelunk MCP server — one DuckDB engine over files and databases."
     )
     parser.add_argument(
-        "--dsn",
-        required=True,
-        help="SQLAlchemy DSN, e.g. sqlite:///path/to.db",
+        "--source",
+        action="append",
+        default=[],
+        metavar="SPEC",
+        help=(
+            "A data source, repeatable. A file path (.csv/.parquet/.json/.xlsx), a SQLite file, "
+            "or a sqlite:// / postgresql:// / mysql:// / mssql:// DSN. Prefix with name= to set "
+            "the source name, e.g. sales=./sales.parquet."
+        ),
+    )
+    parser.add_argument("--dsn", default=None, help="Alias for a single --source (back-compat).")
+    parser.add_argument(
+        "--session-dir",
+        default=".spelunk_session",
+        help=(
+            "Root directory for durable workspaces (created if missing). Each process gets its "
+            "own workspace at <session-dir>/<pid>-<rand>/ so concurrent servers never collide. "
+            "Default: ./.spelunk_session."
+        ),
+    )
+    parser.add_argument(
+        "--shared-workspace",
+        action="store_true",
+        help=(
+            "Use one shared <session-dir>/workspace.duckdb instead of a per-process subdir. "
+            "Results persist across restarts and are visible to a later server on the same dir, "
+            "but concurrent servers contend for the single-writer lock (only the first is "
+            "durable; the rest fall back to ephemeral)."
+        ),
+    )
+    parser.add_argument(
+        "--keep-workspaces",
+        type=int,
+        default=3,
+        metavar="N",
+        help=(
+            "On startup, keep the N most recent per-process workspaces under --session-dir and "
+            "reclaim older ones with no live owner. Default: 3. 0 or less keeps everything. "
+            "No-op with --shared-workspace."
+        ),
+    )
+    parser.add_argument(
+        "--allow-add-source",
+        action="store_true",
+        help=(
+            "Register the add_source / remove_source tools so the agent can attach and detach "
+            "data sources at runtime. This lets the agent read any file/database the server "
+            "process can reach — only enable it for a trusted, process-per-agent setup. Off by "
+            "default."
+        ),
+    )
+    parser.add_argument("--memory-limit", default=None, help="DuckDB memory_limit, e.g. 4GB.")
+    parser.add_argument("--temp-dir", default=None, help="Directory for DuckDB spill files.")
+    parser.add_argument("--max-temp-size", default=None, help="Cap on spill size, e.g. 50GB.")
+    parser.add_argument(
+        "--tool-log",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Where to write one JSON line per tool call for usage analysis. A file path appends "
+            "there; '-' writes to stderr; 'off' disables. Default: <session-dir>/tool-calls.jsonl "
+            "when --session-dir is set, otherwise stderr."
+        ),
     )
     args = parser.parse_args()
 
-    engine = connect(args.dsn)
-    server = build_server(engine)
+    specs = list(args.source)
+    if args.dsn:
+        specs.append(args.dsn)
+
+    session = DuckSession.open(
+        specs,
+        session_dir=args.session_dir,
+        per_process=not args.shared_workspace,
+        keep_workspaces=args.keep_workspaces,
+        memory_limit=args.memory_limit,
+        temp_dir=args.temp_dir,
+        max_temp_size=args.max_temp_size,
+    )
+
+    # Resolve the tool-log AFTER open(): by default the durable dir is a per-process subdir
+    # chosen inside open(), so the default log belongs there, not under the --session-dir root.
+    if args.tool_log == "off":
+        tool_log: str | None = None
+    elif args.tool_log:
+        tool_log = args.tool_log
+    elif args.session_dir:
+        tool_log = str(Path(session.workspace_dir) / "tool-calls.jsonl")
+    else:
+        tool_log = "-"  # stderr
+
+    server = build_server(session, tool_log=tool_log, allow_add_source=args.allow_add_source)
     server.run(transport="stdio")
 
 
