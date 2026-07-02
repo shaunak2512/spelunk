@@ -16,6 +16,7 @@ import functools
 import inspect
 import json
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +36,17 @@ _tool_logger.propagate = False
 # and row payloads are summarised, never dumped.
 _LOGGED_ARGS = ("sql", "name", "flow", "target", "format", "path", "spec")
 _LOGGED_RESULT_FIELDS = ("name", "flow", "row_count", "format", "path", "dropped_results", "kind")
+
+# add_source accepts DSNs that can embed credentials (postgresql://user:pw@host/db); strip the
+# userinfo (user:pass@) before the spec is written to the on-disk tool-call log.
+_DSN_CREDENTIALS_RE = re.compile(r"//[^/@\s]+@")
+
+
+def _redact(value: object) -> object:
+    """Mask userinfo (user:pass@) in DSN-like strings so credentials never reach the log."""
+    if isinstance(value, str):
+        return _DSN_CREDENTIALS_RE.sub("//***@", value)
+    return value
 
 
 def _configure_tool_logging(tool_log: str | None) -> None:
@@ -90,7 +102,11 @@ def _logged(fn):
         record: dict = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "tool": tool_name,
-            "args": {k: v for k, v in bound.arguments.items() if k in _LOGGED_ARGS},
+            "args": {
+                k: (_redact(v) if k == "spec" else v)
+                for k, v in bound.arguments.items()
+                if k in _LOGGED_ARGS
+            },
         }
         start = time.perf_counter()
         try:

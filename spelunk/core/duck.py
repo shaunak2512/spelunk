@@ -26,6 +26,7 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -44,8 +45,19 @@ _NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
 # Schemas in the workspace catalog that are never flows and must never be dropped.
 _RESERVED_SCHEMAS = frozenset({"main", "information_schema", "pg_catalog", "system", "temp"})
 
-# DuckDB type-name fragments that mark a column as numeric (for profile stats).
-_NUMERIC_TYPES = ("INT", "DECIMAL", "DOUBLE", "FLOAT", "REAL", "NUMERIC", "HUGEINT", "BIGINT")
+# DuckDB base type names that mark a column as numeric (for profile stats). Matched against the
+# type name with any parametrisation stripped (e.g. DECIMAL(18,3) -> DECIMAL) — exact, not
+# substring, so INTERVAL is not mistaken for an INT (STDDEV/percentiles fail on interval values).
+_NUMERIC_TYPES = frozenset({
+    "TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT",
+    "UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT", "UHUGEINT",
+    "DECIMAL", "NUMERIC", "REAL", "FLOAT", "DOUBLE",
+})
+
+
+def _is_numeric_type(type_name: str) -> bool:
+    """True if a DuckDB column type is numeric — exact base-type match (drops any `(...)`)."""
+    return type_name.upper().split("(", 1)[0].strip() in _NUMERIC_TYPES
 
 _SAMPLE_ROWS = 5
 # A materialized result larger than this, produced by an unfiltered SELECT * over a source,
@@ -299,14 +311,16 @@ class DuckSession:
         kind, and the objects it made queryable.
         """
         src = sources_mod.build_source(spec)  # off-lock: fallback specs connect here
-        existing = {s.name for s in self.sources}
-        if src.name in existing or src.name == self._catalog:
-            raise ValueError(
-                f"Source name {src.name!r} is already in use "
-                f"(sources: {sorted(existing) or ['(none)']}; workspace catalog: {self._catalog!r}). "
-                "Prefix the spec with a different name, e.g. mydata=<spec>."
-            )
         with self._lock:
+            # Check-and-register under one lock: two concurrent add_source calls with the same
+            # name must not both pass the uniqueness test (worker threads run tools concurrently).
+            existing = {s.name for s in self.sources}
+            if src.name in existing or src.name == self._catalog:
+                raise ValueError(
+                    f"Source name {src.name!r} is already in use "
+                    f"(sources: {sorted(existing) or ['(none)']}; workspace catalog: {self._catalog!r}). "
+                    "Prefix the spec with a different name, e.g. mydata=<spec>."
+                )
             for stmt in src.setup_sql:  # on failure, nothing is appended — self.sources unchanged
                 self._con.execute(stmt)
             self.sources.append(src)
@@ -320,11 +334,13 @@ class DuckSession:
         and forgets it. Affects this session's connection only — under the process-per-agent
         model that's the agent's own isolated workspace. Raises if no such source exists.
         """
-        src = next((s for s in self.sources if s.name == name), None)
-        if src is None:
-            known = sorted(s.name for s in self.sources)
-            raise ValueError(f"No source named {name!r}. Configured sources: {known or ['(none)']}.")
         with self._lock:
+            # Look up and remove under one lock so a concurrent add/remove can't leave a stale
+            # entry or double-remove (worker threads run tools concurrently).
+            src = next((s for s in self.sources if s.name == name), None)
+            if src is None:
+                known = sorted(s.name for s in self.sources)
+                raise ValueError(f"No source named {name!r}. Configured sources: {known or ['(none)']}.")
             for stmt in sources_mod.teardown_sql(src):
                 self._con.execute(stmt)
             self.sources.remove(src)
@@ -374,10 +390,8 @@ class DuckSession:
             self._con.execute(f'CREATE SCHEMA IF NOT EXISTS "{flow}"')
             self._set_search_path(flow)
             t0 = time.perf_counter()
-            try:
+            with self._friendly_catalog_errors(flow):
                 self._con.execute(f'CREATE OR REPLACE TABLE "{flow}"."{name}" AS {sql}')
-            except duckdb.CatalogException as exc:
-                raise ValueError(self._catalog_help(flow, exc)) from exc
             elapsed = time.perf_counter() - t0
             row_count = self._con.execute(f'SELECT COUNT(*) FROM "{flow}"."{name}"').fetchone()[0]
             columns = self._columns_of(flow, name)
@@ -413,13 +427,23 @@ class DuckSession:
             "(reference attached databases as \"<source>\".\"<table>\"; read db://tables to list them)."
         )
 
+    @contextmanager
+    def _friendly_catalog_errors(self, flow: str):
+        """Rewrite a DuckDB CatalogException (unknown table/source) into an actionable
+        ``ValueError`` listing the flow's results and configured sources — shared by
+        ``query`` / ``profile`` / ``export`` so all three fail the same helpful way."""
+        try:
+            yield
+        except duckdb.CatalogException as exc:
+            raise ValueError(self._catalog_help(flow, exc)) from exc
+
     # ------------------------------------------------------------------ profile ------- #
     def profile(self, sql: str, flow: str | None = None) -> dict:
         """Per-column stats over the full result of *sql*, computed in DuckDB."""
         flow = flow or self.default_flow
         _validate_name(flow, "flow name")
         guard.assert_read_only(sql, "duckdb")
-        with self._lock:
+        with self._lock, self._friendly_catalog_errors(flow):
             self._con.execute(f'CREATE SCHEMA IF NOT EXISTS "{flow}"')
             self._set_search_path(flow)
             t0 = time.perf_counter()
@@ -428,7 +452,7 @@ class DuckSession:
             if not cols:
                 return {"row_count": 0, "elapsed_s": 0.0, "columns": {}}
 
-            numeric = {c for c, t in cols if any(frag in t.upper() for frag in _NUMERIC_TYPES)}
+            numeric = {c for c, t in cols if _is_numeric_type(t)}
             select_parts = ["COUNT(*)"]
             meta: list[tuple[str, str]] = [("_total", "_total")]
             for col, _t in cols:
@@ -502,7 +526,7 @@ class DuckSession:
         else:
             source_expr = _quote_qualified(target)
 
-        with self._lock:
+        with self._lock, self._friendly_catalog_errors(flow):
             self._con.execute(f'CREATE SCHEMA IF NOT EXISTS "{flow}"')
             self._set_search_path(flow)
             self._con.execute(f"COPY {source_expr} TO '{safe_path}' {copy_opts[fmt]}")
@@ -520,14 +544,21 @@ class DuckSession:
         flow = flow or self.default_flow
         _validate_name(flow, "flow name")
         _validate_name(name)
-        engines = [s.engine for s in self.fallback_sources if s.engine is not None]
-        if not engines:
+        remotes = [s for s in self.fallback_sources if s.engine is not None]
+        if not remotes:
             raise ValueError("No fallback (SQLAlchemy) source is configured; nothing to import.")
+        if len(remotes) > 1:
+            names = ", ".join(f'"{s.name}"' for s in remotes)
+            raise ValueError(
+                f"Multiple fallback (SQLAlchemy) sources are configured ({names}); import_remote "
+                "cannot yet disambiguate which one to pull from. Configure a single fallback "
+                "source for this session."
+            )
 
         from .query import run_sql
 
         # The slow remote fetch happens outside the lock.
-        result = run_sql(engines[0], sql, max_rows=None)
+        result = run_sql(remotes[0].engine, sql, max_rows=None)
         import pandas as pd
 
         df = pd.DataFrame(result.rows, columns=result.columns)

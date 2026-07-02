@@ -74,9 +74,11 @@ class TestQueryTool:
         assert data["row_count"] == 3
 
     def test_unsafe_write_rejected(self, mcp_server):
-        from spelunk.core.types import UnsafeSQLError
+        # guard.assert_read_only raises UnsafeSQLError; FastMCP re-wraps it as ToolError, so we
+        # assert that specific type plus the guard's message rather than a bare Exception.
+        from fastmcp.exceptions import ToolError
 
-        with pytest.raises((UnsafeSQLError, Exception)):
+        with pytest.raises(ToolError, match="not a SELECT"):
             _run(mcp_server.call_tool("query", {"sql": "DELETE FROM orders", "name": "x"}))
 
 
@@ -125,7 +127,9 @@ class TestToolLogging:
         session = DuckSession.open([f"shop={sqlite_file}"])
         server = build_server(session, tool_log=str(log_path))
         try:
-            with pytest.raises(Exception):
+            from fastmcp.exceptions import ToolError
+
+            with pytest.raises(ToolError, match="not a SELECT"):
                 _run(server.call_tool("query", {"sql": "DELETE FROM x", "name": "x"}))
         finally:
             session.close()

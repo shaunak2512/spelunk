@@ -199,7 +199,13 @@ def _attach_target(kind: SourceKind, locator: str) -> str:
     from the DSN (more reliable across the scanners than passing a raw URL).
     """
     if kind == "sqlite":
-        path = locator[len("sqlite://"):].lstrip("/") if locator.lower().startswith("sqlite://") else locator
+        if locator.lower().startswith("sqlite://"):
+            rest = locator[len("sqlite://"):]
+            # Strip only the single URI-separator slash, so the SQLAlchemy 4-slash absolute form
+            # (sqlite:////abs/path.db -> /abs/path.db) survives; 3-slash relative stays relative.
+            path = rest[1:] if rest.startswith("/") else rest
+        else:
+            path = locator
         return _duck_path(path)
 
     from sqlalchemy.engine import make_url
