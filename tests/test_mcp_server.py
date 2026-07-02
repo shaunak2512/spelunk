@@ -1,11 +1,8 @@
 """Tests for spelunk.mcp.server — offline, no server spin-up.
 
-Strategy:
-- Build a FastMCP instance via build_server(engine) using the sample_db fixture.
-- Assert that the expected tool, resource, and resource template are registered
-  (using asyncio.run + mcp.list_tools / list_resources / list_resource_templates).
-- Call the handlers in-process via mcp.call_tool / mcp.read_resource to verify
-  they return correct data from sample_db.
+Builds a FastMCP instance via build_server(DuckSession) over a SQLite source ('shop') and a
+CSV file source ('orders'), then drives the tools/resources in-process via
+mcp.call_tool / mcp.read_resource.
 """
 from __future__ import annotations
 
@@ -14,251 +11,180 @@ import json
 
 import pytest
 
-from spelunk.core.connection import connect
+from spelunk.core.duck import DuckSession
 from spelunk.mcp.server import build_server
 
 
-# --------------------------------------------------------------------------- #
-# Helpers
-# --------------------------------------------------------------------------- #
-
 def _run(coro):
-    """Run an async coroutine synchronously (avoids requiring pytest-asyncio)."""
     return asyncio.run(coro)
 
 
-# --------------------------------------------------------------------------- #
-# Fixtures
-# --------------------------------------------------------------------------- #
-
 @pytest.fixture
-def mcp_server(sample_db):
-    """Build a FastMCP server wired to the sample_db SQLite database."""
-    engine = connect(sample_db, read_only=False)  # sample_db is writable tmp file
-    return build_server(engine)
+def mcp_server(sqlite_file, csv_file):
+    session = DuckSession.open([f"shop={sqlite_file}", f"orders={csv_file}"])
+    yield build_server(session)
+    session.close()
 
-
-# --------------------------------------------------------------------------- #
-# Registration tests
-# --------------------------------------------------------------------------- #
 
 class TestRegistration:
-    """Assert that the three components are registered on the FastMCP instance."""
+    def test_five_core_tools_registered(self, mcp_server):
+        names = {t.name for t in _run(mcp_server.list_tools())}
+        assert {"query", "profile", "export", "catalog", "drop"} <= names
 
-    def test_run_query_tool_is_registered(self, mcp_server):
-        tools = _run(mcp_server.list_tools())
-        tool_names = [t.name for t in tools]
-        assert "run_query" in tool_names, f"Expected 'run_query' in tools, got: {tool_names}"
+    def test_no_import_remote_without_fallback(self, mcp_server):
+        names = {t.name for t in _run(mcp_server.list_tools())}
+        assert "import_remote" not in names  # no SQL-Server source configured
 
-    def test_list_tables_resource_is_registered(self, mcp_server):
-        resources = _run(mcp_server.list_resources())
-        uris = [str(r.uri) for r in resources]
-        assert any("tables" in u for u in uris), (
-            f"Expected a 'db://tables' resource, got URIs: {uris}"
-        )
-
-    def test_describe_table_template_is_registered(self, mcp_server):
-        templates = _run(mcp_server.list_resource_templates())
-        uri_templates = [t.uri_template for t in templates]
-        assert any("{table}" in t for t in uri_templates), (
-            f"Expected a 'db://{{table}}' template, got: {uri_templates}"
-        )
+    def test_resources_registered(self, mcp_server):
+        uris = [str(r.uri) for r in _run(mcp_server.list_resources())]
+        templates = [t.uri_template for t in _run(mcp_server.list_resource_templates())]
+        assert any("tables" in u for u in uris)
+        assert any("{table}" in t for t in templates)
 
 
-# --------------------------------------------------------------------------- #
-# Handler correctness tests (via in-process calls)
-# --------------------------------------------------------------------------- #
-
-class TestListTablesResource:
-    """db://tables resource returns the tables in sample_db."""
-
-    def test_returns_json_string(self, mcp_server):
-        result = _run(mcp_server.read_resource("db://tables"))
-        content = result.contents[0].content
-        assert isinstance(content, str), "Resource content should be a JSON string"
-
-    def test_contains_customers_and_orders(self, mcp_server):
-        result = _run(mcp_server.read_resource("db://tables"))
-        content = result.contents[0].content
-        data = json.loads(content)
+class TestResources:
+    def test_list_tables_spans_sources(self, mcp_server):
+        data = json.loads(_run(mcp_server.read_resource("db://tables")).contents[0].content)
         names = {row["name"] for row in data}
-        assert "customers" in names, f"Expected 'customers' in table list, got: {names}"
-        assert "orders" in names, f"Expected 'orders' in table list, got: {names}"
+        assert "shop.customers" in names
+        assert "orders" in names
 
-    def test_kind_field_present(self, mcp_server):
-        result = _run(mcp_server.read_resource("db://tables"))
-        data = json.loads(result.contents[0].content)
-        for row in data:
-            assert "kind" in row, f"Missing 'kind' field in table entry: {row}"
-
-
-class TestDescribeTableTemplate:
-    """db://{table} template returns a TableDescription for a named table."""
-
-    def test_customers_description_has_columns(self, mcp_server):
-        result = _run(mcp_server.read_resource("db://customers"))
-        content = result.contents[0].content
-        data = json.loads(content)
+    def test_describe_qualified_table(self, mcp_server):
+        data = json.loads(_run(mcp_server.read_resource("db://shop.customers")).contents[0].content)
         col_names = [c["name"] for c in data["columns"]]
-        assert "id" in col_names
-        assert "name" in col_names
-        assert "city" in col_names
-
-    def test_orders_has_foreign_key(self, mcp_server):
-        result = _run(mcp_server.read_resource("db://orders"))
-        content = result.contents[0].content
-        data = json.loads(content)
-        fk_columns = [fk["column"] for fk in data.get("foreign_keys", [])]
-        assert "customer_id" in fk_columns, (
-            f"Expected FK on customer_id in orders, got: {fk_columns}"
-        )
-
-    def test_sample_rows_populated(self, mcp_server):
-        result = _run(mcp_server.read_resource("db://customers"))
-        content = result.contents[0].content
-        data = json.loads(content)
-        assert len(data["sample_rows"]) > 0, "Expected at least one sample row"
-
-    def test_primary_key_identified(self, mcp_server):
-        result = _run(mcp_server.read_resource("db://customers"))
-        data = json.loads(result.contents[0].content)
-        assert "id" in data["primary_key"], (
-            f"Expected 'id' in primary_key, got: {data['primary_key']}"
-        )
+        assert "id" in col_names and "name" in col_names
+        assert "id" in data["primary_key"]
+        assert len(data["sample_rows"]) > 0
 
 
-class TestRunQueryTool:
-    """run_query tool executes SQL and returns QueryResult-shaped data."""
+class TestQueryTool:
+    def test_query_materializes_and_samples(self, mcp_server):
+        res = _run(mcp_server.call_tool("query", {"sql": "SELECT * FROM \"shop\".\"customers\"", "name": "c"}))
+        data = res.structured_content
+        assert data["row_count"] == 3
+        assert data["name"] == "c"
+        assert len(data["sample"]) == 3
 
-    def test_select_all_customers(self, mcp_server):
-        result = _run(mcp_server.call_tool("run_query", {"sql": "SELECT * FROM customers"}))
-        # call_tool returns a ToolResult; structured_content holds the dict
-        data = result.structured_content
-        assert "columns" in data
-        assert "rows" in data
-        assert "row_count" in data
-        assert data["row_count"] == 3, f"Expected 3 customers, got: {data['row_count']}"
-
-    def test_customer_names_present(self, mcp_server):
-        result = _run(mcp_server.call_tool("run_query", {"sql": "SELECT name FROM customers ORDER BY id"}))
-        data = result.structured_content
-        names = [row[0] for row in data["rows"]]
-        assert names == ["Ada", "Linus", "Grace"], f"Unexpected names: {names}"
-
-    def test_orders_count(self, mcp_server):
-        result = _run(mcp_server.call_tool("run_query", {"sql": "SELECT COUNT(*) FROM orders"}))
-        data = result.structured_content
-        assert data["rows"][0][0] == 3, f"Expected 3 orders, got: {data['rows']}"
-
-    def test_join_query(self, mcp_server):
+    def test_cross_source_join(self, mcp_server):
         sql = (
-            "SELECT c.name, o.amount "
-            "FROM customers c JOIN orders o ON c.id = o.customer_id "
-            "WHERE o.status = 'shipped'"
+            'SELECT c.name, o.amount FROM "shop"."customers" c '
+            "JOIN orders o ON c.id = o.customer_id"
         )
-        result = _run(mcp_server.call_tool("run_query", {"sql": sql}))
-        data = result.structured_content
-        assert data["row_count"] == 2, f"Expected 2 shipped orders, got: {data['row_count']}"
+        data = _run(mcp_server.call_tool("query", {"sql": sql, "name": "joined"})).structured_content
+        assert data["row_count"] == 3
 
-    def test_result_has_columns_field(self, mcp_server):
-        result = _run(mcp_server.call_tool("run_query", {"sql": "SELECT id, name FROM customers"}))
-        data = result.structured_content
-        assert data["columns"] == ["id", "name"], f"Unexpected columns: {data['columns']}"
+    def test_unsafe_write_rejected(self, mcp_server):
+        # guard.assert_read_only raises UnsafeSQLError; FastMCP re-wraps it as ToolError, so we
+        # assert that specific type plus the guard's message rather than a bare Exception.
+        from fastmcp.exceptions import ToolError
 
-    def test_unsafe_write_raises(self, mcp_server):
-        from spelunk.core.types import UnsafeSQLError
-        with pytest.raises(Exception):
-            # run_sql raises UnsafeSQLError for writes; FastMCP may wrap it
-            _run(mcp_server.call_tool("run_query", {"sql": "DELETE FROM customers"}))
+        with pytest.raises(ToolError, match="not a SELECT"):
+            _run(mcp_server.call_tool("query", {"sql": "DELETE FROM orders", "name": "x"}))
 
 
-# --------------------------------------------------------------------------- #
-# describe_query tool
-# --------------------------------------------------------------------------- #
+class TestOtherTools:
+    def test_profile(self, mcp_server):
+        _run(mcp_server.call_tool("query", {"sql": "SELECT * FROM orders", "name": "o"}))
+        data = _run(mcp_server.call_tool("profile", {"sql": "SELECT * FROM o"})).structured_content
+        assert "amount" in data["columns"]
+        assert data["columns"]["amount"]["min"] == 75.0
 
-class TestDescribeQueryTool:
-    """describe_query returns per-column stats with correct field names."""
+    def test_catalog_and_drop(self, mcp_server):
+        _run(mcp_server.call_tool("query", {"sql": "SELECT 1 AS a", "name": "r1", "flow": "w"}))
+        cat = _run(mcp_server.call_tool("catalog", {"flow": "w"})).structured_content
+        assert [r["name"] for r in cat["results"]] == ["r1"]
+        dropped = _run(mcp_server.call_tool("drop", {"flow": "w"})).structured_content
+        assert dropped["dropped_results"] == 1
 
-    def test_numeric_column_has_non_null_count(self, mcp_server):
-        result = _run(mcp_server.call_tool("describe_query", {"sql": "SELECT amount FROM orders"}))
-        data = result.structured_content
-        assert "non_null_count" in data["columns"]["amount"], (
-            f"Expected 'non_null_count' key in numeric column stats, got: {data['columns']['amount'].keys()}"
-        )
-
-    def test_numeric_column_has_no_bare_count(self, mcp_server):
-        result = _run(mcp_server.call_tool("describe_query", {"sql": "SELECT amount FROM orders"}))
-        data = result.structured_content
-        assert "count" not in data["columns"]["amount"], (
-            "Key 'count' should be renamed to 'non_null_count'"
-        )
-
-    def test_numeric_column_has_std(self, mcp_server):
-        result = _run(mcp_server.call_tool("describe_query", {"sql": "SELECT amount FROM orders"}))
-        data = result.structured_content
-        assert "std" in data["columns"]["amount"], (
-            f"Expected 'std' in numeric column stats, got: {data['columns']['amount'].keys()}"
-        )
-        assert data["columns"]["amount"]["std"] is not None
-
-    def test_text_column_has_non_null_count(self, mcp_server):
-        result = _run(mcp_server.call_tool("describe_query", {"sql": "SELECT status FROM orders"}))
-        data = result.structured_content
-        assert "non_null_count" in data["columns"]["status"], (
-            f"Expected 'non_null_count' key in text column stats, got: {data['columns']['status'].keys()}"
-        )
-
-    def test_text_column_has_no_bare_count(self, mcp_server):
-        result = _run(mcp_server.call_tool("describe_query", {"sql": "SELECT status FROM orders"}))
-        data = result.structured_content
-        assert "count" not in data["columns"]["status"], (
-            "Key 'count' should be renamed to 'non_null_count'"
-        )
-
-    def test_row_count_matches_expected(self, mcp_server):
-        result = _run(mcp_server.call_tool("describe_query", {"sql": "SELECT amount FROM orders"}))
-        data = result.structured_content
-        assert data["row_count"] == 3, f"Expected 3 rows, got: {data['row_count']}"
-
-    def test_non_null_count_excludes_nulls(self, mcp_server):
-        # city has one NULL (Grace has no city); non_null_count should be 2
-        result = _run(mcp_server.call_tool("describe_query", {"sql": "SELECT city FROM customers"}))
-        data = result.structured_content
-        assert data["columns"]["city"]["non_null_count"] == 2, (
-            f"Expected non_null_count=2 for city (one NULL), got: {data['columns']['city']}"
-        )
+    def test_export(self, mcp_server, tmp_path):
+        _run(mcp_server.call_tool("query", {"sql": "SELECT * FROM orders", "name": "o"}))
+        out = str(tmp_path / "o.parquet")
+        res = _run(mcp_server.call_tool("export", {"target": "o", "format": "parquet", "path": out})).structured_content
+        assert res["row_count"] == 3
 
 
-# --------------------------------------------------------------------------- #
-# build_server contract
-# --------------------------------------------------------------------------- #
+class TestToolLogging:
+    def test_each_call_logs_one_json_line(self, sqlite_file, csv_file, tmp_path):
+        log_path = tmp_path / "tool-calls.jsonl"
+        session = DuckSession.open([f"shop={sqlite_file}", f"orders={csv_file}"])
+        server = build_server(session, tool_log=str(log_path))
+        try:
+            _run(server.call_tool("query", {"sql": "SELECT * FROM orders", "name": "o"}))
+            _run(server.call_tool("catalog", {}))
+        finally:
+            session.close()
 
-class TestBuildServerContract:
-    """Structural checks on the returned FastMCP instance."""
+        lines = [json.loads(line) for line in log_path.read_text().splitlines()]
+        assert [r["tool"] for r in lines] == ["query", "catalog"]
+        q = lines[0]
+        assert q["outcome"] == "ok"
+        assert q["args"]["name"] == "o"
+        assert q["result"]["row_count"] == 3
+        assert isinstance(q["duration_ms"], (int, float))
 
-    def test_returns_fastmcp_instance(self, sample_db):
-        from fastmcp import FastMCP
-        engine = connect(sample_db, read_only=False)
-        server = build_server(engine)
-        assert isinstance(server, FastMCP)
+    def test_failed_call_logs_error_outcome(self, sqlite_file, tmp_path):
+        log_path = tmp_path / "tool-calls.jsonl"
+        session = DuckSession.open([f"shop={sqlite_file}"])
+        server = build_server(session, tool_log=str(log_path))
+        try:
+            from fastmcp.exceptions import ToolError
 
-    def test_server_has_three_registered_components(self, mcp_server):
-        tools = _run(mcp_server.list_tools())
-        resources = _run(mcp_server.list_resources())
-        templates = _run(mcp_server.list_resource_templates())
-        tool_names = {t.name for t in tools}
-        assert tool_names == {"run_query", "export_query", "describe_query"}, (
-            f"Unexpected tools: {tool_names}"
-        )
-        assert len(resources) == 1, f"Expected 1 resource, got: {[str(r.uri) for r in resources]}"
-        assert len(templates) == 1, f"Expected 1 template, got: {[t.uri_template for t in templates]}"
+            with pytest.raises(ToolError, match="not a SELECT"):
+                _run(server.call_tool("query", {"sql": "DELETE FROM x", "name": "x"}))
+        finally:
+            session.close()
 
-    def test_multiple_servers_are_independent(self, sample_db):
-        """build_server should not share state between calls."""
-        engine = connect(sample_db, read_only=False)
-        s1 = build_server(engine)
-        s2 = build_server(engine)
-        tools1 = _run(s1.list_tools())
-        tools2 = _run(s2.list_tools())
-        assert len(tools1) == 3
-        assert len(tools2) == 3
+        rec = json.loads(log_path.read_text().splitlines()[-1])
+        assert rec["tool"] == "query"
+        assert rec["outcome"] == "error"
+        assert rec["error"]
+
+
+class TestAddSourceGating:
+    def test_tools_absent_without_flag(self, mcp_server):
+        names = {t.name for t in _run(mcp_server.list_tools())}
+        assert "add_source" not in names and "remove_source" not in names
+
+    def test_tools_present_with_flag(self, sqlite_file):
+        session = DuckSession.open([f"shop={sqlite_file}"])
+        try:
+            names = {t.name for t in _run(build_server(session, allow_add_source=True).list_tools())}
+            assert {"add_source", "remove_source"} <= names
+            # import_remote is registered too, since a fallback source can now be added at runtime.
+            assert "import_remote" in names
+        finally:
+            session.close()
+
+    def test_add_then_query_then_remove(self, sqlite_file, parquet_file):
+        session = DuckSession.open([f"shop={sqlite_file}"])
+        server = build_server(session, allow_add_source=True)
+        try:
+            added = _run(server.call_tool("add_source", {"spec": f"regions={parquet_file}"})).structured_content
+            assert added["name"] == "regions"
+            data = _run(server.call_tool("query", {"sql": "SELECT * FROM regions", "name": "r"})).structured_content
+            assert data["row_count"] == 2
+            removed = _run(server.call_tool("remove_source", {"name": "regions"})).structured_content
+            assert removed["removed"] is True
+        finally:
+            session.close()
+
+
+class TestFallbackToolGating:
+    def test_import_remote_registered_with_fallback(self, sqlite_file):
+        # An mssql:// DSN can't actually connect, but build_source defers the connect to a
+        # real engine; use monkeypatched fallback instead: a sqlite engine tagged fallback.
+        from spelunk.core import sources
+        from spelunk.core.connection import connect
+
+        src = sources.Source(name="remote", kind="fallback", locator="x", engine=connect(sqlite_file_dsn(sqlite_file)))
+        session = DuckSession.open([f"shop={sqlite_file}"])
+        session.sources.append(src)
+        try:
+            names = {t.name for t in _run(build_server(session).list_tools())}
+            assert "import_remote" in names
+        finally:
+            session.close()
+
+
+def sqlite_file_dsn(path: str) -> str:
+    return f"sqlite:///{path.replace(chr(92), '/')}"

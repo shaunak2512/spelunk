@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "spelunk": {
+      "command": "C:\\Users\\shaun\\repo\\spelunk\\.venv\\Scripts\\python.exe",
+      "args": [
+        "-m",
+        "spelunk.mcp.server",
+        "--source",
+        "pitchfork=C:\\Users\\shaun\\repo\\spelunk\\sample data\\pitchfork_review.sqlite",
+        "--session-dir",
+        "C:/Users/shaun/repo/spelunk/.spelunk_session"
+      ]
+    }
+  }
+}

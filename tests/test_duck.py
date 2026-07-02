@@ -1,0 +1,308 @@
+"""Tests for spelunk.core.duck.DuckSession — the unified engine + workspace."""
+from __future__ import annotations
+
+import os
+import time
+
+import duckdb
+import pytest
+
+from spelunk.core.duck import DuckSession
+from spelunk.core.types import UnsafeSQLError
+
+
+@pytest.fixture
+def session(sqlite_file, csv_file):
+    """A session over the sample SQLite DB ('shop') and the orders CSV ('orders')."""
+    s = DuckSession.open([f"shop={sqlite_file}", f"orders={csv_file}"])
+    yield s
+    s.close()
+
+
+class TestIntrospection:
+    def test_list_objects_spans_sources(self, session):
+        objs = {o.name: o for o in session.list_objects()}
+        assert "shop.customers" in objs and "shop.orders" in objs
+        assert "orders" in objs  # the CSV file view
+        assert objs["shop.customers"].row_count == 3
+        assert objs["orders"].kind == "view"
+
+    def test_describe_columns_and_pk(self, session):
+        desc = session.describe("shop.customers")
+        names = [c.name for c in desc.columns]
+        assert names == ["id", "name", "city", "signup_date"]
+        assert desc.primary_key == ["id"]
+        assert desc.row_count == 3
+        assert len(desc.sample_rows) == 3
+
+
+class TestQuery:
+    def test_materializes_and_returns_sample(self, session):
+        r = session.query("SELECT id, name FROM \"shop\".\"customers\" ORDER BY id", "cust")
+        assert r["name"] == "cust"
+        assert r["row_count"] == 3
+        assert [c["name"] for c in r["columns"]] == ["id", "name"]
+        assert r["sample"][0] == [1, "Ada"]
+
+    def test_cross_source_join(self, session):
+        r = session.query(
+            'SELECT c.name, o.amount FROM "shop"."customers" c '
+            "JOIN orders o ON c.id = o.customer_id",
+            "joined",
+        )
+        assert r["row_count"] == 3
+
+    def test_result_is_reusable_by_name(self, session):
+        session.query("SELECT * FROM \"shop\".\"customers\"", "cust")
+        r2 = session.query("SELECT COUNT(*) AS n FROM cust", "cnt")
+        assert r2["sample"] == [[3]]
+
+    def test_read_only_guard_rejects_writes(self, session):
+        with pytest.raises(UnsafeSQLError):
+            session.query("DROP TABLE orders", "x")
+
+    def test_required_name_validated(self, session):
+        with pytest.raises(ValueError):
+            session.query("SELECT 1", "bad name!")
+
+    def test_large_unfiltered_star_hint(self, session):
+        # Build a >100k-row table, then SELECT * it wholesale -> nudge fires.
+        session.query("SELECT i AS x FROM range(150000) t(i)", "big")
+        r = session.query("SELECT * FROM big", "copy")
+        assert "hints" in r and any("wholesale" in h for h in r["hints"])
+
+    def test_small_query_has_no_hint(self, session):
+        r = session.query("SELECT * FROM orders", "o")
+        assert "hints" not in r
+
+
+class TestProfile:
+    def test_numeric_and_text_stats(self, session):
+        session.query(
+            'SELECT c.name, o.amount FROM "shop"."customers" c '
+            "JOIN orders o ON c.id = o.customer_id",
+            "joined",
+        )
+        stats = session.profile("SELECT * FROM joined")["columns"]
+        assert stats["amount"]["min"] == 75.0
+        assert stats["amount"]["max"] == 250.0
+        assert "p50" in stats["amount"]  # percentiles always available in DuckDB
+        assert stats["name"]["top"] == "Ada"
+        assert stats["name"]["unique"] == 2
+
+
+class TestFlows:
+    def test_flows_isolate_same_name(self, session):
+        session.query("SELECT 1 AS a", "r", flow="q1")
+        session.query("SELECT 2 AS a", "r", flow="q2")
+        assert session.query("SELECT a FROM q1.r", "x", flow="q1")["sample"] == [[1]]
+        # cross-flow qualified reference
+        assert session.query('SELECT a FROM "q2"."r"', "y", flow="q1")["sample"] == [[2]]
+
+    def test_catalog_lists_flows_then_results(self, session):
+        session.query("SELECT 1 AS a", "r1", flow="work")
+        flows = {f["flow"]: f["result_count"] for f in session.catalog()["flows"]}
+        assert flows.get("work") == 1
+        names = [r["name"] for r in session.catalog("work")["results"]]
+        assert names == ["r1"]
+
+    def test_drop_result_then_flow(self, session):
+        session.query("SELECT 1 AS a", "r1", flow="work")
+        assert session.drop("r1", flow="work")["dropped"] is True
+        assert session.drop("r1", flow="work")["dropped"] is False
+        session.query("SELECT 1 AS a", "r2", flow="work")
+        assert session.drop(flow="work")["dropped_results"] == 1
+
+    def test_cannot_drop_reserved(self, session):
+        with pytest.raises(ValueError, match="reserved"):
+            session.drop(flow="main")
+
+
+class TestSourceManagement:
+    def test_add_file_source_then_query(self, session, parquet_file):
+        res = session.add_source(f"regions={parquet_file}")
+        assert res["name"] == "regions" and res["kind"] == "file"
+        assert [o["name"] for o in res["objects"]] == ["regions"]
+        # Queryable in any flow, by bare view name.
+        r = session.query("SELECT city FROM regions ORDER BY city", "cities", flow="other")
+        assert [row[0] for row in r["sample"]] == ["Melbourne", "Sydney"]
+
+    def test_add_db_source_lists_its_tables(self, session, sqlite_file):
+        res = session.add_source(f"shop2={sqlite_file}")
+        assert res["kind"] == "sqlite"
+        assert "shop2.customers" in [o["name"] for o in res["objects"]]
+        assert "shop2.customers" in [o.name for o in session.list_objects()]
+
+    def test_remove_source_detaches(self, session, parquet_file):
+        session.add_source(f"regions={parquet_file}")
+        out = session.remove_source("regions")
+        assert out == {"name": "regions", "kind": "file", "removed": True}
+        assert "regions" not in [s.name for s in session.sources]
+        with pytest.raises(ValueError, match="does not exist"):  # query wraps the CatalogException
+            session.query("SELECT * FROM regions", "x")
+
+    def test_remove_startup_source(self, session):
+        # remove-any: a source configured at open() can be detached too.
+        assert session.remove_source("orders")["removed"] is True
+        with pytest.raises(ValueError, match="does not exist"):
+            session.query("SELECT * FROM orders", "x")
+
+    def test_add_duplicate_name_rejected(self, session, parquet_file):
+        with pytest.raises(ValueError, match="already in use"):
+            session.add_source(f"orders={parquet_file}")  # 'orders' already configured
+
+    def test_remove_unknown_name_raises(self, session):
+        with pytest.raises(ValueError, match="No source named"):
+            session.remove_source("nope")
+
+
+class TestExport:
+    def test_export_result_name(self, session, tmp_path):
+        session.query("SELECT * FROM orders", "o")
+        out = str(tmp_path / "o.csv")
+        res = session.export("o", "csv", out)
+        assert res["row_count"] == 3 and os.path.exists(out)
+
+    def test_export_raw_select(self, session, tmp_path):
+        out = str(tmp_path / "q.json")
+        res = session.export('SELECT * FROM "shop"."customers"', "json", out)
+        assert res["row_count"] == 3 and os.path.exists(out)
+
+    def test_export_bad_format(self, session):
+        with pytest.raises(ValueError):
+            session.export("orders", "xlsx", "x.xlsx")
+
+
+class TestPersistence:
+    def test_durable_workspace_survives_reopen(self, sqlite_file, tmp_path):
+        d = str(tmp_path / "sess")
+        s1 = DuckSession.open([f"shop={sqlite_file}"], session_dir=d, per_process=False)
+        s1.query("SELECT * FROM \"shop\".\"customers\"", "kept", flow="work")
+        s1.close()
+        s2 = DuckSession.open([f"shop={sqlite_file}"], session_dir=d, per_process=False)
+        try:
+            assert "kept" in [r["name"] for r in s2.catalog("work")["results"]]
+        finally:
+            s2.close()
+
+    def test_per_process_workspaces_are_durable_and_isolated(self, sqlite_file, tmp_path):
+        """Two concurrent servers under one parent each get their OWN durable workspace.
+
+        No single-writer contention (distinct files), and results can't collide even when both
+        reuse the same result name in the same flow.
+        """
+        parent = str(tmp_path / "root")
+        # per_process is the DEFAULT — don't pass it.
+        s1 = DuckSession.open([f"shop={sqlite_file}"], session_dir=parent)
+        s2 = DuckSession.open([f"shop={sqlite_file}"], session_dir=parent)
+        try:
+            # Distinct durable subdirs under the shared parent — not an ephemeral fallback.
+            assert s1.workspace_dir != s2.workspace_dir
+            assert os.path.dirname(s1.workspace_dir) == os.path.abspath(parent)
+            assert os.path.exists(os.path.join(s1.workspace_dir, "workspace.duckdb"))
+            assert os.path.exists(os.path.join(s2.workspace_dir, "workspace.duckdb"))
+
+            # Same flow + same result name in each — they must not see each other's rows.
+            s1.query("SELECT 1 AS a", "tmp", flow="work")
+            s2.query("SELECT 2 AS a", "tmp", flow="work")
+            assert s1.query('SELECT a FROM "work"."tmp"', "r1")["sample"] == [[1]]
+            assert s2.query('SELECT a FROM "work"."tmp"', "r2")["sample"] == [[2]]
+        finally:
+            s1.close()
+            s2.close()
+
+    def test_per_process_keeps_only_n_recent_workspaces(self, sqlite_file, tmp_path):
+        """Opening reclaims stale per-process workspaces, keeping only the N most recent."""
+        parent = str(tmp_path / "root")
+        os.makedirs(parent, exist_ok=True)
+        old = time.time() - 86_400  # a day ago: past the sweep grace window
+        # Five stale, unlocked workspaces, oldest -> newest by mtime.
+        for i in range(5):
+            d = os.path.join(parent, f"00000-stale{i}")
+            os.makedirs(d)
+            duckdb.connect(os.path.join(d, "workspace.duckdb")).close()  # free (no live owner)
+            os.utime(d, (old + i, old + i))
+
+        s = DuckSession.open([f"shop={sqlite_file}"], session_dir=parent, keep_workspaces=3)
+        try:
+            remaining = {
+                d for d in os.listdir(parent)
+                if os.path.isfile(os.path.join(parent, d, "workspace.duckdb"))
+            }
+            # The fresh dir is newest (kept) plus the 2 newest stale dirs == 3 total.
+            assert len(remaining) == 3
+            assert os.path.basename(s.workspace_dir) in remaining
+            assert {"00000-stale4", "00000-stale3"} <= remaining  # 2 newest stale survive
+            assert "00000-stale0" not in remaining  # 3 oldest reclaimed
+        finally:
+            s.close()
+
+    def test_per_process_sweep_skips_live_workspace(self, sqlite_file, tmp_path):
+        """A stale-looking workspace still held by a LIVE (separate) process is never reclaimed.
+
+        Must use a subprocess to hold the lock: a second connection in this process would share
+        DuckDB's cached instance and never look locked.
+        """
+        import subprocess
+        import sys as _sys
+        import textwrap
+
+        parent = str(tmp_path / "root")
+        held = os.path.join(parent, "99999-held")
+        os.makedirs(held, exist_ok=True)
+        holder_code = textwrap.dedent(
+            f"""
+            import duckdb, os, time
+            _con = duckdb.connect(os.path.join({held!r}, "workspace.duckdb"))  # hold the lock
+            print("LOCKED", flush=True)
+            time.sleep(30)
+            """
+        )
+        holder = subprocess.Popen([_sys.executable, "-c", holder_code], stdout=subprocess.PIPE)
+        try:
+            assert holder.stdout.readline().strip() == b"LOCKED"
+            os.utime(held, (time.time() - 86_400, time.time() - 86_400))  # make it look stale
+            # keep=1 would target the held dir for reclaim, but it has a live owner -> skipped.
+            s = DuckSession.open([f"shop={sqlite_file}"], session_dir=parent, keep_workspaces=1)
+            try:
+                assert os.path.isfile(os.path.join(held, "workspace.duckdb"))
+            finally:
+                s.close()
+        finally:
+            holder.terminate()
+            holder.wait(timeout=10)
+
+    def test_locked_workspace_falls_back_to_ephemeral(self, sqlite_file, tmp_path, capsys):
+        """A second SERVER PROCESS on the same locked session_dir stays functional (ephemeral).
+
+        Must use a subprocess to hold the lock: two sessions in one process would share DuckDB's
+        cached instance and never hit the cross-process lock.
+        """
+        import os
+        import subprocess
+        import sys as _sys
+        import textwrap
+
+        d = str(tmp_path / "sess")
+        os.makedirs(d, exist_ok=True)
+        holder_code = textwrap.dedent(
+            f"""
+            import duckdb, os, time
+            _con = duckdb.connect(os.path.join({d!r}, "workspace.duckdb"))  # keep ref -> hold lock
+            print("LOCKED", flush=True)
+            time.sleep(30)
+            """
+        )
+        holder = subprocess.Popen([_sys.executable, "-c", holder_code], stdout=subprocess.PIPE)
+        try:
+            assert holder.stdout.readline().strip() == b"LOCKED"  # wait until it holds the lock
+            # per_process=False to exercise the single-writer contention path.
+            s2 = DuckSession.open([f"shop={sqlite_file}"], session_dir=d, per_process=False)  # must NOT crash
+            try:
+                assert "locked" in capsys.readouterr().err  # warned on stderr
+                assert s2.query("SELECT 1 AS a", "r")["sample"] == [[1]]  # fully usable
+            finally:
+                s2.close()
+        finally:
+            holder.terminate()
+            holder.wait(timeout=10)
