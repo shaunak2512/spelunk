@@ -53,6 +53,14 @@ _RESERVED_SCHEMAS = frozenset(
     {"main", "information_schema", "pg_catalog", "system", "temp", _META_SCHEMA}
 )
 
+# When listing an ATTACHed database's objects, its own system schemas are catalog metadata,
+# not user data, and are hidden from db://tables. A table in the catalog's *default* schema is
+# addressable bare as "<source>"."<table>"; one in any other schema needs the schema segment too
+# ("<source>"."<schema>"."<table>"), so it is qualified. A kind with no default here (mysql, whose
+# default schema is the database name) always gets the schema segment — 3-part is always valid.
+_ATTACHED_SYSTEM_SCHEMAS = frozenset({"information_schema", "pg_catalog"})
+_ATTACHED_DEFAULT_SCHEMA = {"sqlite": "main", "postgres": "public"}
+
 # DuckDB base type names that mark a column as numeric (for profile stats). Matched against the
 # type name with any parametrisation stripped (e.g. DECIMAL(18,3) -> DECIMAL) — exact, not
 # substring, so INTERVAL is not mistaken for an INT (STDDEV/percentiles fail on interval values).
@@ -192,8 +200,7 @@ class DuckSession:
     """A single DuckDB connection wrapping sources + the flow workspace.
 
     Construct with :meth:`open`. Thread-safety: a DuckDBPyConnection isn't safe for concurrent
-    use, so every connection touch holds ``_lock``. Remote pulls (``import_remote``) do their
-    slow SQLAlchemy fetch outside the lock.
+    use, so every connection touch holds ``_lock``.
     """
 
     def __init__(
@@ -322,22 +329,16 @@ class DuckSession:
         if self._tmpdir is not None:
             self._tmpdir.cleanup()
 
-    @property
-    def fallback_sources(self) -> list["Source"]:
-        """Sources reachable only via SQLAlchemy (SQL Server / exotic) — for import_remote."""
-        return [s for s in self.sources if s.kind == "fallback"]
-
     # ------------------------------------------------------------------ sources ------- #
     def add_source(self, spec: str) -> dict:
         """Attach a new data source at runtime (the same ``spec`` grammar as ``--source``).
 
-        Builds the source (a ``fallback`` spec opens its SQLAlchemy engine here, off the lock),
-        rejects a name that collides with an existing source or the workspace catalog, then runs
-        its setup SQL and registers it. The source becomes queryable in *every* flow of this
-        session — sources are connection-global, not flow-scoped. Returns the source's name,
-        kind, and the objects it made queryable.
+        Builds the source, rejects a name that collides with an existing source or the workspace
+        catalog, then runs its setup SQL and registers it. The source becomes queryable in *every*
+        flow of this session — sources are connection-global, not flow-scoped. Returns the source's
+        name, kind, and the objects it made queryable.
         """
-        src = sources_mod.build_source(spec)  # off-lock: fallback specs connect here
+        src = sources_mod.build_source(spec)
         with self._lock:
             # Check-and-register under one lock: two concurrent add_source calls with the same
             # name must not both pass the uniqueness test (worker threads run tools concurrently).
@@ -357,9 +358,9 @@ class DuckSession:
     def remove_source(self, name: str) -> dict:
         """Detach a source added at runtime or configured at startup; idempotent on the SQL.
 
-        Runs the source's teardown (``DETACH`` / ``DROP VIEW``), disposes a fallback engine,
-        and forgets it. Affects this session's connection only — under the process-per-agent
-        model that's the agent's own isolated workspace. Raises if no such source exists.
+        Runs the source's teardown (``DETACH`` / ``DROP VIEW``) and forgets it. Affects this
+        session's connection only — under the process-per-agent model that's the agent's own
+        isolated workspace. Raises if no such source exists.
         """
         with self._lock:
             # Look up and remove under one lock so a concurrent add/remove can't leave a stale
@@ -371,8 +372,6 @@ class DuckSession:
             for stmt in sources_mod.teardown_sql(src):
                 self._con.execute(stmt)
             self.sources.remove(src)
-        if src.engine is not None:
-            src.engine.dispose()
         return {"name": src.name, "kind": src.kind, "removed": True}
 
     # ------------------------------------------------------------------ internals ----- #
@@ -428,6 +427,10 @@ class DuckSession:
         except SqlglotError:
             return [], []
 
+        # CTE names defined in this query are internal aliases, not results or external inputs —
+        # a bare ``FROM <cte>`` must not be recorded as a source leaf (they resolve within the SQL).
+        cte_names = {cte.alias_or_name for cte in tree.find_all(exp.CTE)}
+
         deps: list[dict[str, str]] = []
         sources: list[str] = []
         seen_dep: set[tuple[str, str]] = set()
@@ -438,6 +441,8 @@ class DuckSession:
             catalog = tbl.catalog  # catalog part ('' if absent)
             if not tname:
                 continue
+            if not db and not catalog and tname in cte_names:
+                continue  # reference to a CTE defined in this same query
             if catalog and catalog != self._catalog:
                 cand = None  # a foreign catalog (attached DB) — never a workspace result
             elif db:
@@ -458,8 +463,8 @@ class DuckSession:
     def _record_lineage(self, flow: str, name: str, sql: str, kind: str) -> None:
         """Upsert the lineage row for a just-materialized result (caller holds ``_lock``).
 
-        Called from ``query`` / ``import_remote`` right after the CREATE, so the result set is
-        already current. Dependencies are computed against every *other* live result.
+        Called from ``query`` right after the CREATE, so the result set is already current.
+        Dependencies are computed against every *other* live result.
         """
         results = self._existing_results()
         deps, sources = self._classify_refs(sql, flow, results, (flow, name))
@@ -671,55 +676,6 @@ class DuckSession:
             row_count = self._con.execute(f"SELECT COUNT(*) FROM {source_expr}").fetchone()[0]
         return {"path": abs_path, "format": fmt, "row_count": int(row_count)}
 
-    # ------------------------------------------------------------------ import_remote - #
-    def import_remote(self, sql: str, name: str, flow: str | None = None) -> dict:
-        """Pull a SELECT from a SQLAlchemy-only source (SQL Server / exotic) into the flow.
-
-        Needed because DuckDB can't ATTACH such sources, so they can't be queried in place.
-        Runs the read-only guard, fetches the full result via the fallback engine, and
-        registers it as ``"<flow>"."<name>"``.
-        """
-        flow = self._resolve_flow(flow)
-        _validate_name(name)
-        remotes = [s for s in self.fallback_sources if s.engine is not None]
-        if not remotes:
-            raise ValueError("No fallback (SQLAlchemy) source is configured; nothing to import.")
-        if len(remotes) > 1:
-            names = ", ".join(f'"{s.name}"' for s in remotes)
-            raise ValueError(
-                f"Multiple fallback (SQLAlchemy) sources are configured ({names}); import_remote "
-                "cannot yet disambiguate which one to pull from. Configure a single fallback "
-                "source for this session."
-            )
-
-        from .query import run_sql
-
-        # The slow remote fetch happens outside the lock.
-        result = run_sql(remotes[0].engine, sql, max_rows=None)
-        import pandas as pd
-
-        df = pd.DataFrame(result.rows, columns=result.columns)
-        tmp = f"_import_{uuid4().hex}"
-        with self._lock:
-            self._con.execute(f'CREATE SCHEMA IF NOT EXISTS "{flow}"')
-            self._con.register(tmp, df)
-            try:
-                self._con.execute(f'CREATE OR REPLACE TABLE "{flow}"."{name}" AS SELECT * FROM {tmp}')
-            finally:
-                self._con.unregister(tmp)
-            columns = self._columns_of(flow, name)
-            sample = self._head_sample(flow, name)
-            # Store the *remote* SELECT so replay re-pulls from the fallback source.
-            self._record_lineage(flow, name, sql, "import_remote")
-        return {
-            "name": name,
-            "flow": flow,
-            "row_count": result.row_count,
-            "columns": columns,
-            "sample": sample,
-            "elapsed_s": round(result.elapsed_s or 0.0, 3),
-        }
-
     # ------------------------------------------------------------------ catalog / drop  #
     def catalog(self, flow: str | None = None) -> dict:
         """List flows (no arg) or the results in one flow (their columns + row counts)."""
@@ -903,12 +859,11 @@ class DuckSession:
     def replay(self, flow: str | None = None, into: str | None = None, dry_run: bool = False) -> dict:
         """Rebuild a flow's results from their recorded SQL, in dependency order.
 
-        Re-runs every ``query`` result and re-pulls every ``import_remote`` result of ``flow``,
-        ordered so dependencies rebuild first. External inputs (sources, cross-flow results) must
-        already exist — they are read, not rebuilt. With ``into`` the flow is rebuilt into a fresh
-        namespace (non-destructive); without it the flow is refreshed in place. ``dry_run`` returns
-        the plan without executing. Raises on a dependency cycle, or up-front if an ``import_remote``
-        result can't be re-pulled (no single fallback source configured).
+        Re-runs every ``query`` result of ``flow``, ordered so dependencies rebuild first.
+        External inputs (sources, cross-flow results) must already exist — they are read, not
+        rebuilt. With ``into`` the flow is rebuilt into a fresh namespace (non-destructive);
+        without it the flow is refreshed in place. ``dry_run`` returns the plan without executing.
+        Raises on a dependency cycle.
         """
         flow = self._resolve_flow(flow)
         target = self._resolve_flow(into) if into is not None else flow
@@ -918,7 +873,7 @@ class DuckSession:
             if not selected:
                 raise ValueError(
                     f"Flow {flow!r} has no recorded lineage to replay. "
-                    "Only results built by query / import_remote in this session can be replayed."
+                    "Only results built by query in this session can be replayed."
                 )
             order = self._topo_order(selected)
             plan = [
@@ -934,27 +889,20 @@ class DuckSession:
                     "plan": plan,
                 }
 
-            # Fail before mutating anything if a remote pull can't be satisfied.
-            if any(step["kind"] == "import_remote" for step in plan):
-                self._require_single_remote()
-
             if target != flow:
                 self._con.execute(f'CREATE SCHEMA IF NOT EXISTS "{target}"')
             rebuilt = []
             for (_f, nm) in order:
                 node = selected[(_f, nm)]
                 self._set_search_path(target)
-                if node["kind"] == "import_remote":
-                    rc = self._replay_import_remote(target, nm, node["sql"])
-                else:
-                    with self._friendly_catalog_errors(target):
-                        self._con.execute(
-                            f'CREATE OR REPLACE TABLE "{target}"."{nm}" AS {node["sql"]}'
-                        )
-                    rc = self._con.execute(
-                        f'SELECT COUNT(*) FROM "{target}"."{nm}"'
-                    ).fetchone()[0]
-                    self._record_lineage(target, nm, node["sql"], "query")
+                with self._friendly_catalog_errors(target):
+                    self._con.execute(
+                        f'CREATE OR REPLACE TABLE "{target}"."{nm}" AS {node["sql"]}'
+                    )
+                rc = self._con.execute(
+                    f'SELECT COUNT(*) FROM "{target}"."{nm}"'
+                ).fetchone()[0]
+                self._record_lineage(target, nm, node["sql"], "query")
                 rebuilt.append({"name": nm, "kind": node["kind"], "row_count": int(rc)})
         return {
             "source_flow": flow,
@@ -964,47 +912,14 @@ class DuckSession:
             "rebuilt": rebuilt,
         }
 
-    def _require_single_remote(self) -> "Source":
-        remotes = [s for s in self.fallback_sources if s.engine is not None]
-        if not remotes:
-            raise ValueError(
-                "This flow contains import_remote results, but no fallback (SQLAlchemy) source "
-                "is configured to re-pull them. Configure the source, or replay a flow without "
-                "remote pulls."
-            )
-        if len(remotes) > 1:
-            names = ", ".join(f'"{s.name}"' for s in remotes)
-            raise ValueError(
-                f"Multiple fallback sources are configured ({names}); replay cannot disambiguate "
-                "which to re-pull import_remote results from."
-            )
-        return remotes[0]
-
-    def _replay_import_remote(self, target: str, name: str, sql: str) -> int:
-        """Re-pull one import_remote result during replay (caller holds ``_lock``)."""
-        from .query import run_sql
-
-        engine = self._require_single_remote().engine
-        result = run_sql(engine, sql, max_rows=None)
-        import pandas as pd
-
-        df = pd.DataFrame(result.rows, columns=result.columns)
-        tmp = f"_replay_{uuid4().hex}"
-        self._con.register(tmp, df)
-        try:
-            self._con.execute(f'CREATE OR REPLACE TABLE "{target}"."{name}" AS SELECT * FROM {tmp}')
-        finally:
-            self._con.unregister(tmp)
-        self._record_lineage(target, name, sql, "import_remote")
-        return int(result.row_count)
-
     # ------------------------------------------------------------------ introspection - #
     def list_objects(self) -> list[TableInfo]:
         """List the source objects an agent can query: attached-DB tables + file views.
 
-        Attached-DB tables are named ``<source>.<table>`` (paste-ready); file sources appear
-        as their single view name. Row counts are filled for SQLite/file sources (cheap) and
-        left None for remote DBs (a COUNT could be expensive).
+        Attached-DB tables are named ``<source>.<table>`` (or ``<source>.<schema>.<table>`` for a
+        non-default schema — paste-ready either way); file sources appear as their single view
+        name. Row counts are filled for SQLite/file sources (cheap) and left None for remote DBs
+        (a COUNT could be expensive).
         """
         out: list[TableInfo] = []
         with self._lock:
@@ -1015,20 +930,30 @@ class DuckSession:
     def _objects_for_source(self, src: "Source") -> list[TableInfo]:
         """The queryable objects a single source contributes (caller holds ``_lock``).
 
-        A file source is one bare view; an attached database contributes its tables/views as
-        ``<source>.<table>``. Fallback sources aren't queryable in place (import_remote only).
+        A file source is one bare view; an attached database contributes its user tables/views.
+        A table in the catalog's default schema is named ``<source>.<table>``; one in any other
+        schema is named ``<source>.<schema>.<table>`` so it stays addressable (a Postgres/MySQL
+        source often keeps its tables in a non-default schema). The attached DB's own system
+        schemas (information_schema, pg_catalog) are metadata, not data, and are hidden.
         """
         if src.kind == "file":
             return [TableInfo(name=src.name, kind="view", row_count=self._safe_count(src.name))]
         if src.kind in ("sqlite", "postgres", "mysql"):
             rows = self._con.execute(
-                "SELECT table_name, table_type FROM information_schema.tables "
-                "WHERE table_catalog = ? ORDER BY table_name",
+                "SELECT table_schema, table_name, table_type FROM information_schema.tables "
+                "WHERE table_catalog = ? ORDER BY table_schema, table_name",
                 [src.name],
             ).fetchall()
+            default_schema = _ATTACHED_DEFAULT_SCHEMA.get(src.kind)
             objs: list[TableInfo] = []
-            for tname, ttype in rows:
-                qualified = f"{src.name}.{tname}"
+            for schema, tname, ttype in rows:
+                if schema in _ATTACHED_SYSTEM_SCHEMAS:
+                    continue
+                qualified = (
+                    f"{src.name}.{tname}"
+                    if schema == default_schema
+                    else f"{src.name}.{schema}.{tname}"
+                )
                 kind = "view" if "VIEW" in (ttype or "").upper() else "table"
                 rc = self._safe_count(_quote_qualified(qualified)) if src.kind == "sqlite" else None
                 objs.append(TableInfo(name=qualified, kind=kind, row_count=rc))
@@ -1038,8 +963,8 @@ class DuckSession:
     def describe(self, table: str) -> TableDescription:
         """Describe one source object: columns, primary key, a sample, and a row count.
 
-        FKs/indexes are best-effort and usually empty for attached sources (DuckDB exposes less
-        than SQLAlchemy reflection). *table* may be bare (``sales``) or qualified (``db.orders``).
+        FKs/indexes are best-effort and usually empty for attached sources (DuckDB exposes little
+        constraint metadata). *table* may be bare (``sales``) or qualified (``db.orders``).
         """
         ref = _quote_qualified(table)
         with self._lock:

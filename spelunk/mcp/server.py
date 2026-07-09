@@ -131,25 +131,19 @@ def build_server(
 ) -> FastMCP:
     """Build a FastMCP instance wired to an open :class:`DuckSession`.
 
-    Registers the ``db://`` discovery resources and five tools — ``query``, ``profile``,
-    ``export``, ``catalog``, ``drop`` — plus ``import_remote`` when a SQLAlchemy-only source
-    (e.g. SQL Server) is configured.
+    Registers the ``db://`` discovery resources and the ``query`` / ``profile`` / ``export`` /
+    ``catalog`` / ``drop`` / ``lineage`` / ``replay`` tools.
 
     ``tool_log`` controls per-call logging: a file path writes JSON lines there, ``"-"`` writes
     them to stderr, and ``None`` (the default) is silent.
 
     ``allow_add_source`` (off by default) additionally registers ``add_source`` / ``remove_source``
     so the agent can attach and detach files and databases at runtime. This lets the agent reach
-    any file/DB the host process can — only enable it for a trusted, process-per-agent setup. It
-    also registers ``import_remote`` unconditionally, since a SQL Server source can now appear after
-    startup.
+    any file/DB the host process can — only enable it for a trusted, process-per-agent setup.
     """
     _configure_tool_logging(tool_log)
 
     source_list = ", ".join(f"{s.name} ({s.kind})" for s in session.sources) or "(none configured)"
-    has_fallback = bool(session.fallback_sources)
-    # A fallback source can be added at runtime once add_source is enabled, so register the puller.
-    register_import_remote = has_fallback or allow_add_source
 
     mcp = FastMCP(
         "spelunk",
@@ -160,7 +154,8 @@ def build_server(
             f"them. All SQL is DuckDB SQL. Configured sources: {source_list}.\n\n"
             "## Discover\n"
             "- `db://tables` — JSON array of queryable source objects. Attached-database tables "
-            "are named `<source>.<table>` (paste-ready); file sources appear as a bare view name.\n"
+            "are named `<source>.<table>`, or `<source>.<schema>.<table>` when in a non-default "
+            "schema (paste-ready either way); file sources appear as a bare view name.\n"
             "- `db://{table}` — describe one object: columns, types, primary key, a sample, and "
             "a row count. Read this before writing SQL.\n\n"
             "## Query and build\n"
@@ -177,17 +172,10 @@ def build_server(
             "- `export(target, format, path, flow?)` — write a saved result name OR a full SELECT "
             "to csv/json/parquet (no row cap).\n"
             + (
-                "- `import_remote(sql, name, flow?)` — a SQL Server / SQLAlchemy-only source can't "
-                "be attached, so pull a SELECT from it into the flow as table `name`, then query "
-                "that table normally.\n"
-                if has_fallback
-                else ""
-            )
-            + (
                 "\n## Manage sources\n"
                 "- `add_source(spec)` — attach a new data source at runtime. `spec` is a file path "
                 "(.csv/.parquet/.json/.xlsx), a SQLite file, or a sqlite:// / postgresql:// / "
-                "mysql:// / mssql:// DSN; prefix with `name=` to set the source name (e.g. "
+                "mysql:// DSN; prefix with `name=` to set the source name (e.g. "
                 "`sales=./sales.parquet`). The source becomes queryable in every flow.\n"
                 "- `remove_source(name)` — detach a source by its name. Affects this session only.\n"
                 if allow_add_source
@@ -309,7 +297,7 @@ def build_server(
         name="replay",
         description=(
             "Rebuild a flow's results from their recorded SQL, in dependency order — re-running "
-            "each `query` and re-pulling each `import_remote`. External inputs (sources, cross-flow "
+            "each `query`. External inputs (sources, cross-flow "
             "results) must already exist; they are read, not rebuilt. With `into`, rebuild into a "
             "fresh flow (non-destructive — e.g. re-run the pipeline against updated source files, "
             "then compare); without it, refresh in place. `dry_run=true` returns the ordered plan "
@@ -320,25 +308,13 @@ def build_server(
     def _replay(flow: str = "default", into: str | None = None, dry_run: bool = False) -> dict:
         return session.replay(flow, into, dry_run)
 
-    if register_import_remote:
-        @mcp.tool(
-            name="import_remote",
-            description=(
-                "Pull a read-only SELECT from a SQL Server / SQLAlchemy-only source (which DuckDB "
-                "cannot attach) into the flow as table `name`, then query it normally. No row cap."
-            ),
-        )
-        @_logged
-        def _import_remote(sql: str, name: str, flow: str = "default") -> dict:
-            return session.import_remote(sql, name, flow)
-
     if allow_add_source:
         @mcp.tool(
             name="add_source",
             description=(
                 "Attach a new data source at runtime, then query it like any configured source. "
                 "`spec` is a file path (.csv/.parquet/.json/.xlsx), a SQLite file, or a sqlite:// / "
-                "postgresql:// / mysql:// / mssql:// DSN; prefix with `name=` to set the source name "
+                "postgresql:// / mysql:// DSN; prefix with `name=` to set the source name "
                 "(e.g. `sales=./sales.parquet`). Returns the source name, kind, and the objects it "
                 "made queryable. The source is visible in every flow of this session."
             ),
@@ -374,7 +350,7 @@ def main() -> None:
         metavar="SPEC",
         help=(
             "A data source, repeatable. A file path (.csv/.parquet/.json/.xlsx), a SQLite file, "
-            "or a sqlite:// / postgresql:// / mysql:// / mssql:// DSN. Prefix with name= to set "
+            "or a sqlite:// / postgresql:// / mysql:// DSN. Prefix with name= to set "
             "the source name, e.g. sales=./sales.parquet."
         ),
     )

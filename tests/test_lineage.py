@@ -66,6 +66,19 @@ class TestLineageRecording:
         lin = session.lineage("mid")
         assert {n["name"] for n in lin["nodes"]} == {"mid"}  # base no longer upstream
 
+    def test_cte_not_recorded_as_source_leaf(self, session):
+        # A WITH alias is internal to the query — it must not leak into `sources`, while the
+        # real result the CTE reads (base) is still recorded as a dependency.
+        session.query('SELECT id, name, city FROM "shop"."customers"', "base")
+        session.query(
+            "WITH hi AS (SELECT * FROM base WHERE city IS NOT NULL) "
+            "SELECT COUNT(*) AS n FROM hi",
+            "counted",
+        )
+        node = {n["name"]: n for n in session.lineage("counted")["nodes"]}["counted"]
+        assert node["sources"] == []
+        assert [d["name"] for d in node["deps"]] == ["base"]
+
     def test_cross_flow_dependency_followed(self, session):
         session.query('SELECT id, name FROM "shop"."customers"', "people", "flowA")
         session.query('SELECT * FROM "flowA"."people"', "copy", "flowB")
