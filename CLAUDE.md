@@ -36,7 +36,9 @@ One DuckDB session, wrapped by a thin MCP front-end:
 spelunk/core/
   duck.py        # DuckSession — THE engine+workspace. open() attaches sources, configures
                  #   memory_limit/temp_directory; methods: query / profile / export / catalog /
-                 #   drop / import_remote + list_objects / describe (DuckDB-catalog introspection)
+                 #   drop / lineage / replay / import_remote + list_objects / describe. query()
+                 #   records provenance (SQL + dep edges) into the internal _spelunk_meta.lineage
+                 #   table; lineage() reads that DAG, replay() rebuilds a flow from it.
   sources.py     # Source registry: spec -> DuckDB attach/scan SQL (files as VIEWs, DBs ATTACHed
                  #   READ_ONLY). SQLAlchemy fallback Source for SQL Server / exotic auth.
   guard.py       # sqlglot AST safety: assert_read_only(), enforce_limit() — called dialect="duckdb"
@@ -46,7 +48,7 @@ spelunk/core/
   types.py       # FROZEN contracts: TableInfo, TableDescription, ColumnInfo, errors
 
 spelunk/mcp/
-  server.py      # FastMCP wrapper: build_server(session) registers 5 tools + 2 resources;
+  server.py      # FastMCP wrapper: build_server(session) registers 7 tools + 2 resources;
                  #   main() parses --source specs and serves over stdio
 ```
 
@@ -64,6 +66,8 @@ One row-returning tool (`query`) owns every SELECT; inspection lives on the reso
 | `export(target, format, path, flow?)` | Write a saved result name **or** a full SELECT to csv/json/parquet. |
 | `catalog(flow?)` | No arg → list flows + counts; with a flow → its results. |
 | `drop(name?, flow?)` | Drop one result, or a whole flow (name omitted). |
+| `lineage(name?, flow?)` | Provenance graph: with `name`, the upstream closure (transitive, cross-flow) that built a result; without, the whole flow's DAG. Returns nodes (SQL, deps, sources, kind), edges, a dependency-first `order`, and `missing` deps. Read-only. |
+| `replay(flow?, into?, dry_run?)` | Rebuild a flow from its recorded SQL in dependency order (re-run `query`, re-pull `import_remote`). `into` → non-destructive rebuild into a fresh flow; omitted → in-place refresh; `dry_run` → plan only. Errors on a dependency cycle. Sources + cross-flow results are read, not rebuilt. |
 | `import_remote(sql, name, flow?)` | **Only registered when a SQL Server / SQLAlchemy-only source is configured** (or `--allow-add-source`, since one can be added at runtime) — DuckDB can't attach it, so pull a SELECT in, then query the table. |
 | `add_source(spec)` / `remove_source(name)` | **Only registered with `--allow-add-source`** — attach/detach a file or DB at runtime (`spec` is the same grammar as `--source`). Connection-global: a source is visible in **every flow**, not flow-scoped (DuckDB `ATTACH` can't be per-schema). Isolation comes from the process-per-agent model. |
 
@@ -80,6 +84,14 @@ views named bare) and `db://{table}` (columns, PK, sample, row count).
 - **Materialize-by-default:** `query` does `CREATE OR REPLACE TABLE` — computed once, cheap to
   reuse, correct for pipelines (a DuckDB *view* re-executes its whole upstream on every reference).
   A nudge fires on an unfiltered `SELECT *` that copies a large source table wholesale.
+- **Lineage & replay:** every `query`/`import_remote` result upserts a row into the internal
+  `_spelunk_meta.lineage` table (a reserved schema, hidden from `catalog`/`drop`): its SQL, `kind`,
+  and dependency edges. Deps are found by parsing the SQL (sqlglot) and intersecting table refs with
+  the live `(flow, name)` result set — a ref that names an existing result is a dep, anything else is
+  an external *source* leaf. `CREATE OR REPLACE` re-derives the row so the store always reflects the
+  *current* definition (which permits logical cycles → `replay` topo-sorts and rejects them). This
+  makes a flow a reproducible pipeline: `lineage` shows the DAG, `replay(into=...)` rebuilds it
+  against (possibly changed) sources. Durable — survives `--shared-workspace` reopen.
 - **Disk-backed always + out-of-core:** the workspace is a real DuckDB file (under `--session-dir`,
   else a temp dir). Sources are read on demand with pushdown; buffering operators spill to
   `temp_directory`. A source larger than RAM is the normal case, not a failure.

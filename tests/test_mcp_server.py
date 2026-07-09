@@ -102,6 +102,20 @@ class TestOtherTools:
         res = _run(mcp_server.call_tool("export", {"target": "o", "format": "parquet", "path": out})).structured_content
         assert res["row_count"] == 3
 
+    def test_lineage_and_replay_registered(self, mcp_server):
+        names = {t.name for t in _run(mcp_server.list_tools())}
+        assert {"lineage", "replay"} <= names
+
+    def test_lineage_then_replay_roundtrip(self, mcp_server):
+        _run(mcp_server.call_tool("query", {"sql": 'SELECT * FROM "shop"."customers"', "name": "base"}))
+        _run(mcp_server.call_tool("query", {"sql": "SELECT id, name FROM base", "name": "top"}))
+        lin = _run(mcp_server.call_tool("lineage", {"name": "top"})).structured_content
+        assert {n["name"] for n in lin["nodes"]} == {"base", "top"}
+        rep = _run(mcp_server.call_tool("replay", {"into": "copy"})).structured_content
+        assert rep["order"] == ["base", "top"]
+        cat = _run(mcp_server.call_tool("catalog", {"flow": "copy"})).structured_content
+        assert {r["name"] for r in cat["results"]} == {"base", "top"}
+
 
 class TestToolLogging:
     def test_each_call_logs_one_json_line(self, sqlite_file, csv_file, tmp_path):

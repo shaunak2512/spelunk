@@ -201,6 +201,16 @@ def build_server(
             "results in a flow with columns and row counts.\n"
             "- `drop(name, flow?)` — drop one result; `drop(flow=...)` with no name — drop a whole "
             "flow.\n\n"
+            "## Provenance & replay\n"
+            "Every result records the SQL and dependencies that built it, so a flow is a "
+            "reproducible pipeline, not a pile of tables.\n"
+            "- `lineage(name?, flow?)` — see how results were built: `lineage(name)` gives the "
+            "upstream closure that produced one result; `lineage()` gives the whole flow's DAG "
+            "(nodes, edges, and a dependency-first order).\n"
+            "- `replay(flow?, into?, dry_run?)` — rebuild a flow from its recorded SQL in "
+            "dependency order. `replay(flow, into='v2')` rebuilds into a fresh flow "
+            "(non-destructive — e.g. after source files change, then diff old vs new); "
+            "`replay(flow)` refreshes in place; `dry_run=true` shows the plan first.\n\n"
             "## Notes\n"
             "- All queries are read-only SELECTs (CTEs fine); writes/DDL are rejected at the AST "
             "level. The server materializes your SELECT as a table for you — don't write CREATE/"
@@ -280,6 +290,35 @@ def build_server(
     @_logged
     def _drop(name: str | None = None, flow: str = "default") -> dict:
         return session.drop(name, flow)
+
+    @mcp.tool(
+        name="lineage",
+        description=(
+            "Show how results were built: the SQL and dependency edges behind them. With `name`, "
+            "return the upstream closure that produced that result (the node plus every result it "
+            "transitively depends on, across flows); with no `name`, the whole flow. Returns nodes "
+            "(name, kind, sql, deps, sources, created_at), edges, a dependency-first `order`, and "
+            "`missing` (deps whose lineage is gone). Read-only."
+        ),
+    )
+    @_logged
+    def _lineage(name: str | None = None, flow: str = "default") -> dict:
+        return session.lineage(name, flow)
+
+    @mcp.tool(
+        name="replay",
+        description=(
+            "Rebuild a flow's results from their recorded SQL, in dependency order — re-running "
+            "each `query` and re-pulling each `import_remote`. External inputs (sources, cross-flow "
+            "results) must already exist; they are read, not rebuilt. With `into`, rebuild into a "
+            "fresh flow (non-destructive — e.g. re-run the pipeline against updated source files, "
+            "then compare); without it, refresh in place. `dry_run=true` returns the ordered plan "
+            "without executing. Errors on a dependency cycle."
+        ),
+    )
+    @_logged
+    def _replay(flow: str = "default", into: str | None = None, dry_run: bool = False) -> dict:
+        return session.replay(flow, into, dry_run)
 
     if register_import_remote:
         @mcp.tool(

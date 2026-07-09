@@ -19,6 +19,7 @@ is always disk-backed; ``memory_limit`` / ``temp_directory`` are set at open.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -27,6 +28,7 @@ import tempfile
 import threading
 import time
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -42,8 +44,14 @@ if TYPE_CHECKING:
 # quoted references without injection risk (this is why callers address results by NAME).
 _NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
 
+# Internal schema (in the workspace catalog) holding lineage metadata — never a flow, never
+# queried by an agent. Kept out of catalog()/drop() by living in _RESERVED_SCHEMAS.
+_META_SCHEMA = "_spelunk_meta"
+
 # Schemas in the workspace catalog that are never flows and must never be dropped.
-_RESERVED_SCHEMAS = frozenset({"main", "information_schema", "pg_catalog", "system", "temp"})
+_RESERVED_SCHEMAS = frozenset(
+    {"main", "information_schema", "pg_catalog", "system", "temp", _META_SCHEMA}
+)
 
 # DuckDB base type names that mark a column as numeric (for profile stats). Matched against the
 # type name with any parametrisation stripped (e.g. DECIMAL(18,3) -> DECIMAL) — exact, not
@@ -205,6 +213,25 @@ class DuckSession:
         self._lock = threading.Lock()
         self.default_flow = "default"
         self._con.execute(f'CREATE SCHEMA IF NOT EXISTS "{self.default_flow}"')
+        self._ensure_meta()
+
+    # ------------------------------------------------------------------ lineage store - #
+    def _ensure_meta(self) -> None:
+        """Create the internal lineage store (idempotent). One row per live result.
+
+        A result is keyed by (flow, name); ``CREATE OR REPLACE`` of a result overwrites its
+        row, so the store always reflects the *current* definition. ``deps`` and ``sources``
+        are JSON arrays; ``seq`` is a monotonic creation counter used as a stable tie-break
+        when ordering independent nodes for replay.
+        """
+        self._con.execute(f'CREATE SCHEMA IF NOT EXISTS "{_META_SCHEMA}"')
+        self._con.execute(
+            f'CREATE TABLE IF NOT EXISTS "{_META_SCHEMA}".lineage ('
+            "flow VARCHAR NOT NULL, name VARCHAR NOT NULL, sql VARCHAR NOT NULL, "
+            "kind VARCHAR NOT NULL, deps VARCHAR NOT NULL, sources VARCHAR NOT NULL, "
+            "created_at VARCHAR NOT NULL, seq BIGINT NOT NULL, "
+            "PRIMARY KEY (flow, name))"
+        )
 
     # ------------------------------------------------------------------ open / close --- #
     @classmethod
@@ -349,9 +376,122 @@ class DuckSession:
         return {"name": src.name, "kind": src.kind, "removed": True}
 
     # ------------------------------------------------------------------ internals ----- #
+    def _resolve_flow(self, flow: str | None) -> str:
+        """Default, validate, and reject reserved names — for every flow-scoped write path."""
+        flow = flow or self.default_flow
+        _validate_name(flow, "flow name")
+        if flow in _RESERVED_SCHEMAS:
+            raise ValueError(f"{flow!r} is a reserved schema name; choose another flow name.")
+        return flow
+
     def _set_search_path(self, flow: str) -> None:
         """Resolve bare names against the flow first, then `main` (file-source views)."""
         self._con.execute(f"SET search_path = '{flow},main'")
+
+    def _existing_results(self) -> set[tuple[str, str]]:
+        """All (flow, name) result tables in the workspace catalog (caller holds ``_lock``).
+
+        Used to classify a parsed table reference as a *result dependency* vs an external
+        source leaf: a ref is a dependency iff it names a table that actually exists here.
+        """
+        rows = self._con.execute(
+            "SELECT table_schema, table_name FROM information_schema.tables "
+            "WHERE table_catalog = ? AND table_schema NOT IN "
+            f"({', '.join('?' * len(_RESERVED_SCHEMAS))})",
+            [self._catalog, *sorted(_RESERVED_SCHEMAS)],
+        ).fetchall()
+        return {(s, t) for s, t in rows}
+
+    def _classify_refs(
+        self,
+        sql: str,
+        flow: str,
+        results: set[tuple[str, str]],
+        self_ref: tuple[str, str],
+    ) -> tuple[list[dict[str, str]], list[str]]:
+        """Split a query's table references into result *deps* and external *source* leaves.
+
+        Parses *sql* (best-effort; an unparseable query yields empty lists) and, for each table
+        reference, decides against ``results`` — the live (flow, name) set — whether it is another
+        result (a dependency, resolved the same way DuckDB's search_path does: bare → current
+        flow, ``a.b`` → flow ``a``, ``cat.a.b`` → flow ``a`` only when ``cat`` is the workspace
+        catalog) or an external input (file view / attached-DB table), recorded by its textual
+        form. ``self_ref`` is the (flow, name) being recorded — a reference to it is dropped so a
+        result never depends on itself (e.g. ``CREATE OR REPLACE t AS SELECT ... FROM t``).
+        """
+        import sqlglot
+        from sqlglot import exp
+        from sqlglot.errors import SqlglotError
+
+        try:
+            tree = sqlglot.parse_one(sql, read="duckdb")
+        except SqlglotError:
+            return [], []
+
+        deps: list[dict[str, str]] = []
+        sources: list[str] = []
+        seen_dep: set[tuple[str, str]] = set()
+        seen_src: set[str] = set()
+        for tbl in tree.find_all(exp.Table):
+            tname = tbl.name
+            db = tbl.db  # schema part ('' if absent)
+            catalog = tbl.catalog  # catalog part ('' if absent)
+            if not tname:
+                continue
+            if catalog and catalog != self._catalog:
+                cand = None  # a foreign catalog (attached DB) — never a workspace result
+            elif db:
+                cand = (db, tname)
+            else:
+                cand = (flow, tname)
+            if cand is not None and cand in results:
+                if cand != self_ref and cand not in seen_dep:
+                    seen_dep.add(cand)
+                    deps.append({"flow": cand[0], "name": cand[1]})
+            else:
+                ref = ".".join(p for p in (catalog, db, tname) if p)
+                if ref not in seen_src:
+                    seen_src.add(ref)
+                    sources.append(ref)
+        return deps, sources
+
+    def _record_lineage(self, flow: str, name: str, sql: str, kind: str) -> None:
+        """Upsert the lineage row for a just-materialized result (caller holds ``_lock``).
+
+        Called from ``query`` / ``import_remote`` right after the CREATE, so the result set is
+        already current. Dependencies are computed against every *other* live result.
+        """
+        results = self._existing_results()
+        deps, sources = self._classify_refs(sql, flow, results, (flow, name))
+        seq = self._con.execute(
+            f'SELECT COALESCE(MAX(seq), 0) + 1 FROM "{_META_SCHEMA}".lineage'
+        ).fetchone()[0]
+        self._con.execute(
+            f'DELETE FROM "{_META_SCHEMA}".lineage WHERE flow = ? AND name = ?', [flow, name]
+        )
+        self._con.execute(
+            f'INSERT INTO "{_META_SCHEMA}".lineage '
+            "(flow, name, sql, kind, deps, sources, created_at, seq) VALUES (?,?,?,?,?,?,?,?)",
+            [
+                flow,
+                name,
+                sql,
+                kind,
+                json.dumps(deps),
+                json.dumps(sources),
+                datetime.now(timezone.utc).isoformat(),
+                int(seq),
+            ],
+        )
+
+    def _delete_lineage(self, flow: str, name: str | None) -> None:
+        """Forget lineage for a dropped result (``name`` given) or a whole flow (caller holds lock)."""
+        if name is None:
+            self._con.execute(f'DELETE FROM "{_META_SCHEMA}".lineage WHERE flow = ?', [flow])
+        else:
+            self._con.execute(
+                f'DELETE FROM "{_META_SCHEMA}".lineage WHERE flow = ? AND name = ?', [flow, name]
+            )
 
     def _result_names(self, flow: str) -> list[str]:
         rows = self._con.execute(
@@ -382,8 +522,7 @@ class DuckSession:
         prior result of that name). Returns the result's columns, true row_count, a head
         sample, and any nudges.
         """
-        flow = flow or self.default_flow
-        _validate_name(flow, "flow name")
+        flow = self._resolve_flow(flow)
         _validate_name(name)
         guard.assert_read_only(sql, "duckdb")
         with self._lock:
@@ -396,6 +535,7 @@ class DuckSession:
             row_count = self._con.execute(f'SELECT COUNT(*) FROM "{flow}"."{name}"').fetchone()[0]
             columns = self._columns_of(flow, name)
             sample = self._head_sample(flow, name)
+            self._record_lineage(flow, name, sql, "query")
         out = {
             "name": name,
             "flow": flow,
@@ -440,8 +580,7 @@ class DuckSession:
     # ------------------------------------------------------------------ profile ------- #
     def profile(self, sql: str, flow: str | None = None) -> dict:
         """Per-column stats over the full result of *sql*, computed in DuckDB."""
-        flow = flow or self.default_flow
-        _validate_name(flow, "flow name")
+        flow = self._resolve_flow(flow)
         guard.assert_read_only(sql, "duckdb")
         with self._lock, self._friendly_catalog_errors(flow):
             self._con.execute(f'CREATE SCHEMA IF NOT EXISTS "{flow}"')
@@ -506,8 +645,7 @@ class DuckSession:
         *target* is either a result/table name (e.g. ``joined`` or ``"src"."orders"``) or a
         ``SELECT`` / ``WITH`` query. ``fmt`` is csv, json, or parquet.
         """
-        flow = flow or self.default_flow
-        _validate_name(flow, "flow name")
+        flow = self._resolve_flow(flow)
         fmt = fmt.lower().strip()
         copy_opts = {"parquet": "(FORMAT PARQUET)", "csv": "(FORMAT CSV, HEADER)", "json": "(FORMAT JSON)"}
         if fmt not in copy_opts:
@@ -541,8 +679,7 @@ class DuckSession:
         Runs the read-only guard, fetches the full result via the fallback engine, and
         registers it as ``"<flow>"."<name>"``.
         """
-        flow = flow or self.default_flow
-        _validate_name(flow, "flow name")
+        flow = self._resolve_flow(flow)
         _validate_name(name)
         remotes = [s for s in self.fallback_sources if s.engine is not None]
         if not remotes:
@@ -572,6 +709,8 @@ class DuckSession:
                 self._con.unregister(tmp)
             columns = self._columns_of(flow, name)
             sample = self._head_sample(flow, name)
+            # Store the *remote* SELECT so replay re-pulls from the fallback source.
+            self._record_lineage(flow, name, sql, "import_remote")
         return {
             "name": name,
             "flow": flow,
@@ -610,6 +749,8 @@ class DuckSession:
         """Drop one result (``name`` given) or an entire flow (``name`` omitted)."""
         flow = flow or self.default_flow
         _validate_name(flow, "flow name")
+        if flow in _RESERVED_SCHEMAS:
+            raise ValueError(f"Cannot drop from reserved schema {flow!r}.")
         with self._lock:
             if name is not None:
                 _validate_name(name)
@@ -619,13 +760,243 @@ class DuckSession:
                     [self._catalog, flow, name],
                 ).fetchone()[0] > 0
                 self._con.execute(f'DROP TABLE IF EXISTS "{flow}"."{name}"')
+                self._delete_lineage(flow, name)
                 return {"flow": flow, "name": name, "dropped": bool(existed)}
 
-            if flow in _RESERVED_SCHEMAS:
-                raise ValueError(f"Cannot drop reserved schema {flow!r}.")
             dropped = len(self._result_names(flow))
             self._con.execute(f'DROP SCHEMA IF EXISTS "{flow}" CASCADE')
+            self._delete_lineage(flow, None)
             return {"flow": flow, "dropped_results": dropped}
+
+    # ------------------------------------------------------------------ lineage ------- #
+    def _load_all_lineage(self) -> dict[tuple[str, str], dict[str, Any]]:
+        """Every recorded result across all flows, keyed by (flow, name) (caller holds lock)."""
+        rows = self._con.execute(
+            f'SELECT flow, name, sql, kind, deps, sources, created_at, seq FROM "{_META_SCHEMA}".lineage'
+        ).fetchall()
+        nodes: dict[tuple[str, str], dict[str, Any]] = {}
+        for flow, name, sql, kind, deps, sources, created_at, seq in rows:
+            nodes[(flow, name)] = {
+                "flow": flow,
+                "name": name,
+                "sql": sql,
+                "kind": kind,
+                "deps": json.loads(deps),
+                "sources": json.loads(sources),
+                "created_at": created_at,
+                "seq": seq,
+            }
+        return nodes
+
+    @staticmethod
+    def _ref(flow: str, name: str) -> str:
+        return f"{flow}.{name}"
+
+    def lineage(self, name: str | None = None, flow: str | None = None) -> dict:
+        """Return the provenance graph of results: the SQL and dependency edges that built them.
+
+        With ``name``: the upstream closure that produced that result — the node plus every
+        result it (transitively) depends on, following cross-flow edges. With no ``name``: every
+        result in ``flow``. ``missing`` lists dependency refs with no lineage row (dropped, or an
+        external input). Nodes are ordered so a dependency always precedes its dependents.
+        """
+        flow = self._resolve_flow(flow)
+        with self._lock:
+            allnodes = self._load_all_lineage()
+            if name is not None:
+                _validate_name(name)
+                root = (flow, name)
+                if root not in allnodes:
+                    known = sorted(n for (f, n) in allnodes if f == flow)
+                    raise ValueError(
+                        f"No lineage for result {name!r} in flow {flow!r}. "
+                        f"Flow {flow!r} has recorded results: {known or ['(none)']}."
+                    )
+                selected: dict[tuple[str, str], dict[str, Any]] = {}
+                missing: list[str] = []
+                stack = [root]
+                while stack:
+                    key = stack.pop()
+                    if key in selected:
+                        continue
+                    node = allnodes.get(key)
+                    if node is None:
+                        missing.append(self._ref(*key))
+                        continue
+                    selected[key] = node
+                    for dep in node["deps"]:
+                        stack.append((dep["flow"], dep["name"]))
+            else:
+                selected = {k: v for k, v in allnodes.items() if k[0] == flow}
+                missing = []
+                present = set(selected)
+                for node in selected.values():
+                    for dep in node["deps"]:
+                        dkey = (dep["flow"], dep["name"])
+                        if dkey not in present and dkey not in allnodes:
+                            missing.append(self._ref(*dkey))
+
+        edges = []
+        for key, node in selected.items():
+            for dep in node["deps"]:
+                edges.append({"from": self._ref(dep["flow"], dep["name"]), "to": self._ref(*key)})
+        order = self._topo_order(selected)
+        return {
+            "flow": flow,
+            "root": name,
+            "nodes": [
+                {
+                    "flow": n["flow"],
+                    "name": n["name"],
+                    "kind": n["kind"],
+                    "sql": n["sql"],
+                    "deps": n["deps"],
+                    "sources": n["sources"],
+                    "created_at": n["created_at"],
+                }
+                for n in sorted(selected.values(), key=lambda n: n["seq"])
+            ],
+            "edges": edges,
+            "order": [self._ref(f, nm) for (f, nm) in order],
+            "missing": sorted(set(missing)),
+        }
+
+    @staticmethod
+    def _topo_order(nodes: dict[tuple[str, str], dict[str, Any]]) -> list[tuple[str, str]]:
+        """Kahn topological sort over the sub-DAG induced by ``nodes`` (deps outside are ignored).
+
+        Ties are broken by ``seq`` then name for deterministic output. Raises ``ValueError`` naming
+        the cycle members if the graph is not acyclic.
+        """
+        present = set(nodes)
+        indeg = {k: 0 for k in nodes}
+        adj: dict[tuple[str, str], list[tuple[str, str]]] = {k: [] for k in nodes}
+        for key, node in nodes.items():
+            for dep in node["deps"]:
+                dkey = (dep["flow"], dep["name"])
+                if dkey in present and dkey != key:
+                    adj[dkey].append(key)
+                    indeg[key] += 1
+
+        def rank(k: tuple[str, str]) -> tuple[int, str, str]:
+            return (nodes[k]["seq"], k[0], k[1])
+
+        ready = sorted((k for k in nodes if indeg[k] == 0), key=rank)
+        order: list[tuple[str, str]] = []
+        while ready:
+            key = ready.pop(0)
+            order.append(key)
+            for nxt in adj[key]:
+                indeg[nxt] -= 1
+                if indeg[nxt] == 0:
+                    ready.append(nxt)
+            ready.sort(key=rank)
+        if len(order) != len(nodes):
+            cyclic = sorted(f"{f}.{n}" for (f, n) in nodes if (f, n) not in set(order))
+            raise ValueError(
+                f"Cannot order results — dependency cycle among: {', '.join(cyclic)}. "
+                "A result was redefined to depend on one that depends on it; drop or redefine one."
+            )
+        return order
+
+    # ------------------------------------------------------------------ replay -------- #
+    def replay(self, flow: str | None = None, into: str | None = None, dry_run: bool = False) -> dict:
+        """Rebuild a flow's results from their recorded SQL, in dependency order.
+
+        Re-runs every ``query`` result and re-pulls every ``import_remote`` result of ``flow``,
+        ordered so dependencies rebuild first. External inputs (sources, cross-flow results) must
+        already exist — they are read, not rebuilt. With ``into`` the flow is rebuilt into a fresh
+        namespace (non-destructive); without it the flow is refreshed in place. ``dry_run`` returns
+        the plan without executing. Raises on a dependency cycle, or up-front if an ``import_remote``
+        result can't be re-pulled (no single fallback source configured).
+        """
+        flow = self._resolve_flow(flow)
+        target = self._resolve_flow(into) if into is not None else flow
+        with self._lock:
+            allnodes = self._load_all_lineage()
+            selected = {k: v for k, v in allnodes.items() if k[0] == flow}
+            if not selected:
+                raise ValueError(
+                    f"Flow {flow!r} has no recorded lineage to replay. "
+                    "Only results built by query / import_remote in this session can be replayed."
+                )
+            order = self._topo_order(selected)
+            plan = [
+                {"name": nm, "kind": selected[(f, nm)]["kind"], "sql": selected[(f, nm)]["sql"]}
+                for (f, nm) in order
+            ]
+            if dry_run:
+                return {
+                    "source_flow": flow,
+                    "target_flow": target,
+                    "dry_run": True,
+                    "order": [nm for (_f, nm) in order],
+                    "plan": plan,
+                }
+
+            # Fail before mutating anything if a remote pull can't be satisfied.
+            if any(step["kind"] == "import_remote" for step in plan):
+                self._require_single_remote()
+
+            if target != flow:
+                self._con.execute(f'CREATE SCHEMA IF NOT EXISTS "{target}"')
+            rebuilt = []
+            for (_f, nm) in order:
+                node = selected[(_f, nm)]
+                self._set_search_path(target)
+                if node["kind"] == "import_remote":
+                    rc = self._replay_import_remote(target, nm, node["sql"])
+                else:
+                    with self._friendly_catalog_errors(target):
+                        self._con.execute(
+                            f'CREATE OR REPLACE TABLE "{target}"."{nm}" AS {node["sql"]}'
+                        )
+                    rc = self._con.execute(
+                        f'SELECT COUNT(*) FROM "{target}"."{nm}"'
+                    ).fetchone()[0]
+                    self._record_lineage(target, nm, node["sql"], "query")
+                rebuilt.append({"name": nm, "kind": node["kind"], "row_count": int(rc)})
+        return {
+            "source_flow": flow,
+            "target_flow": target,
+            "dry_run": False,
+            "order": [nm for (_f, nm) in order],
+            "rebuilt": rebuilt,
+        }
+
+    def _require_single_remote(self) -> "Source":
+        remotes = [s for s in self.fallback_sources if s.engine is not None]
+        if not remotes:
+            raise ValueError(
+                "This flow contains import_remote results, but no fallback (SQLAlchemy) source "
+                "is configured to re-pull them. Configure the source, or replay a flow without "
+                "remote pulls."
+            )
+        if len(remotes) > 1:
+            names = ", ".join(f'"{s.name}"' for s in remotes)
+            raise ValueError(
+                f"Multiple fallback sources are configured ({names}); replay cannot disambiguate "
+                "which to re-pull import_remote results from."
+            )
+        return remotes[0]
+
+    def _replay_import_remote(self, target: str, name: str, sql: str) -> int:
+        """Re-pull one import_remote result during replay (caller holds ``_lock``)."""
+        from .query import run_sql
+
+        engine = self._require_single_remote().engine
+        result = run_sql(engine, sql, max_rows=None)
+        import pandas as pd
+
+        df = pd.DataFrame(result.rows, columns=result.columns)
+        tmp = f"_replay_{uuid4().hex}"
+        self._con.register(tmp, df)
+        try:
+            self._con.execute(f'CREATE OR REPLACE TABLE "{target}"."{name}" AS SELECT * FROM {tmp}')
+        finally:
+            self._con.unregister(tmp)
+        self._record_lineage(target, name, sql, "import_remote")
+        return int(result.row_count)
 
     # ------------------------------------------------------------------ introspection - #
     def list_objects(self) -> list[TableInfo]:
