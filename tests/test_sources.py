@@ -37,7 +37,6 @@ class TestDetectKind:
             ("sqlite:///x.db", "sqlite"),
             ("postgresql://u@h/d", "postgres"),
             ("mysql://u@h/d", "mysql"),
-            ("mssql://u@h/d", "fallback"),
         ],
     )
     def test_detect(self, loc, kind):
@@ -46,6 +45,11 @@ class TestDetectKind:
     def test_unknown_raises(self):
         with pytest.raises(ValueError):
             sources.detect_kind("mystery.xyz")
+
+    def test_sql_server_unsupported(self):
+        # DuckDB can't attach SQL Server; it's rejected with a clear message (no fallback).
+        with pytest.raises(ValueError, match="SQL Server sources are not supported"):
+            sources.detect_kind("mssql://u@h/d")
 
 
 class TestDeriveName:
@@ -101,9 +105,29 @@ class TestTeardownSql:
         src = sources.build_source(f"shop={sqlite_file}")
         assert sources.teardown_sql(src) == ['DETACH "shop"']
 
-    def test_fallback_has_no_sql(self):
-        src = sources.Source(name="remote", kind="fallback", locator="x")
-        assert sources.teardown_sql(src) == []
+
+class TestAttachTarget:
+    """The Postgres/MySQL DSN -> key=value string, parsed with the stdlib (no SQLAlchemy)."""
+
+    def test_postgres_dsn(self):
+        target = sources._attach_target(
+            "postgres", "postgresql://alice:s3cret@db.example:5432/analytics?sslmode=require"
+        )
+        assert "host=db.example" in target
+        assert "port=5432" in target
+        assert "user=alice" in target
+        assert "password=s3cret" in target
+        assert "dbname=analytics" in target
+        assert "sslmode=require" in target
+
+    def test_mysql_uses_database_key(self):
+        target = sources._attach_target("mysql", "mysql://root@localhost/shop")
+        assert "database=shop" in target
+        assert "dbname" not in target
+
+    def test_percent_encoded_password_decoded(self):
+        target = sources._attach_target("postgres", "postgresql://u:p%40ss@h/d")
+        assert "password=p@ss" in target
 
     def test_teardown_undoes_attach(self, sqlite_file):
         con = duckdb.connect()

@@ -12,10 +12,9 @@ Postgres table to a result you built two steps ago — all in DuckDB SQL.
 
 | Path | Role |
 |---|---|
-| `spelunk/core/duck.py` | `DuckSession` — the one DuckDB connection: query / profile / export / catalog / drop + introspection. |
-| `spelunk/core/sources.py` | Source registry — maps a spec to a DuckDB attach/scan; SQLAlchemy fallback for SQL Server. |
+| `spelunk/core/duck.py` | `DuckSession` — the one DuckDB connection: query / profile / export / catalog / drop / lineage / replay + introspection. |
+| `spelunk/core/sources.py` | Source registry — maps a spec to a DuckDB attach/scan. DuckDB-only: a source it can't attach (e.g. SQL Server) is rejected. |
 | `spelunk/core/guard.py` | sqlglot AST safety: read-only enforcement (`assert_read_only`). |
-| `spelunk/core/connection.py`, `query.py`, `introspect.py` | Retained SQLAlchemy path, used only by the SQL Server / exotic `import_remote` fallback. |
 | `spelunk/mcp/server.py` | Thin FastMCP wrapper over `DuckSession`. |
 | `tests` | Acceptance tests. |
 
@@ -29,7 +28,8 @@ profile(sql, flow?)         # per-column stats (null_rate, min/max/mean/std, per
 export(target, fmt, path)   # write a saved result name OR a full SELECT to csv/json/parquet
 catalog(flow?)              # list flows, or the results in one flow
 drop(name?, flow?)          # drop one result, or a whole flow
-import_remote(sql, name)    # (only with a SQL Server source) pull a SELECT into the workspace
+lineage(name?, flow?)       # provenance DAG: the SQL + deps that built a result (or a whole flow)
+replay(flow?, into?)        # rebuild a flow from its recorded SQL, in dependency order
 ```
 
 Discovery resources: `db://tables` (queryable source objects) and `db://{table}` (columns, PK,

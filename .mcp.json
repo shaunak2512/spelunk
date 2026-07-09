@@ -6,7 +6,7 @@
         "-m",
         "spelunk.mcp.server",
         "--source",
-        "pitchfork=C:\\Users\\shaun\\repo\\spelunk\\sample data\\pitchfork_review.sqlite",
+        "pitchfork=C:/Users/shaun/repo/spelunk/sample_data/pitchfork_review.sqlite",
         "--source",
         "employees=postgres://postgres:postgres@localhost/employees",
         "--session-dir",

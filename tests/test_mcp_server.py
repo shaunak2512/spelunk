@@ -31,9 +31,9 @@ class TestRegistration:
         names = {t.name for t in _run(mcp_server.list_tools())}
         assert {"query", "profile", "export", "catalog", "drop"} <= names
 
-    def test_no_import_remote_without_fallback(self, mcp_server):
+    def test_no_import_remote_tool(self, mcp_server):
         names = {t.name for t in _run(mcp_server.list_tools())}
-        assert "import_remote" not in names  # no SQL-Server source configured
+        assert "import_remote" not in names  # removed: DuckDB-only, no SQLAlchemy fallback
 
     def test_resources_registered(self, mcp_server):
         uris = [str(r.uri) for r in _run(mcp_server.list_resources())]
@@ -164,8 +164,6 @@ class TestAddSourceGating:
         try:
             names = {t.name for t in _run(build_server(session, allow_add_source=True).list_tools())}
             assert {"add_source", "remove_source"} <= names
-            # import_remote is registered too, since a fallback source can now be added at runtime.
-            assert "import_remote" in names
         finally:
             session.close()
 
@@ -181,24 +179,3 @@ class TestAddSourceGating:
             assert removed["removed"] is True
         finally:
             session.close()
-
-
-class TestFallbackToolGating:
-    def test_import_remote_registered_with_fallback(self, sqlite_file):
-        # An mssql:// DSN can't actually connect, but build_source defers the connect to a
-        # real engine; use monkeypatched fallback instead: a sqlite engine tagged fallback.
-        from spelunk.core import sources
-        from spelunk.core.connection import connect
-
-        src = sources.Source(name="remote", kind="fallback", locator="x", engine=connect(sqlite_file_dsn(sqlite_file)))
-        session = DuckSession.open([f"shop={sqlite_file}"])
-        session.sources.append(src)
-        try:
-            names = {t.name for t in _run(build_server(session).list_tools())}
-            assert "import_remote" in names
-        finally:
-            session.close()
-
-
-def sqlite_file_dsn(path: str) -> str:
-    return f"sqlite:///{path.replace(chr(92), '/')}"

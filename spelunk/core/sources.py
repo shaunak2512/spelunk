@@ -5,10 +5,11 @@ The unified engine is a single DuckDB connection. Every source is reached throug
   * **files** (CSV/TSV/Parquet/JSON/Excel) are scanned with DuckDB's ``read_*`` functions and
     registered as VIEWs in the workspace ``main`` schema (the file stays the source of truth,
     so queries push projection/filters down to the scan rather than copying the file in);
-  * **SQLite / PostgreSQL / MySQL** are ``ATTACH``ed read-only, each as its own catalog;
-  * **SQL Server** (and anything DuckDB can't attach) falls back to a SQLAlchemy engine whose
-    rows are pulled on demand by the server's ``import_remote`` tool — DuckDB has no MSSQL
-    scanner, so such a source can't be queried in place.
+  * **SQLite / PostgreSQL / MySQL** are ``ATTACH``ed read-only, each as its own catalog.
+
+Everything reachable is reached through the one DuckDB connection — there is no out-of-engine
+fallback. A source DuckDB can't attach (e.g. SQL Server) is not supported; export it to a file
+(Parquet/CSV) and point a ``--source`` at that instead.
 
 A spec is a string, optionally prefixed ``name=``::
 
@@ -26,12 +27,12 @@ import os
 import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Iterable, Literal
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 if TYPE_CHECKING:
     import duckdb
-    from sqlalchemy.engine import Engine
 
-SourceKind = Literal["file", "sqlite", "postgres", "mysql", "fallback"]
+SourceKind = Literal["file", "sqlite", "postgres", "mysql"]
 
 # File extension -> DuckDB table function used to scan it.
 _FILE_READERS: dict[str, str] = {
@@ -62,15 +63,13 @@ class Source:
     """One registered data source.
 
     ``setup_sql`` are the statements to run on the DuckDB connection to make the source
-    queryable (extension loads + ATTACH/CREATE VIEW). ``engine`` is set only for ``fallback``
-    sources (SQL Server / exotic auth), which are pulled via SQLAlchemy instead of attached.
+    queryable (extension loads + ATTACH/CREATE VIEW).
     """
 
     name: str
     kind: SourceKind
     locator: str
     setup_sql: list[str] = field(default_factory=list)
-    engine: "Engine | None" = None
 
 
 def parse_spec(spec: str) -> tuple[str | None, str]:
@@ -94,7 +93,10 @@ def detect_kind(locator: str) -> SourceKind:
     if low.startswith(("mysql://", "mariadb://")):
         return "mysql"
     if low.startswith(("mssql://", "mssql+", "sqlserver://")):
-        return "fallback"
+        raise ValueError(
+            f"SQL Server sources are not supported: DuckDB cannot attach {locator!r}. "
+            "Export the data to a file (Parquet/CSV) and point a --source at that instead."
+        )
     if low.startswith("sqlite://"):
         return "sqlite"
     ext = os.path.splitext(low)[1]
@@ -105,7 +107,7 @@ def detect_kind(locator: str) -> SourceKind:
     raise ValueError(
         f"Could not determine the source type of {locator!r}. Supported: files "
         f"({', '.join(sorted(set(_FILE_READERS) | _EXCEL_EXTS | _SQLITE_EXTS))}), "
-        "or a sqlite:// / postgresql:// / mysql:// / mssql:// DSN."
+        "or a sqlite:// / postgresql:// / mysql:// DSN."
     )
 
 
@@ -122,21 +124,14 @@ def build_source(spec: str) -> Source:
 
     if kind == "file":
         return _build_file_source(name, locator)
-    if kind in _ATTACH_EXT:
-        return _build_attach_source(name, kind, locator)
-
-    # fallback (SQL Server / exotic): no attach — carry a read-only SQLAlchemy engine.
-    from .connection import connect
-
-    return Source(name=name, kind="fallback", locator=locator, engine=connect(locator, read_only=True))
+    return _build_attach_source(name, kind, locator)
 
 
 def teardown_sql(src: Source) -> list[str]:
     """Statements that undo a source's :attr:`Source.setup_sql` — the inverse of attaching.
 
-    A ``file`` source drops its ``main`` view; an attached database is ``DETACH``ed. A
-    ``fallback`` source has no DuckDB object (its SQLAlchemy engine is disposed by the caller),
-    so this returns no statements. Used by ``DuckSession.remove_source``.
+    A ``file`` source drops its ``main`` view; an attached database is ``DETACH``ed. Used by
+    ``DuckSession.remove_source``.
     """
     if src.kind == "file":
         return [f'DROP VIEW IF EXISTS main."{src.name}"']
@@ -201,43 +196,39 @@ def _attach_target(kind: SourceKind, locator: str) -> str:
     if kind == "sqlite":
         if locator.lower().startswith("sqlite://"):
             rest = locator[len("sqlite://"):]
-            # Strip only the single URI-separator slash, so the SQLAlchemy 4-slash absolute form
+            # Strip only the single URI-separator slash, so the 4-slash absolute form
             # (sqlite:////abs/path.db -> /abs/path.db) survives; 3-slash relative stays relative.
             path = rest[1:] if rest.startswith("/") else rest
         else:
             path = locator
         return _duck_path(path)
 
-    from sqlalchemy.engine import make_url
-
-    url = make_url(locator)
+    url = urlsplit(locator)
     db_key = "database" if kind == "mysql" else "dbname"
-    parts: list[str] = []
-    if url.host:
-        parts.append(f"host={url.host}")
+    database = url.path[1:] if url.path.startswith("/") else url.path
+    fields: list[str] = []
+    if url.hostname:
+        fields.append(f"host={url.hostname}")
     if url.port:
-        parts.append(f"port={url.port}")
+        fields.append(f"port={url.port}")
     if url.username:
-        parts.append(f"user={url.username}")
+        fields.append(f"user={unquote(url.username)}")
     if url.password:
-        parts.append(f"password={url.password}")
-    if url.database:
-        parts.append(f"{db_key}={url.database}")
-    for key, val in url.query.items():
-        if isinstance(val, (list, tuple)):
-            val = val[0]
-        parts.append(f"{key}={val}")
-    return " ".join(parts).replace("'", "''")
+        fields.append(f"password={unquote(url.password)}")
+    if database:
+        fields.append(f"{db_key}={database}")
+    for key, val in parse_qsl(url.query):
+        fields.append(f"{key}={val}")
+    return " ".join(fields).replace("'", "''")
 
 
 def _derive_name(locator: str, kind: SourceKind) -> str:
     """Derive a SQL-identifier source name from a locator (filename stem or DB name)."""
     if "://" in locator:
-        from sqlalchemy.engine import make_url
-
         try:
-            url = make_url(locator)
-            base = url.database or url.host or kind
+            url = urlsplit(locator)
+            database = url.path[1:] if url.path.startswith("/") else url.path
+            base = database or url.hostname or kind
         except Exception:
             base = kind
     else:

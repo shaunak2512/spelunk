@@ -10,15 +10,10 @@ dependencies = [
     "fastmcp>=2.0",
     "pydantic>=2.7",
     "pandas>=2.2",
-    "sqlalchemy>=2.0",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-cov", "ruff", "pyarrow>=15.0"]
-# Drivers for the SQL Server / exotic fallback path (import_remote). DuckDB attaches
-# SQLite/PostgreSQL/MySQL natively, so those need no extra drivers here. SQL Server's
-# pyodbc also needs a system ODBC driver (e.g. "ODBC Driver 18 for SQL Server").
-servers = ["psycopg[binary]>=3.1", "pymysql>=1.1", "pyodbc>=5.0"]
 
 [build-system]
 requires = ["hatchling"]
