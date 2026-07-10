@@ -59,7 +59,7 @@ One row-returning tool (`query`) owns every SELECT; inspection lives on the reso
 
 | Tool | Purpose |
 |---|---|
-| `query(sql, name, flow?)` | Run a read-only SELECT over sources + saved results; **materialize the full result** as table `name` (required). Returns columns, true row_count, head sample. The one tool for looking *and* building — results are named and immediately reusable. |
+| `query(sql, name, flow?)` | Run a read-only SELECT over sources + saved results; **materialize the full result** as table `name` (required). Returns columns, true row_count, head sample. The one tool for looking *and* building — results are named and immediately reusable. **Batch mode:** `query(steps=[{sql,name},...], flow?)` (mutually exclusive with `sql`/`name`) runs an ordered list in one call; later steps reference earlier steps' names; semantics identical to N sequential calls (same guard, same lineage rows). Fail-fast — completed steps stay materialized, the failing step reports its error, the rest are skipped; only the final step returns a sample. A hint after 3 consecutive single-query calls nudges agents toward the batch. |
 | `profile(sql, flow?)` | Per-column stats (null_rate, min/max/mean/std, p25/p50/p75/p95; unique/top/freq) — no row cap. |
 | `export(target, format, path, flow?)` | Write a saved result name **or** a full SELECT to csv/json/parquet. |
 | `catalog(flow?)` | No arg → list flows + counts; with a flow → its results. |

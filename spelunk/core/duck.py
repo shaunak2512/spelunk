@@ -79,6 +79,9 @@ _SAMPLE_ROWS = 5
 # A materialized result larger than this, produced by an unfiltered SELECT * over a source,
 # triggers a nudge: you probably wanted a slice, and DuckDB would have pushed the filter down.
 _LARGE_MATERIALIZE = 100_000
+# After this many consecutive single-statement query() calls, nudge once toward query_steps —
+# dependent steps batched into one call cost one round trip instead of N.
+_BATCH_NUDGE_AT = 3
 
 
 def _warm_native_imports() -> None:
@@ -219,6 +222,9 @@ class DuckSession:
         self._tmpdir = tmpdir
         self._lock = threading.Lock()
         self.default_flow = "default"
+        # Consecutive single-statement query() calls — at _BATCH_NUDGE_AT the response nudges
+        # the agent toward query_steps (one call per pipeline, not one per step).
+        self._single_query_streak = 0
         self._con.execute(f'CREATE SCHEMA IF NOT EXISTS "{self.default_flow}"')
         self._ensure_meta()
 
@@ -530,6 +536,82 @@ class DuckSession:
         flow = self._resolve_flow(flow)
         _validate_name(name)
         guard.assert_read_only(sql, "duckdb")
+        out = self._materialize_query(sql, name, flow)
+        self._single_query_streak += 1
+        if self._single_query_streak == _BATCH_NUDGE_AT:
+            out.setdefault("hints", []).append(
+                f"That's {_BATCH_NUDGE_AT} single-query calls in a row. Dependent steps can run "
+                "in ONE call: query(steps=[{sql, name}, ...]) executes them in order, and later "
+                "steps reference earlier steps' names — a whole pipeline per round trip."
+            )
+        return out
+
+    def query_steps(self, steps: list[dict], flow: str | None = None) -> dict:
+        """Run an ordered batch of queries in one call — each step materialized like ``query``.
+
+        ``steps`` is a list of ``{"sql": ..., "name": ...}`` items executed in list order in a
+        single flow, so a later step can reference an earlier step's ``name`` (it is a live,
+        lineage-recorded result by then). Semantics are identical to calling :meth:`query` once
+        per step — same guard, same ``CREATE OR REPLACE``, same lineage rows — so ``lineage`` /
+        ``replay`` see no difference. All steps are statically validated (name, read-only SQL)
+        before anything runs; execution is fail-fast — the failing step reports its error,
+        earlier steps stay materialized, later steps are skipped. To keep the response compact,
+        only the final step carries a head sample; intermediates return name/row_count/columns.
+        """
+        flow = self._resolve_flow(flow)
+        if not steps:
+            raise ValueError("steps must be a non-empty list of {sql, name} items.")
+        parsed: list[tuple[str, str]] = []
+        for i, step in enumerate(steps):
+            sql = step.get("sql") if isinstance(step, dict) else None
+            name = step.get("name") if isinstance(step, dict) else None
+            if not sql or not name:
+                raise ValueError(f"steps[{i}] must have both 'sql' and 'name'.")
+            _validate_name(name, f"steps[{i}] name")
+            guard.assert_read_only(sql, "duckdb")
+            parsed.append((sql, name))
+
+        self._single_query_streak = 0
+        results: list[dict] = []
+        completed = 0
+        failed_step: int | None = None
+        t0 = time.perf_counter()
+        for i, (sql, name) in enumerate(parsed):
+            if failed_step is not None:
+                results.append({"name": name, "status": "skipped"})
+                continue
+            try:
+                full = self._materialize_query(sql, name, flow)
+            except Exception as exc:
+                failed_step = i
+                results.append({"name": name, "status": "failed", "error": str(exc)})
+                continue
+            entry = {
+                "name": name,
+                "status": "ok",
+                "row_count": full["row_count"],
+                "columns": full["columns"],
+                "elapsed_s": full["elapsed_s"],
+            }
+            if "hints" in full:
+                entry["hints"] = full["hints"]
+            if i == len(parsed) - 1:
+                entry["sample"] = full["sample"]
+            completed += 1
+            results.append(entry)
+        out = {
+            "flow": flow,
+            "step_count": len(parsed),
+            "completed": completed,
+            "steps": results,
+            "elapsed_s": round(time.perf_counter() - t0, 3),
+        }
+        if failed_step is not None:
+            out["failed_step"] = failed_step
+        return out
+
+    def _materialize_query(self, sql: str, name: str, flow: str) -> dict:
+        """CREATE OR REPLACE the result table + record lineage (caller validated name + SQL)."""
         with self._lock:
             self._con.execute(f'CREATE SCHEMA IF NOT EXISTS "{flow}"')
             self._set_search_path(flow)

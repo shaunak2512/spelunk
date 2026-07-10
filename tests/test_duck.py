@@ -76,6 +76,84 @@ class TestQuery:
         assert "hints" not in r
 
 
+class TestQuerySteps:
+    def test_dependent_steps_run_in_order(self, session):
+        r = session.query_steps(
+            [
+                {"sql": 'SELECT * FROM "shop"."customers"', "name": "base"},
+                {"sql": "SELECT id, name FROM base WHERE id > 1", "name": "mid"},
+                {"sql": "SELECT COUNT(*) AS n FROM mid", "name": "top"},
+            ]
+        )
+        assert r["step_count"] == 3 and r["completed"] == 3
+        assert [s["status"] for s in r["steps"]] == ["ok", "ok", "ok"]
+        assert [s["row_count"] for s in r["steps"]] == [3, 2, 1]
+        # Compact intermediates: only the final step carries a sample.
+        assert "sample" not in r["steps"][0] and "sample" not in r["steps"][1]
+        assert r["steps"][2]["sample"] == [[2]]
+
+    def test_steps_record_lineage_like_sequential_calls(self, session):
+        session.query_steps(
+            [
+                {"sql": 'SELECT * FROM "shop"."customers"', "name": "base"},
+                {"sql": "SELECT id, name FROM base", "name": "top"},
+            ]
+        )
+        lin = session.lineage("top")
+        assert {n["name"] for n in lin["nodes"]} == {"base", "top"}
+        rep = session.replay(into="copy")
+        assert rep["order"] == ["base", "top"]
+
+    def test_fail_fast_keeps_earlier_skips_later(self, session):
+        r = session.query_steps(
+            [
+                {"sql": "SELECT 1 AS a", "name": "ok1"},
+                {"sql": "SELECT * FROM no_such_table", "name": "boom"},
+                {"sql": "SELECT 2 AS b", "name": "never"},
+            ]
+        )
+        assert r["failed_step"] == 1 and r["completed"] == 1
+        assert [s["status"] for s in r["steps"]] == ["ok", "failed", "skipped"]
+        assert "no_such_table" in r["steps"][1]["error"]
+        # ok1 stayed materialized; the skipped step never ran.
+        names = {t["name"] for t in session.catalog("default")["results"]}
+        assert "ok1" in names and "never" not in names
+
+    def test_static_validation_rejects_batch_before_any_side_effect(self, session):
+        with pytest.raises(ValueError, match=r"steps\[1\]"):
+            session.query_steps(
+                [
+                    {"sql": "SELECT 1 AS a", "name": "ok1"},
+                    {"sql": "SELECT 2 AS b", "name": "bad name!"},
+                ]
+            )
+        with pytest.raises(UnsafeSQLError):
+            session.query_steps(
+                [
+                    {"sql": "SELECT 1 AS a", "name": "ok1"},
+                    {"sql": "DELETE FROM orders", "name": "w"},
+                ]
+            )
+        assert session.catalog("default")["results"] == []  # nothing materialized
+
+    def test_empty_or_malformed_steps_rejected(self, session):
+        with pytest.raises(ValueError, match="non-empty"):
+            session.query_steps([])
+        with pytest.raises(ValueError, match=r"steps\[0\]"):
+            session.query_steps([{"sql": "SELECT 1"}])  # name missing
+
+    def test_batch_nudge_after_consecutive_single_queries(self, session):
+        r1 = session.query("SELECT 1 AS a", "t1")
+        r2 = session.query("SELECT 2 AS a", "t2")
+        assert "hints" not in r1 and "hints" not in r2
+        r3 = session.query("SELECT 3 AS a", "t3")
+        assert any("steps" in h for h in r3.get("hints", []))
+        # A batch resets the streak: the next single query is not nagged.
+        session.query_steps([{"sql": "SELECT 4 AS a", "name": "t4"}])
+        r5 = session.query("SELECT 5 AS a", "t5")
+        assert "hints" not in r5
+
+
 class TestProfile:
     def test_numeric_and_text_stats(self, session):
         session.query(

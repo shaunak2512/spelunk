@@ -22,8 +22,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from fastmcp import FastMCP
+from pydantic import BaseModel, Field
 
 from spelunk.core.duck import DuckSession
+
+
+class QueryStep(BaseModel):
+    """One step of a batch `query` call: a SELECT and the result name it materializes as."""
+
+    sql: str = Field(description="Read-only DuckDB SELECT; may reference earlier steps' names.")
+    name: str = Field(description="Result table name this step materializes as (SQL identifier).")
 
 # One JSON line per tool call lands here so agent usage can be analysed offline. Handlers are
 # (re)attached by _configure_tool_logging; until then a NullHandler keeps library/test use silent.
@@ -33,9 +41,12 @@ _tool_logger.setLevel(logging.INFO)
 _tool_logger.propagate = False
 
 # Args worth recording verbatim (SQL kept full — that's the point of the log); long head samples
-# and row payloads are summarised, never dumped.
-_LOGGED_ARGS = ("sql", "name", "flow", "target", "format", "path", "spec")
-_LOGGED_RESULT_FIELDS = ("name", "flow", "row_count", "format", "path", "dropped_results", "kind")
+# and row payloads are summarised, never dumped. `steps` is a batch of {sql, name} — full SQL kept.
+_LOGGED_ARGS = ("sql", "name", "flow", "target", "format", "path", "spec", "steps")
+_LOGGED_RESULT_FIELDS = (
+    "name", "flow", "row_count", "format", "path", "dropped_results", "kind",
+    "step_count", "completed", "failed_step",
+)
 
 # add_source accepts DSNs that can embed credentials (postgresql://user:pw@host/db); strip the
 # userinfo (user:pass@) before the spec is written to the on-disk tool-call log.
@@ -46,6 +57,15 @@ def _redact(value: object) -> object:
     """Mask userinfo (user:pass@) in DSN-like strings so credentials never reach the log."""
     if isinstance(value, str):
         return _DSN_CREDENTIALS_RE.sub("//***@", value)
+    return value
+
+
+def _log_arg(key: str, value: object) -> object:
+    """Make one logged argument JSON-safe: redact DSN specs, unwrap pydantic step models."""
+    if key == "spec":
+        return _redact(value)
+    if key == "steps" and isinstance(value, list):
+        return [s.model_dump() if isinstance(s, BaseModel) else s for s in value]
     return value
 
 
@@ -103,9 +123,7 @@ def _logged(fn):
             "ts": datetime.now(timezone.utc).isoformat(),
             "tool": tool_name,
             "args": {
-                k: (_redact(v) if k == "spec" else v)
-                for k, v in bound.arguments.items()
-                if k in _LOGGED_ARGS
+                k: _log_arg(k, v) for k, v in bound.arguments.items() if k in _LOGGED_ARGS
             },
         }
         start = time.perf_counter()
@@ -166,6 +184,12 @@ def build_server(
             "by `name` in your next query. `name` is required; reuse a scratch name (e.g. `tmp`) "
             "for throwaways, or `drop` them. Reference attached DB tables as \"<source>\".\"<table>\", "
             "files and prior results by bare name.\n"
+            "- `query(steps=[{sql, name}, ...], flow?)` — the SAME tool in batch mode: an ordered "
+            "list of dependent queries executed in one call, later steps referencing earlier "
+            "steps' names. Once you know the shape of a multi-step transform, ALWAYS batch it — "
+            "one round trip per pipeline, not per step. Fail-fast: completed steps stay "
+            "materialized (with lineage), the failing step reports its error, the rest are "
+            "skipped; only the final step returns a sample.\n"
             "- `profile(sql, flow?)` — per-column stats (null_rate, min/max/mean/std, "
             "p25/p50/p75/p95 for numerics; unique/top/freq for text) over the full result. Use "
             "this instead of writing manual aggregation queries.\n"
@@ -223,15 +247,36 @@ def build_server(
     @mcp.tool(
         name="query",
         description=(
-            "Run a read-only DuckDB SELECT over sources and saved results, and store the full "
-            "result (no row cap) as table `name` in the flow for immediate reuse. Returns "
-            "columns, true row_count, and a head sample. `name` is required. Reference attached "
-            "DB tables as \"<source>\".\"<table>\"; files and prior results by bare name. Writes/DDL "
-            "are rejected."
+            "Run read-only DuckDB SELECTs over sources and saved results, storing each full "
+            "result (no row cap) as a named table in the flow for immediate reuse. Two modes: "
+            "single (`sql` + `name`) or batch (`steps=[{sql, name}, ...]`). For multi-step work "
+            "ALWAYS prefer one batch call over sequential single calls: steps run in list order "
+            "and a later step references an earlier step's `name` like any saved result, so a "
+            "whole pipeline is one round trip. Batch is fail-fast — completed steps stay "
+            "materialized, the failing step reports its error, the rest are skipped; only the "
+            "final step returns a head sample (intermediates return row_count + columns). "
+            "Reference attached DB tables as \"<source>\".\"<table>\"; files and prior results by "
+            "bare name. Writes/DDL are rejected."
         ),
     )
     @_logged
-    def _query(sql: str, name: str, flow: str = "default") -> dict:
+    def _query(
+        sql: str | None = None,
+        name: str | None = None,
+        steps: list[QueryStep] | None = None,
+        flow: str = "default",
+    ) -> dict:
+        if steps is not None:
+            if sql is not None or name is not None:
+                raise ValueError(
+                    "Pass either sql+name (single query) or steps (batch), not both."
+                )
+            return session.query_steps([s.model_dump() for s in steps], flow)
+        if sql is None or name is None:
+            raise ValueError(
+                "A single query needs both sql and name; a batch needs "
+                "steps=[{sql, name}, ...]."
+            )
         return session.query(sql, name, flow)
 
     @mcp.tool(

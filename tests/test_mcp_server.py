@@ -81,6 +81,30 @@ class TestQueryTool:
         with pytest.raises(ToolError, match="not a SELECT"):
             _run(mcp_server.call_tool("query", {"sql": "DELETE FROM orders", "name": "x"}))
 
+    def test_batch_steps_pipeline_in_one_call(self, mcp_server):
+        res = _run(mcp_server.call_tool("query", {"steps": [
+            {"sql": 'SELECT * FROM "shop"."customers"', "name": "base"},
+            {"sql": "SELECT COUNT(*) AS n FROM base", "name": "agg"},
+        ]}))
+        data = res.structured_content
+        assert data["completed"] == 2
+        assert [s["status"] for s in data["steps"]] == ["ok", "ok"]
+        assert data["steps"][1]["sample"] == [[3]]
+        # Batch-built results are ordinary saved results: reusable + lineage-recorded.
+        lin = _run(mcp_server.call_tool("lineage", {"name": "agg"})).structured_content
+        assert {n["name"] for n in lin["nodes"]} == {"base", "agg"}
+
+    def test_sql_and_steps_are_mutually_exclusive(self, mcp_server):
+        from fastmcp.exceptions import ToolError
+
+        with pytest.raises(ToolError, match="not both"):
+            _run(mcp_server.call_tool("query", {
+                "sql": "SELECT 1", "name": "x",
+                "steps": [{"sql": "SELECT 1", "name": "y"}],
+            }))
+        with pytest.raises(ToolError, match="single query needs both"):
+            _run(mcp_server.call_tool("query", {}))
+
 
 class TestOtherTools:
     def test_profile(self, mcp_server):
@@ -135,6 +159,25 @@ class TestToolLogging:
         assert q["args"]["name"] == "o"
         assert q["result"]["row_count"] == 3
         assert isinstance(q["duration_ms"], (int, float))
+
+    def test_batch_call_logs_steps_and_summary(self, sqlite_file, tmp_path):
+        log_path = tmp_path / "tool-calls.jsonl"
+        session = DuckSession.open([f"shop={sqlite_file}"])
+        server = build_server(session, tool_log=str(log_path))
+        try:
+            _run(server.call_tool("query", {"steps": [
+                {"sql": 'SELECT * FROM "shop"."customers"', "name": "base"},
+                {"sql": "SELECT COUNT(*) AS n FROM base", "name": "agg"},
+            ]}))
+        finally:
+            session.close()
+
+        rec = json.loads(log_path.read_text().splitlines()[-1])
+        assert rec["outcome"] == "ok"
+        # Full SQL of every step lands in the log (that's the point of it), JSON-clean.
+        assert [s["name"] for s in rec["args"]["steps"]] == ["base", "agg"]
+        assert rec["args"]["steps"][1]["sql"].startswith("SELECT COUNT")
+        assert rec["result"]["step_count"] == 2 and rec["result"]["completed"] == 2
 
     def test_failed_call_logs_error_outcome(self, sqlite_file, tmp_path):
         log_path = tmp_path / "tool-calls.jsonl"
