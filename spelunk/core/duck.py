@@ -149,27 +149,68 @@ _DEFAULT_KEEP_WORKSPACES = 3
 _SWEEP_GRACE_SECONDS = 60
 
 
-def _workspace_is_free(dir_path: str) -> bool:
-    """True if ``dir_path``'s workspace.duckdb is NOT held by a live server.
+# Entries a workspace dir contains before any work happens: the DB file itself, its WAL, and
+# the default spill scratch dir (transient — safe to disregard even if a crash left files in it).
+_WORKSPACE_SCAFFOLD_ENTRIES = frozenset({"workspace.duckdb", "workspace.duckdb.wal", "spill"})
+
+
+def _dir_has_user_artifacts(dir_path: str) -> bool:
+    """True if ``dir_path`` holds anything beyond the workspace scaffold — e.g. a non-empty
+    tool-call log — meaning the run left something worth keeping for postmortems. A 0-byte file
+    (the log a server created but never wrote to) is not an artifact. Conservative: anything
+    unreadable or unexpected (a foreign subdir) counts as an artifact, so the dir is kept."""
+    try:
+        for entry in os.listdir(dir_path):
+            if entry in _WORKSPACE_SCAFFOLD_ENTRIES:
+                continue
+            p = os.path.join(dir_path, entry)
+            try:
+                if os.path.isdir(p) or os.path.getsize(p) > 0:
+                    return True
+            except OSError:
+                return True
+    except OSError:
+        return True
+    return False
+
+
+def _probe_workspace(dir_path: str) -> str | None:
+    """Classify ``dir_path``'s workspace.duckdb: ``None`` (live owner), ``"empty"``, or ``"idle"``.
 
     Probes by opening read-write: a live owner holds the single-writer lock so the connect
-    raises; a crashed/exited owner leaves an unlocked file (its WAL is just replayed) so it opens.
-    Read-write — not read_only — is deliberate: a read_only open of a DB with a pending WAL errors,
-    which would make us mistake a crashed orphan for a live owner and never reclaim it."""
+    raises (→ ``None``, never touch); a crashed/exited owner leaves an unlocked file (its WAL is
+    just replayed) so it opens. Read-write — not read_only — is deliberate: a read_only open of a
+    DB with a pending WAL errors, which would make us mistake a crashed orphan for a live owner
+    and never reclaim it. An opened workspace is ``"empty"`` iff it has no tables outside the
+    reserved schemas (i.e. no user results; file-source views live in ``main``, which is reserved)."""
     try:
         con = duckdb.connect(os.path.join(dir_path, "workspace.duckdb"))
     except Exception:
-        return False
-    con.close()
-    return True
+        return None
+    try:
+        n = con.execute(
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema NOT IN "
+            f"({', '.join('?' * len(_RESERVED_SCHEMAS))})",
+            sorted(_RESERVED_SCHEMAS),
+        ).fetchone()[0]
+    except Exception:
+        n = 1  # can't tell -> assume it holds results (never delete what we can't classify)
+    finally:
+        con.close()
+    return "empty" if n == 0 else "idle"
 
 
 def _reclaim_old_workspaces(parent: str, keep: int, *, exclude: str) -> list[str]:
-    """Delete all but the ``keep`` most-recent per-process workspace subdirs under ``parent``.
+    """Reclaim per-process workspace subdirs under ``parent``. Two tiers:
 
-    Best-effort GC: only removes dirs that have no live owner, are older than the grace window,
-    and are not ``exclude`` (this process's own dir). Never raises — losing a race to a concurrent
-    server just leaves a dir for the next sweep. Returns the dirs actually removed."""
+    * beyond the ``keep`` most-recent subdirs: any dir with no live owner is deleted;
+    * within the keep window: a dir is deleted anyway if it is *empty* — no user results in its
+      DB and no other artifacts (e.g. only a 0-byte tool log). MCP reconnect churn leaves fully
+      formed but worthless workspaces that would otherwise crowd the keep window.
+
+    Best-effort GC: only touches dirs older than the grace window, never ``exclude`` (this
+    process's own dir), never a dir whose owner holds the DuckDB lock. Never raises — losing a
+    race to a concurrent server just leaves a dir for the next sweep. Returns the dirs removed."""
     try:
         dirs = [
             os.path.join(parent, d)
@@ -181,7 +222,7 @@ def _reclaim_old_workspaces(parent: str, keep: int, *, exclude: str) -> list[str
     dirs.sort(key=lambda p: os.path.getmtime(p), reverse=True)  # newest first
     now = time.time()
     removed: list[str] = []
-    for path in dirs[keep:]:  # keep the N newest (this process's fresh dir is among them)
+    for i, path in enumerate(dirs):
         if os.path.abspath(path) == os.path.abspath(exclude):
             continue
         try:
@@ -189,7 +230,13 @@ def _reclaim_old_workspaces(parent: str, keep: int, *, exclude: str) -> list[str
                 continue
         except OSError:
             continue
-        if not _workspace_is_free(path):
+        within_keep = i < keep
+        if within_keep and _dir_has_user_artifacts(path):
+            continue  # in the keep window and visibly non-empty: retained for postmortems
+        status = _probe_workspace(path)
+        if status is None:
+            continue  # live owner holds the lock
+        if within_keep and status != "empty":
             continue
         try:
             shutil.rmtree(path)
@@ -214,12 +261,16 @@ class DuckSession:
         catalog: str,
         workspace_dir: str,
         tmpdir: "tempfile.TemporaryDirectory | None" = None,
+        per_process: bool = False,
     ) -> None:
         self._con = con
         self.sources = sources
         self._catalog = catalog
         self.workspace_dir = workspace_dir
         self._tmpdir = tmpdir
+        # True when workspace_dir is a durable per-process subdir this session exclusively owns
+        # (safe to self-delete on clean exit if nothing was ever materialized).
+        self._per_process = per_process
         self._lock = threading.Lock()
         self.default_flow = "default"
         # Consecutive single-statement query() calls — at _BATCH_NUDGE_AT the response nudges
@@ -274,7 +325,9 @@ class DuckSession:
 
         In ``per_process`` mode, opening also reclaims stale workspaces: the ``keep_workspaces``
         most recent subdirs survive (including the one just created) and older ones with no live
-        owner are deleted. ``keep_workspaces <= 0`` disables the sweep (keep everything).
+        owner are deleted. *Empty* workspaces — no user results, no artifacts beyond a 0-byte
+        tool log (reconnect churn) — are reclaimed even inside the keep window.
+        ``keep_workspaces <= 0`` disables the sweep (keep everything).
 
         A durable workspace is a single-writer DuckDB file (exclusive lock). If it's already
         held by another server instance — e.g. a second editor window on the same project — we
@@ -327,13 +380,37 @@ class DuckSession:
         if pp_parent is not None and keep_workspaces > 0:
             _reclaim_old_workspaces(pp_parent, keep_workspaces, exclude=base)
 
-        return cls(con, attached, catalog=catalog, workspace_dir=base, tmpdir=tmpdir)
+        return cls(
+            con,
+            attached,
+            catalog=catalog,
+            workspace_dir=base,
+            tmpdir=tmpdir,
+            per_process=pp_parent is not None,
+        )
 
-    def close(self) -> None:
+    def close(self, *, reclaim_if_empty: bool = False) -> None:
+        """Close the connection (and delete an ephemeral temp workspace).
+
+        ``reclaim_if_empty=True`` additionally deletes a durable *per-process* workspace dir on
+        the way out when it holds no user results and no other artifacts — a server that started
+        but never did any work (MCP reconnect churn) then leaves nothing behind. Clean-shutdown
+        complement to the startup sweep, which handles crash debris. No-op for shared or
+        ephemeral workspaces. NOTE: any open handle into the dir (e.g. a tool-log FileHandler)
+        blocks deletion on Windows — release those before calling."""
+        reclaim = False
+        if reclaim_if_empty and self._per_process and self._tmpdir is None:
+            with self._lock:
+                reclaim = not self._existing_results()
         with self._lock:
             self._con.close()
         if self._tmpdir is not None:
             self._tmpdir.cleanup()
+        if reclaim and not _dir_has_user_artifacts(self.workspace_dir):
+            try:
+                shutil.rmtree(self.workspace_dir)
+            except OSError:
+                pass  # e.g. a still-open log handle; the next startup sweep will get it
 
     # ------------------------------------------------------------------ sources ------- #
     def add_source(self, spec: str) -> dict:

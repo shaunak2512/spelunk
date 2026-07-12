@@ -294,11 +294,14 @@ class TestPersistence:
         parent = str(tmp_path / "root")
         os.makedirs(parent, exist_ok=True)
         old = time.time() - 86_400  # a day ago: past the sweep grace window
-        # Five stale, unlocked workspaces, oldest -> newest by mtime.
+        # Five stale, unlocked, NON-empty workspaces (holding a result table — empty ones are
+        # reclaimed regardless of keep-N), oldest -> newest by mtime.
         for i in range(5):
             d = os.path.join(parent, f"00000-stale{i}")
             os.makedirs(d)
-            duckdb.connect(os.path.join(d, "workspace.duckdb")).close()  # free (no live owner)
+            con = duckdb.connect(os.path.join(d, "workspace.duckdb"))  # free (no live owner)
+            con.execute("CREATE SCHEMA work; CREATE TABLE work.t AS SELECT 1 AS a")
+            con.close()
             os.utime(d, (old + i, old + i))
 
         s = DuckSession.open([f"shop={sqlite_file}"], session_dir=parent, keep_workspaces=3)
@@ -314,6 +317,77 @@ class TestPersistence:
             assert "00000-stale0" not in remaining  # 3 oldest reclaimed
         finally:
             s.close()
+
+    def test_sweep_reclaims_empty_workspaces_within_keep_window(self, sqlite_file, tmp_path):
+        """Reconnect churn: stale EMPTY workspaces are reclaimed even inside the keep-N window.
+
+        Non-empty siblings (a result table, or a non-empty tool log) and dirs inside the grace
+        window are untouched.
+        """
+        parent = str(tmp_path / "root")
+        os.makedirs(parent, exist_ok=True)
+        old = time.time() - 86_400
+
+        def make_ws(name: str, *, table: bool = False, log_bytes: int = 0, stale: bool = True) -> str:
+            d = os.path.join(parent, name)
+            os.makedirs(d)
+            con = duckdb.connect(os.path.join(d, "workspace.duckdb"))
+            if table:
+                con.execute("CREATE SCHEMA work; CREATE TABLE work.t AS SELECT 1 AS a")
+            con.close()
+            with open(os.path.join(d, "tool-calls.jsonl"), "wb") as f:
+                f.write(b"x" * log_bytes)  # 0 bytes = the log churn leaves behind
+            if stale:
+                os.utime(d, (old, old))
+            return name
+
+        empty1 = make_ws("00000-empty1")
+        empty2 = make_ws("00000-empty2")
+        with_table = make_ws("00000-table", table=True)
+        with_log = make_ws("00000-logged", log_bytes=42)
+        fresh_empty = make_ws("00000-fresh", stale=False)  # inside the 60s grace window
+
+        s = DuckSession.open([f"shop={sqlite_file}"], session_dir=parent, keep_workspaces=10)
+        try:
+            remaining = set(os.listdir(parent))
+            assert empty1 not in remaining and empty2 not in remaining  # reclaimed despite keep=10
+            assert with_table in remaining  # has results: keep-N applies
+            assert with_log in remaining  # non-empty log is a postmortem artifact
+            assert fresh_empty in remaining  # grace window: never touched
+        finally:
+            s.close()
+
+    def test_close_reclaims_own_empty_per_process_workspace(self, sqlite_file, tmp_path):
+        """close(reclaim_if_empty=True) deletes this run's own dir iff it never did any work."""
+        parent = str(tmp_path / "root")
+
+        # Never materialized anything -> dir removed (a 0-byte log is not an artifact).
+        s1 = DuckSession.open([f"shop={sqlite_file}"], session_dir=parent)
+        d1 = s1.workspace_dir
+        open(os.path.join(d1, "tool-calls.jsonl"), "w").close()
+        s1.close(reclaim_if_empty=True)
+        assert not os.path.exists(d1)
+
+        # Materialized a result -> dir survives.
+        s2 = DuckSession.open([f"shop={sqlite_file}"], session_dir=parent)
+        d2 = s2.workspace_dir
+        s2.query("SELECT 1 AS a", "kept")
+        s2.close(reclaim_if_empty=True)
+        assert os.path.isfile(os.path.join(d2, "workspace.duckdb"))
+
+        # A non-empty tool log alone also blocks reclaim (it's the audit trail).
+        s3 = DuckSession.open([f"shop={sqlite_file}"], session_dir=parent)
+        d3 = s3.workspace_dir
+        with open(os.path.join(d3, "tool-calls.jsonl"), "w") as f:
+            f.write('{"tool": "query"}\n')
+        s3.close(reclaim_if_empty=True)
+        assert os.path.exists(d3)
+
+        # Plain close() never reclaims.
+        s4 = DuckSession.open([f"shop={sqlite_file}"], session_dir=parent)
+        d4 = s4.workspace_dir
+        s4.close()
+        assert os.path.exists(d4)
 
     def test_per_process_sweep_skips_live_workspace(self, sqlite_file, tmp_path):
         """A stale-looking workspace still held by a LIVE (separate) process is never reclaimed.

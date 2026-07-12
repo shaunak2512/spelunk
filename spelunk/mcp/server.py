@@ -426,7 +426,8 @@ def main() -> None:
         metavar="N",
         help=(
             "On startup, keep the N most recent per-process workspaces under --session-dir and "
-            "reclaim older ones with no live owner. Default: 3. 0 or less keeps everything. "
+            "reclaim older ones with no live owner. Empty workspaces (no results, no logged "
+            "calls) are reclaimed regardless of N. Default: 3. 0 or less keeps everything. "
             "No-op with --shared-workspace."
         ),
     )
@@ -481,7 +482,14 @@ def main() -> None:
         tool_log = "-"  # stderr
 
     server = build_server(session, tool_log=tool_log, allow_add_source=args.allow_add_source)
-    server.run(transport="stdio")
+    try:
+        server.run(transport="stdio")
+    finally:
+        # Clean shutdown (client closed stdin): release the tool-log file handle so the dir is
+        # deletable on Windows, then let the session reclaim its own workspace if this run never
+        # did any work — reconnect churn then leaves no empty <pid>-<rand> dirs behind.
+        _configure_tool_logging(None)
+        session.close(reclaim_if_empty=True)
 
 
 if __name__ == "__main__":

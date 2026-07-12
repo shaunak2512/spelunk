@@ -132,9 +132,14 @@ dir.
 
 **Workspace GC:** to stop per-process subdirs accumulating, `open()` sweeps on startup — it keeps
 the `--keep-workspaces N` most recent (default 3, including the one just created) and reclaims older
-subdirs that have no *live* owner. Liveness is the DuckDB file lock: the sweep probes each candidate
+subdirs that have no *live* owner. **Empty workspaces are reclaimed regardless of keep-N**: a dir
+whose DB has no tables outside the reserved schemas and no artifacts beyond a 0-byte tool log
+(MCP reconnect churn spawns servers that never handle a call) is garbage even inside the keep
+window. Liveness is the DuckDB file lock: the sweep probes each candidate
 with a read-write `connect` (a live server holds the single-writer lock → skip; a crashed/exited one
-opens → delete). This is cross-process only — two sessions in one process share DuckDB's cached
+opens → delete). Complementing the sweep, `main()` calls `session.close(reclaim_if_empty=True)` on
+clean shutdown (stdin closed), so a no-work server deletes its own dir immediately — after releasing
+the tool-log handler first (an open handle blocks `rmtree` on Windows). This is cross-process only — two sessions in one process share DuckDB's cached
 instance, so a sweep can't detect an in-process holder (irrelevant in production: each server is its
 own process). Dirs younger than a 60s grace window are never touched (a sibling may be mid-startup,
 lock not yet held). `--keep-workspaces 0` (or `<=0`) disables the sweep. The tool-log lives inside
