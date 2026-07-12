@@ -19,3 +19,5 @@ potential_extensions.md
 node_modules/
 market_position*.md
 .mcp*
+experiments/
+scripts/
