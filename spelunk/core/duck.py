@@ -76,12 +76,26 @@ def _is_numeric_type(type_name: str) -> bool:
     return type_name.upper().split("(", 1)[0].strip() in _NUMERIC_TYPES
 
 _SAMPLE_ROWS = 5
+# When a result is small on BOTH axes, query() returns EVERY row as the `sample` (and reports
+# complete=True) instead of a 5-row head — so an agent reads its own small deliverable directly
+# instead of paging it out into junk tables. Bounded on rows AND cells so a wide schema can't blow
+# the token budget: full return requires row_count <= ROW_CAP and row_count*col_count <= CELL_CAP.
+_FULL_SAMPLE_ROW_CAP = 50
+_FULL_SAMPLE_CELL_CAP = 1000
 # A materialized result larger than this, produced by an unfiltered SELECT * over a source,
 # triggers a nudge: you probably wanted a slice, and DuckDB would have pushed the filter down.
 _LARGE_MATERIALIZE = 100_000
 # After this many consecutive single-statement query() calls, nudge once toward query_steps —
 # dependent steps batched into one call cost one round trip instead of N.
 _BATCH_NUDGE_AT = 3
+
+
+def _full_sample_fits(row_count: int, col_count: int) -> bool:
+    """True when a result is small on both axes → return every row as the sample."""
+    return (
+        row_count <= _FULL_SAMPLE_ROW_CAP
+        and row_count * max(col_count, 1) <= _FULL_SAMPLE_CELL_CAP
+    )
 
 
 def _warm_native_imports() -> None:
@@ -543,6 +557,38 @@ class DuckSession:
                     sources.append(ref)
         return deps, sources
 
+    def _referenced_names(self, sql: str, flow: str) -> set[str]:
+        """Names in *flow* that *sql* references (best-effort parse; unparseable → empty).
+
+        Used to decide terminality inside a batch: a step is terminal when no later step
+        references its name. Resolution mirrors :meth:`_classify_refs` — bare and ``<flow>.name``
+        (or ``<catalog>.<flow>.name``) refs count when they land in ``flow``; foreign-catalog and
+        CTE refs don't. Purely a parse — touches no connection state.
+        """
+        import sqlglot
+        from sqlglot import exp
+        from sqlglot.errors import SqlglotError
+
+        try:
+            tree = sqlglot.parse_one(sql, read="duckdb")
+        except SqlglotError:
+            return set()
+        cte_names = {cte.alias_or_name for cte in tree.find_all(exp.CTE)}
+        refs: set[str] = set()
+        for tbl in tree.find_all(exp.Table):
+            tname = tbl.name
+            if not tname:
+                continue
+            db = tbl.db
+            catalog = tbl.catalog
+            if not db and not catalog and tname in cte_names:
+                continue
+            if catalog and catalog != self._catalog:
+                continue  # foreign catalog (attached DB) — never a workspace result
+            if (db or flow) == flow:
+                refs.add(tname)
+        return refs
+
     def _record_lineage(self, flow: str, name: str, sql: str, kind: str) -> None:
         """Upsert the lineage row for a just-materialized result (caller holds ``_lock``).
 
@@ -607,8 +653,11 @@ class DuckSession:
         """Run a read-only SELECT over sources + flow results, materialize it as a table.
 
         ``name`` is required and the result is stored as ``"<flow>"."<name>"`` (replacing any
-        prior result of that name). Returns the result's columns, true row_count, a head
-        sample, and any nudges.
+        prior result of that name). Returns the result's columns, true row_count, a sample, a
+        ``complete`` flag, and any nudges. The sample is a 5-row head, but when the result is
+        small on both axes (row_count <= 50 and row_count*columns <= 1000) it is the *whole*
+        result — ``complete`` is True exactly when ``sample`` holds every row, so an agent can
+        read a small deliverable directly instead of paging it out.
         """
         flow = self._resolve_flow(flow)
         _validate_name(name)
@@ -630,10 +679,15 @@ class DuckSession:
         single flow, so a later step can reference an earlier step's ``name`` (it is a live,
         lineage-recorded result by then). Semantics are identical to calling :meth:`query` once
         per step — same guard, same ``CREATE OR REPLACE``, same lineage rows — so ``lineage`` /
-        ``replay`` see no difference. All steps are statically validated (name, read-only SQL)
-        before anything runs; execution is fail-fast — the failing step reports its error,
-        earlier steps stay materialized, later steps are skipped. To keep the response compact,
-        only the final step carries a head sample; intermediates return name/row_count/columns.
+        ``replay`` see no difference. Steps need not form a single pipeline — a batch can be a
+        dependent chain, a bundle of unrelated queries, or a mix; use it whenever you want more
+        than one result in one round trip. All steps are statically validated (name, read-only
+        SQL) before anything runs; execution is fail-fast — the failing step reports its error,
+        earlier steps stay materialized, later steps are skipped. Every *terminal* step (one no
+        later step references — always includes the last, plus any independent query) carries a
+        sample and ``complete`` flag — full rows when the result is small, per :meth:`query`.
+        Non-terminal intermediates stay compact (name/row_count/columns) so a long pipeline's
+        scaffolding doesn't bloat the response.
         """
         flow = self._resolve_flow(flow)
         if not steps:
@@ -647,6 +701,14 @@ class DuckSession:
             _validate_name(name, f"steps[{i}] name")
             guard.assert_read_only(sql, "duckdb")
             parsed.append((sql, name))
+
+        # A step is terminal when no later step references its name → it's a deliverable, not
+        # scaffolding, so it earns a sample. Refs are a static parse of each step's SQL.
+        step_refs = [self._referenced_names(sql, flow) for sql, _ in parsed]
+        terminal = [
+            not any(name in step_refs[j] for j in range(i + 1, len(parsed)))
+            for i, (_, name) in enumerate(parsed)
+        ]
 
         self._single_query_streak = 0
         results: list[dict] = []
@@ -672,8 +734,9 @@ class DuckSession:
             }
             if "hints" in full:
                 entry["hints"] = full["hints"]
-            if i == len(parsed) - 1:
+            if terminal[i]:
                 entry["sample"] = full["sample"]
+                entry["complete"] = full["complete"]
             completed += 1
             results.append(entry)
         out = {
@@ -696,16 +759,18 @@ class DuckSession:
             with self._friendly_catalog_errors(flow):
                 self._con.execute(f'CREATE OR REPLACE TABLE "{flow}"."{name}" AS {sql}')
             elapsed = time.perf_counter() - t0
-            row_count = self._con.execute(f'SELECT COUNT(*) FROM "{flow}"."{name}"').fetchone()[0]
+            row_count = int(self._con.execute(f'SELECT COUNT(*) FROM "{flow}"."{name}"').fetchone()[0])
             columns = self._columns_of(flow, name)
-            sample = self._head_sample(flow, name)
+            n = row_count if _full_sample_fits(row_count, len(columns)) else _SAMPLE_ROWS
+            sample = self._head_sample(flow, name, n)
             self._record_lineage(flow, name, sql, "query")
         out = {
             "name": name,
             "flow": flow,
-            "row_count": int(row_count),
+            "row_count": row_count,
             "columns": columns,
             "sample": sample,
+            "complete": len(sample) == row_count,
             "elapsed_s": round(elapsed, 3),
         }
         hints = self._query_hints(sql, int(row_count))

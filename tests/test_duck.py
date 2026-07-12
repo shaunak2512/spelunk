@@ -75,6 +75,33 @@ class TestQuery:
         r = session.query("SELECT * FROM orders", "o")
         assert "hints" not in r
 
+    def test_small_result_returns_all_rows_complete(self, session):
+        # 20 rows > 5-row head, but small on both axes -> whole result comes back, complete=True.
+        r = session.query("SELECT i AS x FROM range(20) t(i)", "small")
+        assert r["row_count"] == 20
+        assert len(r["sample"]) == 20
+        assert r["complete"] is True
+        assert r["sample"][0] == [0] and r["sample"][-1] == [19]
+
+    def test_large_result_falls_back_to_head(self, session):
+        # Over the row cap -> 5-row head, complete=False signals there's more.
+        r = session.query("SELECT i AS x FROM range(60) t(i)", "big")
+        assert r["row_count"] == 60
+        assert len(r["sample"]) == 5
+        assert r["complete"] is False
+
+    def test_wide_result_over_cell_cap_falls_back(self, session):
+        # 40 rows (<= row cap) but 30 cols -> 1200 cells > cell cap, so a head, not full rows.
+        cols = ", ".join(f"i AS c{k}" for k in range(30))
+        r = session.query(f"SELECT {cols} FROM range(40) t(i)", "wide")
+        assert r["row_count"] == 40
+        assert len(r["sample"]) == 5
+        assert r["complete"] is False
+
+    def test_tiny_result_is_complete(self, session):
+        r = session.query("SELECT 1 AS a", "one")
+        assert r["complete"] is True
+
 
 class TestQuerySteps:
     def test_dependent_steps_run_in_order(self, session):
@@ -88,9 +115,48 @@ class TestQuerySteps:
         assert r["step_count"] == 3 and r["completed"] == 3
         assert [s["status"] for s in r["steps"]] == ["ok", "ok", "ok"]
         assert [s["row_count"] for s in r["steps"]] == [3, 2, 1]
-        # Compact intermediates: only the final step carries a sample.
+        # Compact intermediates: consumed steps carry no sample; the terminal step does.
         assert "sample" not in r["steps"][0] and "sample" not in r["steps"][1]
         assert r["steps"][2]["sample"] == [[2]]
+        assert r["steps"][2]["complete"] is True
+
+    def test_disconnected_batch_samples_every_step(self, session):
+        # Independent queries — each is terminal, so each small one returns full rows.
+        r = session.query_steps(
+            [
+                {"sql": "SELECT i AS x FROM range(3) t(i)", "name": "a"},
+                {"sql": "SELECT i AS y FROM range(4) t(i)", "name": "b"},
+                {"sql": "SELECT i AS z FROM range(5) t(i)", "name": "c"},
+            ]
+        )
+        assert all(s["complete"] is True for s in r["steps"])
+        assert [len(s["sample"]) for s in r["steps"]] == [3, 4, 5]
+
+    def test_mixed_batch_samples_only_terminals(self, session):
+        # base -> mid (a chain), plus an independent `solo`. Terminals: mid and solo.
+        r = session.query_steps(
+            [
+                {"sql": "SELECT i AS x FROM range(10) t(i)", "name": "base"},
+                {"sql": "SELECT x FROM base WHERE x > 5", "name": "mid"},
+                {"sql": "SELECT 42 AS answer", "name": "solo"},
+            ]
+        )
+        steps = {s["name"]: s for s in r["steps"]}
+        assert "sample" not in steps["base"]  # consumed by mid
+        assert steps["mid"]["complete"] is True and len(steps["mid"]["sample"]) == 4
+        assert steps["solo"]["complete"] is True and steps["solo"]["sample"] == [[42]]
+
+    def test_final_step_full_sample_when_small(self, session):
+        r = session.query_steps(
+            [
+                {"sql": "SELECT i AS x FROM range(60) t(i)", "name": "wide"},
+                {"sql": "SELECT x FROM wide WHERE x < 20", "name": "narrow"},
+            ]
+        )
+        # Final step is small -> every row returned with complete=True.
+        assert r["steps"][-1]["row_count"] == 20
+        assert len(r["steps"][-1]["sample"]) == 20
+        assert r["steps"][-1]["complete"] is True
 
     def test_steps_record_lineage_like_sequential_calls(self, session):
         session.query_steps(
