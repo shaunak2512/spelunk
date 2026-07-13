@@ -21,3 +21,5 @@ market_position*.md
 .mcp*
 experiments/
 scripts/
+briefs/
+data/
