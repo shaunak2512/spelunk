@@ -1,3 +1,4 @@
 """Spelunk — a vendor-agnostic database exploration harness."""
 
-__version__ = "0.0.1"
+# Keep in sync with `version` in pyproject.toml — tests/test_version.py enforces it.
+__version__ = "0.1.0"

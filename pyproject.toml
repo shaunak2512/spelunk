@@ -43,6 +43,10 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["spelunk"]
 
+# CLAUDE.md is agent guidance for working *on* Spelunk — useful in a clone, noise in a release.
+[tool.hatch.build.targets.sdist]
+exclude = ["CLAUDE.md"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"

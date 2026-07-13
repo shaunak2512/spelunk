@@ -24,6 +24,7 @@ from pathlib import Path
 from fastmcp import FastMCP
 from pydantic import BaseModel, Field
 
+from spelunk import __version__
 from spelunk.core.duck import DuckSession
 
 
@@ -171,6 +172,7 @@ def build_server(
 
     mcp = FastMCP(
         "spelunk",
+        version=__version__,
         instructions=(
             "Spelunk is a single DuckDB engine over all your data sources. Files (CSV/Parquet/"
             "JSON/Excel) and attached databases (SQLite/PostgreSQL/MySQL) live in one DuckDB "
