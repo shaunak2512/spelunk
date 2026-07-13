@@ -2,10 +2,20 @@ name: Publish to PyPI
 
 # Publishes on a version tag (e.g. `git tag v0.1.0 && git push --tags`).
 # Uses PyPI Trusted Publishing (OIDC) — no API token stored in the repo.
-# One-time setup on PyPI: for the `spelunk-mcp` project, Settings -> Publishing
-# -> add a GitHub publisher for repo shaunak2512/spelunk, workflow `publish.yml`,
-# environment `pypi`. (New project? Use PyPI's "pending publisher" form with the
-# same values so the first tagged release can create it.)
+#
+# One-time setup, BOTH halves required:
+#
+# 1. On PyPI — for the `spelunk-mcp` project, Settings -> Publishing -> add a GitHub
+#    publisher for repo shaunak2512/spelunk, workflow `publish.yml`, environment `pypi`.
+#    (New project? Use PyPI's "pending publisher" form with the same values so the first
+#    tagged release can create it.)
+#
+# 2. On GitHub — Settings -> Environments -> `pypi` must exist AND its deployment branch
+#    policy must admit the tag. A `pypi` environment restricted to `main` alone rejects this
+#    workflow ("Tag v0.1.0 is not allowed to deploy to pypi due to environment protection
+#    rules") because a tag push runs from the tag ref, not a branch — the build job succeeds
+#    and the publish job never starts. Add a deployment policy of type *tag* matching `v*`.
+#    That rejection happens before any upload, so a blocked tag is safe to retry.
 
 on:
   push:
