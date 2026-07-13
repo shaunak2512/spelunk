@@ -1424,8 +1424,8 @@ wheels = [
 ]
 
 [[package]]
-name = "spelunk"
-version = "0.0.1"
+name = "spelunk-mcp"
+version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "duckdb" },
