@@ -10,7 +10,9 @@ name: Publish to PyPI
 on:
   push:
     tags: ["v*"]
-  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -18,9 +20,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
+
+      # A tag that disagrees with pyproject.toml would publish a version nobody asked for (or
+      # collide with one already on PyPI, which is unfixable — PyPI forbids re-uploads).
+      - name: Verify tag matches the package version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(python3 -c 'import tomllib, pathlib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')"
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::tag v$tag does not match pyproject.toml version $pkg"
+            exit 1
+          fi
 
       - name: Build
         run: uv build
@@ -47,4 +62,6 @@ jobs:
           path: dist
 
       - name: Publish
-        uses: pypa/gh-action-pypi-publish@release/v1
+        # Pinned to a SHA, not the mutable release/v1 tag — this step holds the OIDC token that
+        # can publish to PyPI, so it's the one action worth freezing. Bump deliberately.
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b  # release/v1

@@ -42,11 +42,16 @@ _tool_logger.propagate = False
 
 # Args worth recording verbatim (SQL kept full — that's the point of the log); long head samples
 # and row payloads are summarised, never dumped. `steps` is a batch of {sql, name} — full SQL kept.
-_LOGGED_ARGS = ("sql", "name", "flow", "target", "format", "path", "spec", "steps")
+_LOGGED_ARGS = (
+    "sql", "name", "flow", "target", "format", "path", "spec", "steps", "into", "dry_run",
+)
 _LOGGED_RESULT_FIELDS = (
     "name", "flow", "row_count", "format", "path", "dropped_results", "kind",
     "step_count", "completed", "failed_step",
+    "root", "source_flow", "target_flow", "dry_run",  # lineage / replay
 )
+# lineage/replay result lists carry the full SQL of every node — log their size, not their body.
+_COUNTED_RESULT_FIELDS = ("columns", "nodes", "edges", "order", "missing", "rebuilt", "plan")
 
 # add_source accepts DSNs that can embed credentials (postgresql://user:pw@host/db); strip the
 # userinfo (user:pass@) before the spec is written to the on-disk tool-call log.
@@ -98,9 +103,10 @@ def _summarize_result(result: object) -> dict:
     if not isinstance(result, dict):
         return {"type": type(result).__name__}
     summary = {k: result[k] for k in _LOGGED_RESULT_FIELDS if k in result}
-    cols = result.get("columns")
-    if isinstance(cols, (list, dict)):
-        summary["column_count"] = len(cols)
+    for key in _COUNTED_RESULT_FIELDS:
+        val = result.get(key)
+        if isinstance(val, (list, dict)):
+            summary["column_count" if key == "columns" else f"{key}_count"] = len(val)
     return summary
 
 

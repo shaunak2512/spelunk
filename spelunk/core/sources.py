@@ -205,21 +205,35 @@ def _attach_target(kind: SourceKind, locator: str) -> str:
 
     url = urlsplit(locator)
     db_key = "database" if kind == "mysql" else "dbname"
-    database = url.path[1:] if url.path.startswith("/") else url.path
+    # Percent-decoded like the other fields — urlsplit leaves the path encoded.
+    database = unquote(url.path[1:] if url.path.startswith("/") else url.path)
     fields: list[str] = []
     if url.hostname:
-        fields.append(f"host={url.hostname}")
+        fields.append(f"host={_conn_value(url.hostname)}")
     if url.port:
         fields.append(f"port={url.port}")
     if url.username:
-        fields.append(f"user={unquote(url.username)}")
+        fields.append(f"user={_conn_value(unquote(url.username))}")
     if url.password:
-        fields.append(f"password={unquote(url.password)}")
+        fields.append(f"password={_conn_value(unquote(url.password))}")
     if database:
-        fields.append(f"{db_key}={database}")
+        fields.append(f"{db_key}={_conn_value(database)}")
     for key, val in parse_qsl(url.query):
-        fields.append(f"{key}={val}")
+        fields.append(f"{key}={_conn_value(val)}")
     return " ".join(fields).replace("'", "''")
+
+
+def _conn_value(val: str) -> str:
+    """Quote one value of a ``key=value`` connection string (libpq rules).
+
+    A space in a value would otherwise end the field and turn the rest into bogus keys
+    (``password=hunter 2`` -> a ``2`` key), so anything holding whitespace, a quote or a
+    backslash is single-quoted with those escaped. Plain values pass through unwrapped.
+    """
+    if val and not any(ch.isspace() or ch in "'\\" for ch in val):
+        return val
+    escaped = val.replace("\\", "\\\\").replace("'", "\\'")
+    return f"'{escaped}'"
 
 
 def _derive_name(locator: str, kind: SourceKind) -> str:
