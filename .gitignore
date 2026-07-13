@@ -16,5 +16,8 @@ build/
 sample_data/
 potential_extensions.md
 .spelunk_session/
+node_modules/
 market_position*.md
 .mcp*
+experiments/
+scripts/

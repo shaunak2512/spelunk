@@ -12,10 +12,9 @@ Postgres table to a result you built two steps ago — all in DuckDB SQL.
 
 | Path | Role |
 |---|---|
-| `spelunk/core/duck.py` | `DuckSession` — the one DuckDB connection: query / profile / export / catalog / drop + introspection. |
-| `spelunk/core/sources.py` | Source registry — maps a spec to a DuckDB attach/scan; SQLAlchemy fallback for SQL Server. |
+| `spelunk/core/duck.py` | `DuckSession` — the one DuckDB connection: query / profile / export / catalog / drop / lineage / replay + introspection. |
+| `spelunk/core/sources.py` | Source registry — maps a spec to a DuckDB attach/scan. DuckDB-only: a source it can't attach (e.g. SQL Server) is rejected. |
 | `spelunk/core/guard.py` | sqlglot AST safety: read-only enforcement (`assert_read_only`). |
-| `spelunk/core/connection.py`, `query.py`, `introspect.py` | Retained SQLAlchemy path, used only by the SQL Server / exotic `import_remote` fallback. |
 | `spelunk/mcp/server.py` | Thin FastMCP wrapper over `DuckSession`. |
 | `tests` | Acceptance tests. |
 
@@ -29,29 +28,53 @@ profile(sql, flow?)         # per-column stats (null_rate, min/max/mean/std, per
 export(target, fmt, path)   # write a saved result name OR a full SELECT to csv/json/parquet
 catalog(flow?)              # list flows, or the results in one flow
 drop(name?, flow?)          # drop one result, or a whole flow
-import_remote(sql, name)    # (only with a SQL Server source) pull a SELECT into the workspace
+lineage(name?, flow?)       # provenance DAG: the SQL + deps that built a result (or a whole flow)
+replay(flow?, into?)        # rebuild a flow from its recorded SQL, in dependency order
 ```
 
 Discovery resources: `db://tables` (queryable source objects) and `db://{table}` (columns, PK,
 sample, row count). A **flow** is an isolated result namespace (a DuckDB schema); give each
 concurrent line of analysis its own flow.
 
-## Run it
+## Install & run
+
+The fastest path is [`uvx`](https://docs.astral.sh/uv/) — no clone, no venv. It fetches Spelunk
+into an ephemeral environment and runs the `spelunk` command. The package is published as
+`spelunk-mcp` (the command is `spelunk`), so pass it via `--from`:
 
 ```bash
-python -m spelunk.mcp.server \
+uvx --from spelunk-mcp spelunk \
   --source sales=./data/sales.parquet \
   --source sqlite:///path/to/app.db \
   --session-dir .spelunk_session          # omit for an ephemeral (non-durable) workspace
 ```
 
+Want the latest commit instead of the released version? Point `uvx` straight at the repo:
+
+```bash
+uvx --from git+https://github.com/shaunak2512/spelunk spelunk --source sales=./data/sales.parquet
+```
+
+Either way, wire it into Claude Code with a `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "spelunk": {
+      "command": "uvx",
+      "args": ["--from", "spelunk-mcp", "spelunk", "--source", "sales=./data/sales.parquet"]
+    }
+  }
+}
+```
+
+Prefer a local checkout? `python -m spelunk.mcp.server --source ...` is equivalent to the `spelunk`
+command.
+
 Sources auto-detect by extension/scheme; prefix with `name=` to set the catalog/view name.
 Optional resource guards: `--memory-limit 4GB`, `--temp-dir <dir>`, `--max-temp-size 50GB`.
 DuckDB is out-of-core, so a source larger than RAM is the normal case — scans read on demand and
 buffering operators spill to the temp directory.
-
-A `.mcp.json` in the repo root wires Claude Code to a local source (edit the paths for your
-machine before use).
 
 ## Dev
 

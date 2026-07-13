@@ -22,8 +22,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from fastmcp import FastMCP
+from pydantic import BaseModel, Field
 
 from spelunk.core.duck import DuckSession
+
+
+class QueryStep(BaseModel):
+    """One step of a batch `query` call: a SELECT and the result name it materializes as."""
+
+    sql: str = Field(description="Read-only DuckDB SELECT; may reference earlier steps' names.")
+    name: str = Field(description="Result table name this step materializes as (SQL identifier).")
 
 # One JSON line per tool call lands here so agent usage can be analysed offline. Handlers are
 # (re)attached by _configure_tool_logging; until then a NullHandler keeps library/test use silent.
@@ -33,9 +41,17 @@ _tool_logger.setLevel(logging.INFO)
 _tool_logger.propagate = False
 
 # Args worth recording verbatim (SQL kept full — that's the point of the log); long head samples
-# and row payloads are summarised, never dumped.
-_LOGGED_ARGS = ("sql", "name", "flow", "target", "format", "path", "spec")
-_LOGGED_RESULT_FIELDS = ("name", "flow", "row_count", "format", "path", "dropped_results", "kind")
+# and row payloads are summarised, never dumped. `steps` is a batch of {sql, name} — full SQL kept.
+_LOGGED_ARGS = (
+    "sql", "name", "flow", "target", "format", "path", "spec", "steps", "into", "dry_run",
+)
+_LOGGED_RESULT_FIELDS = (
+    "name", "flow", "row_count", "format", "path", "dropped_results", "kind",
+    "step_count", "completed", "failed_step",
+    "root", "source_flow", "target_flow", "dry_run",  # lineage / replay
+)
+# lineage/replay result lists carry the full SQL of every node — log their size, not their body.
+_COUNTED_RESULT_FIELDS = ("columns", "nodes", "edges", "order", "missing", "rebuilt", "plan")
 
 # add_source accepts DSNs that can embed credentials (postgresql://user:pw@host/db); strip the
 # userinfo (user:pass@) before the spec is written to the on-disk tool-call log.
@@ -46,6 +62,15 @@ def _redact(value: object) -> object:
     """Mask userinfo (user:pass@) in DSN-like strings so credentials never reach the log."""
     if isinstance(value, str):
         return _DSN_CREDENTIALS_RE.sub("//***@", value)
+    return value
+
+
+def _log_arg(key: str, value: object) -> object:
+    """Make one logged argument JSON-safe: redact DSN specs, unwrap pydantic step models."""
+    if key == "spec":
+        return _redact(value)
+    if key == "steps" and isinstance(value, list):
+        return [s.model_dump() if isinstance(s, BaseModel) else s for s in value]
     return value
 
 
@@ -78,9 +103,10 @@ def _summarize_result(result: object) -> dict:
     if not isinstance(result, dict):
         return {"type": type(result).__name__}
     summary = {k: result[k] for k in _LOGGED_RESULT_FIELDS if k in result}
-    cols = result.get("columns")
-    if isinstance(cols, (list, dict)):
-        summary["column_count"] = len(cols)
+    for key in _COUNTED_RESULT_FIELDS:
+        val = result.get(key)
+        if isinstance(val, (list, dict)):
+            summary["column_count" if key == "columns" else f"{key}_count"] = len(val)
     return summary
 
 
@@ -103,9 +129,7 @@ def _logged(fn):
             "ts": datetime.now(timezone.utc).isoformat(),
             "tool": tool_name,
             "args": {
-                k: (_redact(v) if k == "spec" else v)
-                for k, v in bound.arguments.items()
-                if k in _LOGGED_ARGS
+                k: _log_arg(k, v) for k, v in bound.arguments.items() if k in _LOGGED_ARGS
             },
         }
         start = time.perf_counter()
@@ -131,25 +155,19 @@ def build_server(
 ) -> FastMCP:
     """Build a FastMCP instance wired to an open :class:`DuckSession`.
 
-    Registers the ``db://`` discovery resources and five tools — ``query``, ``profile``,
-    ``export``, ``catalog``, ``drop`` — plus ``import_remote`` when a SQLAlchemy-only source
-    (e.g. SQL Server) is configured.
+    Registers the ``db://`` discovery resources and the ``query`` / ``profile`` / ``export`` /
+    ``catalog`` / ``drop`` / ``lineage`` / ``replay`` tools.
 
     ``tool_log`` controls per-call logging: a file path writes JSON lines there, ``"-"`` writes
     them to stderr, and ``None`` (the default) is silent.
 
     ``allow_add_source`` (off by default) additionally registers ``add_source`` / ``remove_source``
     so the agent can attach and detach files and databases at runtime. This lets the agent reach
-    any file/DB the host process can — only enable it for a trusted, process-per-agent setup. It
-    also registers ``import_remote`` unconditionally, since a SQL Server source can now appear after
-    startup.
+    any file/DB the host process can — only enable it for a trusted, process-per-agent setup.
     """
     _configure_tool_logging(tool_log)
 
     source_list = ", ".join(f"{s.name} ({s.kind})" for s in session.sources) or "(none configured)"
-    has_fallback = bool(session.fallback_sources)
-    # A fallback source can be added at runtime once add_source is enabled, so register the puller.
-    register_import_remote = has_fallback or allow_add_source
 
     mcp = FastMCP(
         "spelunk",
@@ -160,34 +178,39 @@ def build_server(
             f"them. All SQL is DuckDB SQL. Configured sources: {source_list}.\n\n"
             "## Discover\n"
             "- `db://tables` — JSON array of queryable source objects. Attached-database tables "
-            "are named `<source>.<table>` (paste-ready); file sources appear as a bare view name.\n"
+            "are named `<source>.<table>`, or `<source>.<schema>.<table>` when in a non-default "
+            "schema (paste-ready either way); file sources appear as a bare view name.\n"
             "- `db://{table}` — describe one object: columns, types, primary key, a sample, and "
             "a row count. Read this before writing SQL.\n\n"
             "## Query and build\n"
             "- `query(sql, name, flow?)` — run a read-only SELECT over sources AND saved results, "
             "and store the FULL result as table `name` in the flow (no row cap). Returns the "
-            "result's columns, true row_count, and a head sample. This is the ONE tool for both "
+            "result's columns, true row_count, and a sample — a 5-row head, or EVERY row (with "
+            "`complete: true`) when the result is small — so you read a small deliverable without "
+            "paging. This is the ONE tool for both "
             "looking and building: every result is named and immediately reusable — reference it "
             "by `name` in your next query. `name` is required; reuse a scratch name (e.g. `tmp`) "
             "for throwaways, or `drop` them. Reference attached DB tables as \"<source>\".\"<table>\", "
             "files and prior results by bare name.\n"
+            "- `query(steps=[{sql, name}, ...], flow?)` — the SAME tool in batch mode: an ordered "
+            "list of queries executed in one call. Steps may be a dependent chain (later steps "
+            "reference earlier steps' names), a bundle of unrelated queries, or a mix — batch "
+            "whenever you want more than one result in one round trip, not just for pipelines. "
+            "ALWAYS batch instead of firing sequential single calls. Fail-fast: completed steps "
+            "stay materialized (with lineage), the failing step reports its error, the rest are "
+            "skipped. Every terminal step (one no later step references — the last, plus any "
+            "independent query) returns a sample (full rows when small, else a head); "
+            "intermediate steps consumed downstream stay compact (row_count + columns).\n"
             "- `profile(sql, flow?)` — per-column stats (null_rate, min/max/mean/std, "
             "p25/p50/p75/p95 for numerics; unique/top/freq for text) over the full result. Use "
             "this instead of writing manual aggregation queries.\n"
             "- `export(target, format, path, flow?)` — write a saved result name OR a full SELECT "
             "to csv/json/parquet (no row cap).\n"
             + (
-                "- `import_remote(sql, name, flow?)` — a SQL Server / SQLAlchemy-only source can't "
-                "be attached, so pull a SELECT from it into the flow as table `name`, then query "
-                "that table normally.\n"
-                if has_fallback
-                else ""
-            )
-            + (
                 "\n## Manage sources\n"
                 "- `add_source(spec)` — attach a new data source at runtime. `spec` is a file path "
                 "(.csv/.parquet/.json/.xlsx), a SQLite file, or a sqlite:// / postgresql:// / "
-                "mysql:// / mssql:// DSN; prefix with `name=` to set the source name (e.g. "
+                "mysql:// DSN; prefix with `name=` to set the source name (e.g. "
                 "`sales=./sales.parquet`). The source becomes queryable in every flow.\n"
                 "- `remove_source(name)` — detach a source by its name. Affects this session only.\n"
                 if allow_add_source
@@ -201,12 +224,23 @@ def build_server(
             "results in a flow with columns and row counts.\n"
             "- `drop(name, flow?)` — drop one result; `drop(flow=...)` with no name — drop a whole "
             "flow.\n\n"
+            "## Provenance & replay\n"
+            "Every result records the SQL and dependencies that built it, so a flow is a "
+            "reproducible pipeline, not a pile of tables.\n"
+            "- `lineage(name?, flow?)` — see how results were built: `lineage(name)` gives the "
+            "upstream closure that produced one result; `lineage()` gives the whole flow's DAG "
+            "(nodes, edges, and a dependency-first order).\n"
+            "- `replay(flow?, into?, dry_run?)` — rebuild a flow from its recorded SQL in "
+            "dependency order. `replay(flow, into='v2')` rebuilds into a fresh flow "
+            "(non-destructive — e.g. after source files change, then diff old vs new); "
+            "`replay(flow)` refreshes in place; `dry_run=true` shows the plan first.\n\n"
             "## Notes\n"
             "- All queries are read-only SELECTs (CTEs fine); writes/DDL are rejected at the AST "
             "level. The server materializes your SELECT as a table for you — don't write CREATE/"
             "INSERT yourself.\n"
-            "- The head sample is a preview; the full result is the saved table — `profile` or "
-            "query it for the whole set, or `export` it to a file.\n"
+            "- The sample is the whole result when `complete` is true; otherwise it's a 5-row "
+            "preview and the full result is the saved table — `profile` or query it for the whole "
+            "set, or `export` it to a file.\n"
             "- Sources are read on demand (DuckDB pushes filters/projections down); filter or "
             "aggregate before materializing rather than copying a whole large table."
         ),
@@ -225,15 +259,39 @@ def build_server(
     @mcp.tool(
         name="query",
         description=(
-            "Run a read-only DuckDB SELECT over sources and saved results, and store the full "
-            "result (no row cap) as table `name` in the flow for immediate reuse. Returns "
-            "columns, true row_count, and a head sample. `name` is required. Reference attached "
-            "DB tables as \"<source>\".\"<table>\"; files and prior results by bare name. Writes/DDL "
-            "are rejected."
+            "Run read-only DuckDB SELECTs over sources and saved results, storing each full "
+            "result (no row cap) as a named table in the flow for immediate reuse. Two modes: "
+            "single (`sql` + `name`) or batch (`steps=[{sql, name}, ...]`). ALWAYS prefer one "
+            "batch call over sequential single calls: steps run in list order and a later step "
+            "may reference an earlier step's `name` like any saved result. Batch is not only for "
+            "pipelines — the steps can be a dependent chain, a bundle of unrelated queries, or a "
+            "mix; batch whenever you want more than one result in one round trip. Fail-fast — "
+            "completed steps stay materialized, the failing step reports its error, the rest are "
+            "skipped. Every terminal step (one no later step references — the last, plus any "
+            "independent query) returns a sample — every row with `complete: true` when small, "
+            "else a 5-row head; downstream-consumed intermediates return row_count + columns. "
+            "Reference attached DB tables as \"<source>\".\"<table>\"; files and prior results by "
+            "bare name. Writes/DDL are rejected."
         ),
     )
     @_logged
-    def _query(sql: str, name: str, flow: str = "default") -> dict:
+    def _query(
+        sql: str | None = None,
+        name: str | None = None,
+        steps: list[QueryStep] | None = None,
+        flow: str = "default",
+    ) -> dict:
+        if steps is not None:
+            if sql is not None or name is not None:
+                raise ValueError(
+                    "Pass either sql+name (single query) or steps (batch), not both."
+                )
+            return session.query_steps([s.model_dump() for s in steps], flow)
+        if sql is None or name is None:
+            raise ValueError(
+                "A single query needs both sql and name; a batch needs "
+                "steps=[{sql, name}, ...]."
+            )
         return session.query(sql, name, flow)
 
     @mcp.tool(
@@ -281,17 +339,34 @@ def build_server(
     def _drop(name: str | None = None, flow: str = "default") -> dict:
         return session.drop(name, flow)
 
-    if register_import_remote:
-        @mcp.tool(
-            name="import_remote",
-            description=(
-                "Pull a read-only SELECT from a SQL Server / SQLAlchemy-only source (which DuckDB "
-                "cannot attach) into the flow as table `name`, then query it normally. No row cap."
-            ),
-        )
-        @_logged
-        def _import_remote(sql: str, name: str, flow: str = "default") -> dict:
-            return session.import_remote(sql, name, flow)
+    @mcp.tool(
+        name="lineage",
+        description=(
+            "Show how results were built: the SQL and dependency edges behind them. With `name`, "
+            "return the upstream closure that produced that result (the node plus every result it "
+            "transitively depends on, across flows); with no `name`, the whole flow. Returns nodes "
+            "(name, kind, sql, deps, sources, created_at), edges, a dependency-first `order`, and "
+            "`missing` (deps whose lineage is gone). Read-only."
+        ),
+    )
+    @_logged
+    def _lineage(name: str | None = None, flow: str = "default") -> dict:
+        return session.lineage(name, flow)
+
+    @mcp.tool(
+        name="replay",
+        description=(
+            "Rebuild a flow's results from their recorded SQL, in dependency order — re-running "
+            "each `query`. External inputs (sources, cross-flow "
+            "results) must already exist; they are read, not rebuilt. With `into`, rebuild into a "
+            "fresh flow (non-destructive — e.g. re-run the pipeline against updated source files, "
+            "then compare); without it, refresh in place. `dry_run=true` returns the ordered plan "
+            "without executing. Errors on a dependency cycle."
+        ),
+    )
+    @_logged
+    def _replay(flow: str = "default", into: str | None = None, dry_run: bool = False) -> dict:
+        return session.replay(flow, into, dry_run)
 
     if allow_add_source:
         @mcp.tool(
@@ -299,7 +374,7 @@ def build_server(
             description=(
                 "Attach a new data source at runtime, then query it like any configured source. "
                 "`spec` is a file path (.csv/.parquet/.json/.xlsx), a SQLite file, or a sqlite:// / "
-                "postgresql:// / mysql:// / mssql:// DSN; prefix with `name=` to set the source name "
+                "postgresql:// / mysql:// DSN; prefix with `name=` to set the source name "
                 "(e.g. `sales=./sales.parquet`). Returns the source name, kind, and the objects it "
                 "made queryable. The source is visible in every flow of this session."
             ),
@@ -335,7 +410,7 @@ def main() -> None:
         metavar="SPEC",
         help=(
             "A data source, repeatable. A file path (.csv/.parquet/.json/.xlsx), a SQLite file, "
-            "or a sqlite:// / postgresql:// / mysql:// / mssql:// DSN. Prefix with name= to set "
+            "or a sqlite:// / postgresql:// / mysql:// DSN. Prefix with name= to set "
             "the source name, e.g. sales=./sales.parquet."
         ),
     )
@@ -366,7 +441,8 @@ def main() -> None:
         metavar="N",
         help=(
             "On startup, keep the N most recent per-process workspaces under --session-dir and "
-            "reclaim older ones with no live owner. Default: 3. 0 or less keeps everything. "
+            "reclaim older ones with no live owner. Empty workspaces (no results, no logged "
+            "calls) are reclaimed regardless of N. Default: 3. 0 or less keeps everything. "
             "No-op with --shared-workspace."
         ),
     )
@@ -421,7 +497,14 @@ def main() -> None:
         tool_log = "-"  # stderr
 
     server = build_server(session, tool_log=tool_log, allow_add_source=args.allow_add_source)
-    server.run(transport="stdio")
+    try:
+        server.run(transport="stdio")
+    finally:
+        # Clean shutdown (client closed stdin): release the tool-log file handle so the dir is
+        # deletable on Windows, then let the session reclaim its own workspace if this run never
+        # did any work — reconnect churn then leaves no empty <pid>-<rand> dirs behind.
+        _configure_tool_logging(None)
+        session.close(reclaim_if_empty=True)
 
 
 if __name__ == "__main__":

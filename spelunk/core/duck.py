@@ -19,6 +19,7 @@ is always disk-backed; ``memory_limit`` / ``temp_directory`` are set at open.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -27,6 +28,7 @@ import tempfile
 import threading
 import time
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -42,8 +44,22 @@ if TYPE_CHECKING:
 # quoted references without injection risk (this is why callers address results by NAME).
 _NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
 
+# Internal schema (in the workspace catalog) holding lineage metadata — never a flow, never
+# queried by an agent. Kept out of catalog()/drop() by living in _RESERVED_SCHEMAS.
+_META_SCHEMA = "_spelunk_meta"
+
 # Schemas in the workspace catalog that are never flows and must never be dropped.
-_RESERVED_SCHEMAS = frozenset({"main", "information_schema", "pg_catalog", "system", "temp"})
+_RESERVED_SCHEMAS = frozenset(
+    {"main", "information_schema", "pg_catalog", "system", "temp", _META_SCHEMA}
+)
+
+# When listing an ATTACHed database's objects, its own system schemas are catalog metadata,
+# not user data, and are hidden from db://tables. A table in the catalog's *default* schema is
+# addressable bare as "<source>"."<table>"; one in any other schema needs the schema segment too
+# ("<source>"."<schema>"."<table>"), so it is qualified. A kind with no default here (mysql, whose
+# default schema is the database name) always gets the schema segment — 3-part is always valid.
+_ATTACHED_SYSTEM_SCHEMAS = frozenset({"information_schema", "pg_catalog"})
+_ATTACHED_DEFAULT_SCHEMA = {"sqlite": "main", "postgres": "public"}
 
 # DuckDB base type names that mark a column as numeric (for profile stats). Matched against the
 # type name with any parametrisation stripped (e.g. DECIMAL(18,3) -> DECIMAL) — exact, not
@@ -60,9 +76,26 @@ def _is_numeric_type(type_name: str) -> bool:
     return type_name.upper().split("(", 1)[0].strip() in _NUMERIC_TYPES
 
 _SAMPLE_ROWS = 5
+# When a result is small on BOTH axes, query() returns EVERY row as the `sample` (and reports
+# complete=True) instead of a 5-row head — so an agent reads its own small deliverable directly
+# instead of paging it out into junk tables. Bounded on rows AND cells so a wide schema can't blow
+# the token budget: full return requires row_count <= ROW_CAP and row_count*col_count <= CELL_CAP.
+_FULL_SAMPLE_ROW_CAP = 50
+_FULL_SAMPLE_CELL_CAP = 1000
 # A materialized result larger than this, produced by an unfiltered SELECT * over a source,
 # triggers a nudge: you probably wanted a slice, and DuckDB would have pushed the filter down.
 _LARGE_MATERIALIZE = 100_000
+# After this many consecutive single-statement query() calls, nudge once toward query_steps —
+# dependent steps batched into one call cost one round trip instead of N.
+_BATCH_NUDGE_AT = 3
+
+
+def _full_sample_fits(row_count: int, col_count: int) -> bool:
+    """True when a result is small on both axes → return every row as the sample."""
+    return (
+        row_count <= _FULL_SAMPLE_ROW_CAP
+        and row_count * max(col_count, 1) <= _FULL_SAMPLE_CELL_CAP
+    )
 
 
 def _warm_native_imports() -> None:
@@ -130,27 +163,68 @@ _DEFAULT_KEEP_WORKSPACES = 3
 _SWEEP_GRACE_SECONDS = 60
 
 
-def _workspace_is_free(dir_path: str) -> bool:
-    """True if ``dir_path``'s workspace.duckdb is NOT held by a live server.
+# Entries a workspace dir contains before any work happens: the DB file itself, its WAL, and
+# the default spill scratch dir (transient — safe to disregard even if a crash left files in it).
+_WORKSPACE_SCAFFOLD_ENTRIES = frozenset({"workspace.duckdb", "workspace.duckdb.wal", "spill"})
+
+
+def _dir_has_user_artifacts(dir_path: str) -> bool:
+    """True if ``dir_path`` holds anything beyond the workspace scaffold — e.g. a non-empty
+    tool-call log — meaning the run left something worth keeping for postmortems. A 0-byte file
+    (the log a server created but never wrote to) is not an artifact. Conservative: anything
+    unreadable or unexpected (a foreign subdir) counts as an artifact, so the dir is kept."""
+    try:
+        for entry in os.listdir(dir_path):
+            if entry in _WORKSPACE_SCAFFOLD_ENTRIES:
+                continue
+            p = os.path.join(dir_path, entry)
+            try:
+                if os.path.isdir(p) or os.path.getsize(p) > 0:
+                    return True
+            except OSError:
+                return True
+    except OSError:
+        return True
+    return False
+
+
+def _probe_workspace(dir_path: str) -> str | None:
+    """Classify ``dir_path``'s workspace.duckdb: ``None`` (live owner), ``"empty"``, or ``"idle"``.
 
     Probes by opening read-write: a live owner holds the single-writer lock so the connect
-    raises; a crashed/exited owner leaves an unlocked file (its WAL is just replayed) so it opens.
-    Read-write — not read_only — is deliberate: a read_only open of a DB with a pending WAL errors,
-    which would make us mistake a crashed orphan for a live owner and never reclaim it."""
+    raises (→ ``None``, never touch); a crashed/exited owner leaves an unlocked file (its WAL is
+    just replayed) so it opens. Read-write — not read_only — is deliberate: a read_only open of a
+    DB with a pending WAL errors, which would make us mistake a crashed orphan for a live owner
+    and never reclaim it. An opened workspace is ``"empty"`` iff it has no tables outside the
+    reserved schemas (i.e. no user results; file-source views live in ``main``, which is reserved)."""
     try:
         con = duckdb.connect(os.path.join(dir_path, "workspace.duckdb"))
     except Exception:
-        return False
-    con.close()
-    return True
+        return None
+    try:
+        n = con.execute(
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema NOT IN "
+            f"({', '.join('?' * len(_RESERVED_SCHEMAS))})",
+            sorted(_RESERVED_SCHEMAS),
+        ).fetchone()[0]
+    except Exception:
+        n = 1  # can't tell -> assume it holds results (never delete what we can't classify)
+    finally:
+        con.close()
+    return "empty" if n == 0 else "idle"
 
 
 def _reclaim_old_workspaces(parent: str, keep: int, *, exclude: str) -> list[str]:
-    """Delete all but the ``keep`` most-recent per-process workspace subdirs under ``parent``.
+    """Reclaim per-process workspace subdirs under ``parent``. Two tiers:
 
-    Best-effort GC: only removes dirs that have no live owner, are older than the grace window,
-    and are not ``exclude`` (this process's own dir). Never raises — losing a race to a concurrent
-    server just leaves a dir for the next sweep. Returns the dirs actually removed."""
+    * beyond the ``keep`` most-recent subdirs: any dir with no live owner is deleted;
+    * within the keep window: a dir is deleted anyway if it is *empty* — no user results in its
+      DB and no other artifacts (e.g. only a 0-byte tool log). MCP reconnect churn leaves fully
+      formed but worthless workspaces that would otherwise crowd the keep window.
+
+    Best-effort GC: only touches dirs older than the grace window, never ``exclude`` (this
+    process's own dir), never a dir whose owner holds the DuckDB lock. Never raises — losing a
+    race to a concurrent server just leaves a dir for the next sweep. Returns the dirs removed."""
     try:
         dirs = [
             os.path.join(parent, d)
@@ -162,7 +236,7 @@ def _reclaim_old_workspaces(parent: str, keep: int, *, exclude: str) -> list[str
     dirs.sort(key=lambda p: os.path.getmtime(p), reverse=True)  # newest first
     now = time.time()
     removed: list[str] = []
-    for path in dirs[keep:]:  # keep the N newest (this process's fresh dir is among them)
+    for i, path in enumerate(dirs):
         if os.path.abspath(path) == os.path.abspath(exclude):
             continue
         try:
@@ -170,7 +244,13 @@ def _reclaim_old_workspaces(parent: str, keep: int, *, exclude: str) -> list[str
                 continue
         except OSError:
             continue
-        if not _workspace_is_free(path):
+        within_keep = i < keep
+        if within_keep and _dir_has_user_artifacts(path):
+            continue  # in the keep window and visibly non-empty: retained for postmortems
+        status = _probe_workspace(path)
+        if status is None:
+            continue  # live owner holds the lock
+        if within_keep and status != "empty":
             continue
         try:
             shutil.rmtree(path)
@@ -184,8 +264,7 @@ class DuckSession:
     """A single DuckDB connection wrapping sources + the flow workspace.
 
     Construct with :meth:`open`. Thread-safety: a DuckDBPyConnection isn't safe for concurrent
-    use, so every connection touch holds ``_lock``. Remote pulls (``import_remote``) do their
-    slow SQLAlchemy fetch outside the lock.
+    use, so every connection touch holds ``_lock``.
     """
 
     def __init__(
@@ -196,15 +275,41 @@ class DuckSession:
         catalog: str,
         workspace_dir: str,
         tmpdir: "tempfile.TemporaryDirectory | None" = None,
+        per_process: bool = False,
     ) -> None:
         self._con = con
         self.sources = sources
         self._catalog = catalog
         self.workspace_dir = workspace_dir
         self._tmpdir = tmpdir
+        # True when workspace_dir is a durable per-process subdir this session exclusively owns
+        # (safe to self-delete on clean exit if nothing was ever materialized).
+        self._per_process = per_process
         self._lock = threading.Lock()
         self.default_flow = "default"
+        # Consecutive single-statement query() calls — at _BATCH_NUDGE_AT the response nudges
+        # the agent toward query_steps (one call per pipeline, not one per step).
+        self._single_query_streak = 0
         self._con.execute(f'CREATE SCHEMA IF NOT EXISTS "{self.default_flow}"')
+        self._ensure_meta()
+
+    # ------------------------------------------------------------------ lineage store - #
+    def _ensure_meta(self) -> None:
+        """Create the internal lineage store (idempotent). One row per live result.
+
+        A result is keyed by (flow, name); ``CREATE OR REPLACE`` of a result overwrites its
+        row, so the store always reflects the *current* definition. ``deps`` and ``sources``
+        are JSON arrays; ``seq`` is a monotonic creation counter used as a stable tie-break
+        when ordering independent nodes for replay.
+        """
+        self._con.execute(f'CREATE SCHEMA IF NOT EXISTS "{_META_SCHEMA}"')
+        self._con.execute(
+            f'CREATE TABLE IF NOT EXISTS "{_META_SCHEMA}".lineage ('
+            "flow VARCHAR NOT NULL, name VARCHAR NOT NULL, sql VARCHAR NOT NULL, "
+            "kind VARCHAR NOT NULL, deps VARCHAR NOT NULL, sources VARCHAR NOT NULL, "
+            "created_at VARCHAR NOT NULL, seq BIGINT NOT NULL, "
+            "PRIMARY KEY (flow, name))"
+        )
 
     # ------------------------------------------------------------------ open / close --- #
     @classmethod
@@ -234,7 +339,9 @@ class DuckSession:
 
         In ``per_process`` mode, opening also reclaims stale workspaces: the ``keep_workspaces``
         most recent subdirs survive (including the one just created) and older ones with no live
-        owner are deleted. ``keep_workspaces <= 0`` disables the sweep (keep everything).
+        owner are deleted. *Empty* workspaces — no user results, no artifacts beyond a 0-byte
+        tool log (reconnect churn) — are reclaimed even inside the keep window.
+        ``keep_workspaces <= 0`` disables the sweep (keep everything).
 
         A durable workspace is a single-writer DuckDB file (exclusive lock). If it's already
         held by another server instance — e.g. a second editor window on the same project — we
@@ -287,30 +394,48 @@ class DuckSession:
         if pp_parent is not None and keep_workspaces > 0:
             _reclaim_old_workspaces(pp_parent, keep_workspaces, exclude=base)
 
-        return cls(con, attached, catalog=catalog, workspace_dir=base, tmpdir=tmpdir)
+        return cls(
+            con,
+            attached,
+            catalog=catalog,
+            workspace_dir=base,
+            tmpdir=tmpdir,
+            per_process=pp_parent is not None,
+        )
 
-    def close(self) -> None:
+    def close(self, *, reclaim_if_empty: bool = False) -> None:
+        """Close the connection (and delete an ephemeral temp workspace).
+
+        ``reclaim_if_empty=True`` additionally deletes a durable *per-process* workspace dir on
+        the way out when it holds no user results and no other artifacts — a server that started
+        but never did any work (MCP reconnect churn) then leaves nothing behind. Clean-shutdown
+        complement to the startup sweep, which handles crash debris. No-op for shared or
+        ephemeral workspaces. NOTE: any open handle into the dir (e.g. a tool-log FileHandler)
+        blocks deletion on Windows — release those before calling."""
+        reclaim = False
+        if reclaim_if_empty and self._per_process and self._tmpdir is None:
+            with self._lock:
+                reclaim = not self._existing_results()
         with self._lock:
             self._con.close()
         if self._tmpdir is not None:
             self._tmpdir.cleanup()
-
-    @property
-    def fallback_sources(self) -> list["Source"]:
-        """Sources reachable only via SQLAlchemy (SQL Server / exotic) — for import_remote."""
-        return [s for s in self.sources if s.kind == "fallback"]
+        if reclaim and not _dir_has_user_artifacts(self.workspace_dir):
+            try:
+                shutil.rmtree(self.workspace_dir)
+            except OSError:
+                pass  # e.g. a still-open log handle; the next startup sweep will get it
 
     # ------------------------------------------------------------------ sources ------- #
     def add_source(self, spec: str) -> dict:
         """Attach a new data source at runtime (the same ``spec`` grammar as ``--source``).
 
-        Builds the source (a ``fallback`` spec opens its SQLAlchemy engine here, off the lock),
-        rejects a name that collides with an existing source or the workspace catalog, then runs
-        its setup SQL and registers it. The source becomes queryable in *every* flow of this
-        session — sources are connection-global, not flow-scoped. Returns the source's name,
-        kind, and the objects it made queryable.
+        Builds the source, rejects a name that collides with an existing source or the workspace
+        catalog, then runs its setup SQL and registers it. The source becomes queryable in *every*
+        flow of this session — sources are connection-global, not flow-scoped. Returns the source's
+        name, kind, and the objects it made queryable.
         """
-        src = sources_mod.build_source(spec)  # off-lock: fallback specs connect here
+        src = sources_mod.build_source(spec)
         with self._lock:
             # Check-and-register under one lock: two concurrent add_source calls with the same
             # name must not both pass the uniqueness test (worker threads run tools concurrently).
@@ -330,9 +455,9 @@ class DuckSession:
     def remove_source(self, name: str) -> dict:
         """Detach a source added at runtime or configured at startup; idempotent on the SQL.
 
-        Runs the source's teardown (``DETACH`` / ``DROP VIEW``), disposes a fallback engine,
-        and forgets it. Affects this session's connection only — under the process-per-agent
-        model that's the agent's own isolated workspace. Raises if no such source exists.
+        Runs the source's teardown (``DETACH`` / ``DROP VIEW``) and forgets it. Affects this
+        session's connection only — under the process-per-agent model that's the agent's own
+        isolated workspace. Raises if no such source exists.
         """
         with self._lock:
             # Look up and remove under one lock so a concurrent add/remove can't leave a stale
@@ -344,14 +469,163 @@ class DuckSession:
             for stmt in sources_mod.teardown_sql(src):
                 self._con.execute(stmt)
             self.sources.remove(src)
-        if src.engine is not None:
-            src.engine.dispose()
         return {"name": src.name, "kind": src.kind, "removed": True}
 
     # ------------------------------------------------------------------ internals ----- #
+    def _resolve_flow(self, flow: str | None) -> str:
+        """Default, validate, and reject reserved names — for every flow-scoped write path."""
+        flow = flow or self.default_flow
+        _validate_name(flow, "flow name")
+        if flow in _RESERVED_SCHEMAS:
+            raise ValueError(f"{flow!r} is a reserved schema name; choose another flow name.")
+        return flow
+
     def _set_search_path(self, flow: str) -> None:
         """Resolve bare names against the flow first, then `main` (file-source views)."""
         self._con.execute(f"SET search_path = '{flow},main'")
+
+    def _existing_results(self) -> set[tuple[str, str]]:
+        """All (flow, name) result tables in the workspace catalog (caller holds ``_lock``).
+
+        Used to classify a parsed table reference as a *result dependency* vs an external
+        source leaf: a ref is a dependency iff it names a table that actually exists here.
+        """
+        rows = self._con.execute(
+            "SELECT table_schema, table_name FROM information_schema.tables "
+            "WHERE table_catalog = ? AND table_schema NOT IN "
+            f"({', '.join('?' * len(_RESERVED_SCHEMAS))})",
+            [self._catalog, *sorted(_RESERVED_SCHEMAS)],
+        ).fetchall()
+        return {(s, t) for s, t in rows}
+
+    def _classify_refs(
+        self,
+        sql: str,
+        flow: str,
+        results: set[tuple[str, str]],
+        self_ref: tuple[str, str],
+    ) -> tuple[list[dict[str, str]], list[str]]:
+        """Split a query's table references into result *deps* and external *source* leaves.
+
+        Parses *sql* (best-effort; an unparseable query yields empty lists) and, for each table
+        reference, decides against ``results`` — the live (flow, name) set — whether it is another
+        result (a dependency, resolved the same way DuckDB's search_path does: bare → current
+        flow, ``a.b`` → flow ``a``, ``cat.a.b`` → flow ``a`` only when ``cat`` is the workspace
+        catalog) or an external input (file view / attached-DB table), recorded by its textual
+        form. ``self_ref`` is the (flow, name) being recorded — a reference to it is dropped so a
+        result never depends on itself (e.g. ``CREATE OR REPLACE t AS SELECT ... FROM t``).
+        """
+        import sqlglot
+        from sqlglot import exp
+        from sqlglot.errors import SqlglotError
+
+        try:
+            tree = sqlglot.parse_one(sql, read="duckdb")
+        except SqlglotError:
+            return [], []
+
+        # CTE names defined in this query are internal aliases, not results or external inputs —
+        # a bare ``FROM <cte>`` must not be recorded as a source leaf (they resolve within the SQL).
+        cte_names = {cte.alias_or_name for cte in tree.find_all(exp.CTE)}
+
+        deps: list[dict[str, str]] = []
+        sources: list[str] = []
+        seen_dep: set[tuple[str, str]] = set()
+        seen_src: set[str] = set()
+        for tbl in tree.find_all(exp.Table):
+            tname = tbl.name
+            db = tbl.db  # schema part ('' if absent)
+            catalog = tbl.catalog  # catalog part ('' if absent)
+            if not tname:
+                continue
+            if not db and not catalog and tname in cte_names:
+                continue  # reference to a CTE defined in this same query
+            if catalog and catalog != self._catalog:
+                cand = None  # a foreign catalog (attached DB) — never a workspace result
+            elif db:
+                cand = (db, tname)
+            else:
+                cand = (flow, tname)
+            if cand is not None and cand in results:
+                if cand != self_ref and cand not in seen_dep:
+                    seen_dep.add(cand)
+                    deps.append({"flow": cand[0], "name": cand[1]})
+            else:
+                ref = ".".join(p for p in (catalog, db, tname) if p)
+                if ref not in seen_src:
+                    seen_src.add(ref)
+                    sources.append(ref)
+        return deps, sources
+
+    def _referenced_names(self, sql: str, flow: str) -> set[str]:
+        """Names in *flow* that *sql* references (best-effort parse; unparseable → empty).
+
+        Used to decide terminality inside a batch: a step is terminal when no later step
+        references its name. Resolution mirrors :meth:`_classify_refs` — bare and ``<flow>.name``
+        (or ``<catalog>.<flow>.name``) refs count when they land in ``flow``; foreign-catalog and
+        CTE refs don't. Purely a parse — touches no connection state.
+        """
+        import sqlglot
+        from sqlglot import exp
+        from sqlglot.errors import SqlglotError
+
+        try:
+            tree = sqlglot.parse_one(sql, read="duckdb")
+        except SqlglotError:
+            return set()
+        cte_names = {cte.alias_or_name for cte in tree.find_all(exp.CTE)}
+        refs: set[str] = set()
+        for tbl in tree.find_all(exp.Table):
+            tname = tbl.name
+            if not tname:
+                continue
+            db = tbl.db
+            catalog = tbl.catalog
+            if not db and not catalog and tname in cte_names:
+                continue
+            if catalog and catalog != self._catalog:
+                continue  # foreign catalog (attached DB) — never a workspace result
+            if (db or flow) == flow:
+                refs.add(tname)
+        return refs
+
+    def _record_lineage(self, flow: str, name: str, sql: str, kind: str) -> None:
+        """Upsert the lineage row for a just-materialized result (caller holds ``_lock``).
+
+        Called from ``query`` right after the CREATE, so the result set is already current.
+        Dependencies are computed against every *other* live result.
+        """
+        results = self._existing_results()
+        deps, sources = self._classify_refs(sql, flow, results, (flow, name))
+        seq = self._con.execute(
+            f'SELECT COALESCE(MAX(seq), 0) + 1 FROM "{_META_SCHEMA}".lineage'
+        ).fetchone()[0]
+        self._con.execute(
+            f'DELETE FROM "{_META_SCHEMA}".lineage WHERE flow = ? AND name = ?', [flow, name]
+        )
+        self._con.execute(
+            f'INSERT INTO "{_META_SCHEMA}".lineage '
+            "(flow, name, sql, kind, deps, sources, created_at, seq) VALUES (?,?,?,?,?,?,?,?)",
+            [
+                flow,
+                name,
+                sql,
+                kind,
+                json.dumps(deps),
+                json.dumps(sources),
+                datetime.now(timezone.utc).isoformat(),
+                int(seq),
+            ],
+        )
+
+    def _delete_lineage(self, flow: str, name: str | None) -> None:
+        """Forget lineage for a dropped result (``name`` given) or a whole flow (caller holds lock)."""
+        if name is None:
+            self._con.execute(f'DELETE FROM "{_META_SCHEMA}".lineage WHERE flow = ?', [flow])
+        else:
+            self._con.execute(
+                f'DELETE FROM "{_META_SCHEMA}".lineage WHERE flow = ? AND name = ?', [flow, name]
+            )
 
     def _result_names(self, flow: str) -> list[str]:
         rows = self._con.execute(
@@ -379,13 +653,105 @@ class DuckSession:
         """Run a read-only SELECT over sources + flow results, materialize it as a table.
 
         ``name`` is required and the result is stored as ``"<flow>"."<name>"`` (replacing any
-        prior result of that name). Returns the result's columns, true row_count, a head
-        sample, and any nudges.
+        prior result of that name). Returns the result's columns, true row_count, a sample, a
+        ``complete`` flag, and any nudges. The sample is a 5-row head, but when the result is
+        small on both axes (row_count <= 50 and row_count*columns <= 1000) it is the *whole*
+        result — ``complete`` is True exactly when ``sample`` holds every row, so an agent can
+        read a small deliverable directly instead of paging it out.
         """
-        flow = flow or self.default_flow
-        _validate_name(flow, "flow name")
+        flow = self._resolve_flow(flow)
         _validate_name(name)
         guard.assert_read_only(sql, "duckdb")
+        out = self._materialize_query(sql, name, flow)
+        self._single_query_streak += 1
+        if self._single_query_streak == _BATCH_NUDGE_AT:
+            out.setdefault("hints", []).append(
+                f"That's {_BATCH_NUDGE_AT} single-query calls in a row. Dependent steps can run "
+                "in ONE call: query(steps=[{sql, name}, ...]) executes them in order, and later "
+                "steps reference earlier steps' names — a whole pipeline per round trip."
+            )
+        return out
+
+    def query_steps(self, steps: list[dict], flow: str | None = None) -> dict:
+        """Run an ordered batch of queries in one call — each step materialized like ``query``.
+
+        ``steps`` is a list of ``{"sql": ..., "name": ...}`` items executed in list order in a
+        single flow, so a later step can reference an earlier step's ``name`` (it is a live,
+        lineage-recorded result by then). Semantics are identical to calling :meth:`query` once
+        per step — same guard, same ``CREATE OR REPLACE``, same lineage rows — so ``lineage`` /
+        ``replay`` see no difference. Steps need not form a single pipeline — a batch can be a
+        dependent chain, a bundle of unrelated queries, or a mix; use it whenever you want more
+        than one result in one round trip. All steps are statically validated (name, read-only
+        SQL) before anything runs; execution is fail-fast — the failing step reports its error,
+        earlier steps stay materialized, later steps are skipped. Every *terminal* step (one no
+        later step references — always includes the last, plus any independent query) carries a
+        sample and ``complete`` flag — full rows when the result is small, per :meth:`query`.
+        Non-terminal intermediates stay compact (name/row_count/columns) so a long pipeline's
+        scaffolding doesn't bloat the response.
+        """
+        flow = self._resolve_flow(flow)
+        if not steps:
+            raise ValueError("steps must be a non-empty list of {sql, name} items.")
+        parsed: list[tuple[str, str]] = []
+        for i, step in enumerate(steps):
+            sql = step.get("sql") if isinstance(step, dict) else None
+            name = step.get("name") if isinstance(step, dict) else None
+            if not sql or not name:
+                raise ValueError(f"steps[{i}] must have both 'sql' and 'name'.")
+            _validate_name(name, f"steps[{i}] name")
+            guard.assert_read_only(sql, "duckdb")
+            parsed.append((sql, name))
+
+        # A step is terminal when no later step references its name → it's a deliverable, not
+        # scaffolding, so it earns a sample. Refs are a static parse of each step's SQL.
+        step_refs = [self._referenced_names(sql, flow) for sql, _ in parsed]
+        terminal = [
+            not any(name in step_refs[j] for j in range(i + 1, len(parsed)))
+            for i, (_, name) in enumerate(parsed)
+        ]
+
+        self._single_query_streak = 0
+        results: list[dict] = []
+        completed = 0
+        failed_step: int | None = None
+        t0 = time.perf_counter()
+        for i, (sql, name) in enumerate(parsed):
+            if failed_step is not None:
+                results.append({"name": name, "status": "skipped"})
+                continue
+            try:
+                full = self._materialize_query(sql, name, flow)
+            except Exception as exc:
+                failed_step = i
+                results.append({"name": name, "status": "failed", "error": str(exc)})
+                continue
+            entry = {
+                "name": name,
+                "status": "ok",
+                "row_count": full["row_count"],
+                "columns": full["columns"],
+                "elapsed_s": full["elapsed_s"],
+            }
+            if "hints" in full:
+                entry["hints"] = full["hints"]
+            if terminal[i]:
+                entry["sample"] = full["sample"]
+                entry["complete"] = full["complete"]
+            completed += 1
+            results.append(entry)
+        out = {
+            "flow": flow,
+            "step_count": len(parsed),
+            "completed": completed,
+            "steps": results,
+            "elapsed_s": round(time.perf_counter() - t0, 3),
+        }
+        if failed_step is not None:
+            out["failed_step"] = failed_step
+        return out
+
+    def _materialize_query(self, sql: str, name: str, flow: str) -> dict:
+        """CREATE OR REPLACE the result table + record lineage (caller validated name + SQL)."""
         with self._lock:
             self._con.execute(f'CREATE SCHEMA IF NOT EXISTS "{flow}"')
             self._set_search_path(flow)
@@ -393,15 +759,18 @@ class DuckSession:
             with self._friendly_catalog_errors(flow):
                 self._con.execute(f'CREATE OR REPLACE TABLE "{flow}"."{name}" AS {sql}')
             elapsed = time.perf_counter() - t0
-            row_count = self._con.execute(f'SELECT COUNT(*) FROM "{flow}"."{name}"').fetchone()[0]
+            row_count = int(self._con.execute(f'SELECT COUNT(*) FROM "{flow}"."{name}"').fetchone()[0])
             columns = self._columns_of(flow, name)
-            sample = self._head_sample(flow, name)
+            n = row_count if _full_sample_fits(row_count, len(columns)) else _SAMPLE_ROWS
+            sample = self._head_sample(flow, name, n)
+            self._record_lineage(flow, name, sql, "query")
         out = {
             "name": name,
             "flow": flow,
-            "row_count": int(row_count),
+            "row_count": row_count,
             "columns": columns,
             "sample": sample,
+            "complete": len(sample) == row_count,
             "elapsed_s": round(elapsed, 3),
         }
         hints = self._query_hints(sql, int(row_count))
@@ -440,8 +809,7 @@ class DuckSession:
     # ------------------------------------------------------------------ profile ------- #
     def profile(self, sql: str, flow: str | None = None) -> dict:
         """Per-column stats over the full result of *sql*, computed in DuckDB."""
-        flow = flow or self.default_flow
-        _validate_name(flow, "flow name")
+        flow = self._resolve_flow(flow)
         guard.assert_read_only(sql, "duckdb")
         with self._lock, self._friendly_catalog_errors(flow):
             self._con.execute(f'CREATE SCHEMA IF NOT EXISTS "{flow}"')
@@ -506,8 +874,7 @@ class DuckSession:
         *target* is either a result/table name (e.g. ``joined`` or ``"src"."orders"``) or a
         ``SELECT`` / ``WITH`` query. ``fmt`` is csv, json, or parquet.
         """
-        flow = flow or self.default_flow
-        _validate_name(flow, "flow name")
+        flow = self._resolve_flow(flow)
         fmt = fmt.lower().strip()
         copy_opts = {"parquet": "(FORMAT PARQUET)", "csv": "(FORMAT CSV, HEADER)", "json": "(FORMAT JSON)"}
         if fmt not in copy_opts:
@@ -532,54 +899,6 @@ class DuckSession:
             self._con.execute(f"COPY {source_expr} TO '{safe_path}' {copy_opts[fmt]}")
             row_count = self._con.execute(f"SELECT COUNT(*) FROM {source_expr}").fetchone()[0]
         return {"path": abs_path, "format": fmt, "row_count": int(row_count)}
-
-    # ------------------------------------------------------------------ import_remote - #
-    def import_remote(self, sql: str, name: str, flow: str | None = None) -> dict:
-        """Pull a SELECT from a SQLAlchemy-only source (SQL Server / exotic) into the flow.
-
-        Needed because DuckDB can't ATTACH such sources, so they can't be queried in place.
-        Runs the read-only guard, fetches the full result via the fallback engine, and
-        registers it as ``"<flow>"."<name>"``.
-        """
-        flow = flow or self.default_flow
-        _validate_name(flow, "flow name")
-        _validate_name(name)
-        remotes = [s for s in self.fallback_sources if s.engine is not None]
-        if not remotes:
-            raise ValueError("No fallback (SQLAlchemy) source is configured; nothing to import.")
-        if len(remotes) > 1:
-            names = ", ".join(f'"{s.name}"' for s in remotes)
-            raise ValueError(
-                f"Multiple fallback (SQLAlchemy) sources are configured ({names}); import_remote "
-                "cannot yet disambiguate which one to pull from. Configure a single fallback "
-                "source for this session."
-            )
-
-        from .query import run_sql
-
-        # The slow remote fetch happens outside the lock.
-        result = run_sql(remotes[0].engine, sql, max_rows=None)
-        import pandas as pd
-
-        df = pd.DataFrame(result.rows, columns=result.columns)
-        tmp = f"_import_{uuid4().hex}"
-        with self._lock:
-            self._con.execute(f'CREATE SCHEMA IF NOT EXISTS "{flow}"')
-            self._con.register(tmp, df)
-            try:
-                self._con.execute(f'CREATE OR REPLACE TABLE "{flow}"."{name}" AS SELECT * FROM {tmp}')
-            finally:
-                self._con.unregister(tmp)
-            columns = self._columns_of(flow, name)
-            sample = self._head_sample(flow, name)
-        return {
-            "name": name,
-            "flow": flow,
-            "row_count": result.row_count,
-            "columns": columns,
-            "sample": sample,
-            "elapsed_s": round(result.elapsed_s or 0.0, 3),
-        }
 
     # ------------------------------------------------------------------ catalog / drop  #
     def catalog(self, flow: str | None = None) -> dict:
@@ -610,6 +929,8 @@ class DuckSession:
         """Drop one result (``name`` given) or an entire flow (``name`` omitted)."""
         flow = flow or self.default_flow
         _validate_name(flow, "flow name")
+        if flow in _RESERVED_SCHEMAS:
+            raise ValueError(f"Cannot drop from reserved schema {flow!r}.")
         with self._lock:
             if name is not None:
                 _validate_name(name)
@@ -619,21 +940,210 @@ class DuckSession:
                     [self._catalog, flow, name],
                 ).fetchone()[0] > 0
                 self._con.execute(f'DROP TABLE IF EXISTS "{flow}"."{name}"')
+                self._delete_lineage(flow, name)
                 return {"flow": flow, "name": name, "dropped": bool(existed)}
 
-            if flow in _RESERVED_SCHEMAS:
-                raise ValueError(f"Cannot drop reserved schema {flow!r}.")
             dropped = len(self._result_names(flow))
             self._con.execute(f'DROP SCHEMA IF EXISTS "{flow}" CASCADE')
+            self._delete_lineage(flow, None)
             return {"flow": flow, "dropped_results": dropped}
+
+    # ------------------------------------------------------------------ lineage ------- #
+    def _load_all_lineage(self) -> dict[tuple[str, str], dict[str, Any]]:
+        """Every recorded result across all flows, keyed by (flow, name) (caller holds lock)."""
+        rows = self._con.execute(
+            f'SELECT flow, name, sql, kind, deps, sources, created_at, seq FROM "{_META_SCHEMA}".lineage'
+        ).fetchall()
+        nodes: dict[tuple[str, str], dict[str, Any]] = {}
+        for flow, name, sql, kind, deps, sources, created_at, seq in rows:
+            nodes[(flow, name)] = {
+                "flow": flow,
+                "name": name,
+                "sql": sql,
+                "kind": kind,
+                "deps": json.loads(deps),
+                "sources": json.loads(sources),
+                "created_at": created_at,
+                "seq": seq,
+            }
+        return nodes
+
+    @staticmethod
+    def _ref(flow: str, name: str) -> str:
+        return f"{flow}.{name}"
+
+    def lineage(self, name: str | None = None, flow: str | None = None) -> dict:
+        """Return the provenance graph of results: the SQL and dependency edges that built them.
+
+        With ``name``: the upstream closure that produced that result — the node plus every
+        result it (transitively) depends on, following cross-flow edges. With no ``name``: every
+        result in ``flow``. ``missing`` lists dependency refs with no lineage row (dropped, or an
+        external input). Nodes are ordered so a dependency always precedes its dependents.
+        """
+        flow = self._resolve_flow(flow)
+        with self._lock:
+            allnodes = self._load_all_lineage()
+            if name is not None:
+                _validate_name(name)
+                root = (flow, name)
+                if root not in allnodes:
+                    known = sorted(n for (f, n) in allnodes if f == flow)
+                    raise ValueError(
+                        f"No lineage for result {name!r} in flow {flow!r}. "
+                        f"Flow {flow!r} has recorded results: {known or ['(none)']}."
+                    )
+                selected: dict[tuple[str, str], dict[str, Any]] = {}
+                missing: list[str] = []
+                stack = [root]
+                while stack:
+                    key = stack.pop()
+                    if key in selected:
+                        continue
+                    node = allnodes.get(key)
+                    if node is None:
+                        missing.append(self._ref(*key))
+                        continue
+                    selected[key] = node
+                    for dep in node["deps"]:
+                        stack.append((dep["flow"], dep["name"]))
+            else:
+                selected = {k: v for k, v in allnodes.items() if k[0] == flow}
+                missing = []
+                present = set(selected)
+                for node in selected.values():
+                    for dep in node["deps"]:
+                        dkey = (dep["flow"], dep["name"])
+                        if dkey not in present and dkey not in allnodes:
+                            missing.append(self._ref(*dkey))
+
+        edges = []
+        for key, node in selected.items():
+            for dep in node["deps"]:
+                edges.append({"from": self._ref(dep["flow"], dep["name"]), "to": self._ref(*key)})
+        order = self._topo_order(selected)
+        return {
+            "flow": flow,
+            "root": name,
+            "nodes": [
+                {
+                    "flow": n["flow"],
+                    "name": n["name"],
+                    "kind": n["kind"],
+                    "sql": n["sql"],
+                    "deps": n["deps"],
+                    "sources": n["sources"],
+                    "created_at": n["created_at"],
+                }
+                for n in sorted(selected.values(), key=lambda n: n["seq"])
+            ],
+            "edges": edges,
+            "order": [self._ref(f, nm) for (f, nm) in order],
+            "missing": sorted(set(missing)),
+        }
+
+    @staticmethod
+    def _topo_order(nodes: dict[tuple[str, str], dict[str, Any]]) -> list[tuple[str, str]]:
+        """Kahn topological sort over the sub-DAG induced by ``nodes`` (deps outside are ignored).
+
+        Ties are broken by ``seq`` then name for deterministic output. Raises ``ValueError`` naming
+        the cycle members if the graph is not acyclic.
+        """
+        present = set(nodes)
+        indeg = {k: 0 for k in nodes}
+        adj: dict[tuple[str, str], list[tuple[str, str]]] = {k: [] for k in nodes}
+        for key, node in nodes.items():
+            for dep in node["deps"]:
+                dkey = (dep["flow"], dep["name"])
+                if dkey in present and dkey != key:
+                    adj[dkey].append(key)
+                    indeg[key] += 1
+
+        def rank(k: tuple[str, str]) -> tuple[int, str, str]:
+            return (nodes[k]["seq"], k[0], k[1])
+
+        ready = sorted((k for k in nodes if indeg[k] == 0), key=rank)
+        order: list[tuple[str, str]] = []
+        while ready:
+            key = ready.pop(0)
+            order.append(key)
+            for nxt in adj[key]:
+                indeg[nxt] -= 1
+                if indeg[nxt] == 0:
+                    ready.append(nxt)
+            ready.sort(key=rank)
+        if len(order) != len(nodes):
+            cyclic = sorted(f"{f}.{n}" for (f, n) in nodes if (f, n) not in set(order))
+            raise ValueError(
+                f"Cannot order results — dependency cycle among: {', '.join(cyclic)}. "
+                "A result was redefined to depend on one that depends on it; drop or redefine one."
+            )
+        return order
+
+    # ------------------------------------------------------------------ replay -------- #
+    def replay(self, flow: str | None = None, into: str | None = None, dry_run: bool = False) -> dict:
+        """Rebuild a flow's results from their recorded SQL, in dependency order.
+
+        Re-runs every ``query`` result of ``flow``, ordered so dependencies rebuild first.
+        External inputs (sources, cross-flow results) must already exist — they are read, not
+        rebuilt. With ``into`` the flow is rebuilt into a fresh namespace (non-destructive);
+        without it the flow is refreshed in place. ``dry_run`` returns the plan without executing.
+        Raises on a dependency cycle.
+        """
+        flow = self._resolve_flow(flow)
+        target = self._resolve_flow(into) if into is not None else flow
+        with self._lock:
+            allnodes = self._load_all_lineage()
+            selected = {k: v for k, v in allnodes.items() if k[0] == flow}
+            if not selected:
+                raise ValueError(
+                    f"Flow {flow!r} has no recorded lineage to replay. "
+                    "Only results built by query in this session can be replayed."
+                )
+            order = self._topo_order(selected)
+            plan = [
+                {"name": nm, "kind": selected[(f, nm)]["kind"], "sql": selected[(f, nm)]["sql"]}
+                for (f, nm) in order
+            ]
+            if dry_run:
+                return {
+                    "source_flow": flow,
+                    "target_flow": target,
+                    "dry_run": True,
+                    "order": [nm for (_f, nm) in order],
+                    "plan": plan,
+                }
+
+            if target != flow:
+                self._con.execute(f'CREATE SCHEMA IF NOT EXISTS "{target}"')
+            rebuilt = []
+            for (_f, nm) in order:
+                node = selected[(_f, nm)]
+                self._set_search_path(target)
+                with self._friendly_catalog_errors(target):
+                    self._con.execute(
+                        f'CREATE OR REPLACE TABLE "{target}"."{nm}" AS {node["sql"]}'
+                    )
+                rc = self._con.execute(
+                    f'SELECT COUNT(*) FROM "{target}"."{nm}"'
+                ).fetchone()[0]
+                self._record_lineage(target, nm, node["sql"], "query")
+                rebuilt.append({"name": nm, "kind": node["kind"], "row_count": int(rc)})
+        return {
+            "source_flow": flow,
+            "target_flow": target,
+            "dry_run": False,
+            "order": [nm for (_f, nm) in order],
+            "rebuilt": rebuilt,
+        }
 
     # ------------------------------------------------------------------ introspection - #
     def list_objects(self) -> list[TableInfo]:
         """List the source objects an agent can query: attached-DB tables + file views.
 
-        Attached-DB tables are named ``<source>.<table>`` (paste-ready); file sources appear
-        as their single view name. Row counts are filled for SQLite/file sources (cheap) and
-        left None for remote DBs (a COUNT could be expensive).
+        Attached-DB tables are named ``<source>.<table>`` (or ``<source>.<schema>.<table>`` for a
+        non-default schema — paste-ready either way); file sources appear as their single view
+        name. Row counts are filled for SQLite/file sources (cheap) and left None for remote DBs
+        (a COUNT could be expensive).
         """
         out: list[TableInfo] = []
         with self._lock:
@@ -644,20 +1154,30 @@ class DuckSession:
     def _objects_for_source(self, src: "Source") -> list[TableInfo]:
         """The queryable objects a single source contributes (caller holds ``_lock``).
 
-        A file source is one bare view; an attached database contributes its tables/views as
-        ``<source>.<table>``. Fallback sources aren't queryable in place (import_remote only).
+        A file source is one bare view; an attached database contributes its user tables/views.
+        A table in the catalog's default schema is named ``<source>.<table>``; one in any other
+        schema is named ``<source>.<schema>.<table>`` so it stays addressable (a Postgres/MySQL
+        source often keeps its tables in a non-default schema). The attached DB's own system
+        schemas (information_schema, pg_catalog) are metadata, not data, and are hidden.
         """
         if src.kind == "file":
             return [TableInfo(name=src.name, kind="view", row_count=self._safe_count(src.name))]
         if src.kind in ("sqlite", "postgres", "mysql"):
             rows = self._con.execute(
-                "SELECT table_name, table_type FROM information_schema.tables "
-                "WHERE table_catalog = ? ORDER BY table_name",
+                "SELECT table_schema, table_name, table_type FROM information_schema.tables "
+                "WHERE table_catalog = ? ORDER BY table_schema, table_name",
                 [src.name],
             ).fetchall()
+            default_schema = _ATTACHED_DEFAULT_SCHEMA.get(src.kind)
             objs: list[TableInfo] = []
-            for tname, ttype in rows:
-                qualified = f"{src.name}.{tname}"
+            for schema, tname, ttype in rows:
+                if schema in _ATTACHED_SYSTEM_SCHEMAS:
+                    continue
+                qualified = (
+                    f"{src.name}.{tname}"
+                    if schema == default_schema
+                    else f"{src.name}.{schema}.{tname}"
+                )
                 kind = "view" if "VIEW" in (ttype or "").upper() else "table"
                 rc = self._safe_count(_quote_qualified(qualified)) if src.kind == "sqlite" else None
                 objs.append(TableInfo(name=qualified, kind=kind, row_count=rc))
@@ -667,8 +1187,8 @@ class DuckSession:
     def describe(self, table: str) -> TableDescription:
         """Describe one source object: columns, primary key, a sample, and a row count.
 
-        FKs/indexes are best-effort and usually empty for attached sources (DuckDB exposes less
-        than SQLAlchemy reflection). *table* may be bare (``sales``) or qualified (``db.orders``).
+        FKs/indexes are best-effort and usually empty for attached sources (DuckDB exposes little
+        constraint metadata). *table* may be bare (``sales``) or qualified (``db.orders``).
         """
         ref = _quote_qualified(table)
         with self._lock:

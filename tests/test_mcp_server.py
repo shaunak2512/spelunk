@@ -31,9 +31,9 @@ class TestRegistration:
         names = {t.name for t in _run(mcp_server.list_tools())}
         assert {"query", "profile", "export", "catalog", "drop"} <= names
 
-    def test_no_import_remote_without_fallback(self, mcp_server):
+    def test_no_import_remote_tool(self, mcp_server):
         names = {t.name for t in _run(mcp_server.list_tools())}
-        assert "import_remote" not in names  # no SQL-Server source configured
+        assert "import_remote" not in names  # removed: DuckDB-only, no SQLAlchemy fallback
 
     def test_resources_registered(self, mcp_server):
         uris = [str(r.uri) for r in _run(mcp_server.list_resources())]
@@ -81,6 +81,30 @@ class TestQueryTool:
         with pytest.raises(ToolError, match="not a SELECT"):
             _run(mcp_server.call_tool("query", {"sql": "DELETE FROM orders", "name": "x"}))
 
+    def test_batch_steps_pipeline_in_one_call(self, mcp_server):
+        res = _run(mcp_server.call_tool("query", {"steps": [
+            {"sql": 'SELECT * FROM "shop"."customers"', "name": "base"},
+            {"sql": "SELECT COUNT(*) AS n FROM base", "name": "agg"},
+        ]}))
+        data = res.structured_content
+        assert data["completed"] == 2
+        assert [s["status"] for s in data["steps"]] == ["ok", "ok"]
+        assert data["steps"][1]["sample"] == [[3]]
+        # Batch-built results are ordinary saved results: reusable + lineage-recorded.
+        lin = _run(mcp_server.call_tool("lineage", {"name": "agg"})).structured_content
+        assert {n["name"] for n in lin["nodes"]} == {"base", "agg"}
+
+    def test_sql_and_steps_are_mutually_exclusive(self, mcp_server):
+        from fastmcp.exceptions import ToolError
+
+        with pytest.raises(ToolError, match="not both"):
+            _run(mcp_server.call_tool("query", {
+                "sql": "SELECT 1", "name": "x",
+                "steps": [{"sql": "SELECT 1", "name": "y"}],
+            }))
+        with pytest.raises(ToolError, match="single query needs both"):
+            _run(mcp_server.call_tool("query", {}))
+
 
 class TestOtherTools:
     def test_profile(self, mcp_server):
@@ -102,6 +126,20 @@ class TestOtherTools:
         res = _run(mcp_server.call_tool("export", {"target": "o", "format": "parquet", "path": out})).structured_content
         assert res["row_count"] == 3
 
+    def test_lineage_and_replay_registered(self, mcp_server):
+        names = {t.name for t in _run(mcp_server.list_tools())}
+        assert {"lineage", "replay"} <= names
+
+    def test_lineage_then_replay_roundtrip(self, mcp_server):
+        _run(mcp_server.call_tool("query", {"sql": 'SELECT * FROM "shop"."customers"', "name": "base"}))
+        _run(mcp_server.call_tool("query", {"sql": "SELECT id, name FROM base", "name": "top"}))
+        lin = _run(mcp_server.call_tool("lineage", {"name": "top"})).structured_content
+        assert {n["name"] for n in lin["nodes"]} == {"base", "top"}
+        rep = _run(mcp_server.call_tool("replay", {"into": "copy"})).structured_content
+        assert rep["order"] == ["base", "top"]
+        cat = _run(mcp_server.call_tool("catalog", {"flow": "copy"})).structured_content
+        assert {r["name"] for r in cat["results"]} == {"base", "top"}
+
 
 class TestToolLogging:
     def test_each_call_logs_one_json_line(self, sqlite_file, csv_file, tmp_path):
@@ -121,6 +159,25 @@ class TestToolLogging:
         assert q["args"]["name"] == "o"
         assert q["result"]["row_count"] == 3
         assert isinstance(q["duration_ms"], (int, float))
+
+    def test_batch_call_logs_steps_and_summary(self, sqlite_file, tmp_path):
+        log_path = tmp_path / "tool-calls.jsonl"
+        session = DuckSession.open([f"shop={sqlite_file}"])
+        server = build_server(session, tool_log=str(log_path))
+        try:
+            _run(server.call_tool("query", {"steps": [
+                {"sql": 'SELECT * FROM "shop"."customers"', "name": "base"},
+                {"sql": "SELECT COUNT(*) AS n FROM base", "name": "agg"},
+            ]}))
+        finally:
+            session.close()
+
+        rec = json.loads(log_path.read_text().splitlines()[-1])
+        assert rec["outcome"] == "ok"
+        # Full SQL of every step lands in the log (that's the point of it), JSON-clean.
+        assert [s["name"] for s in rec["args"]["steps"]] == ["base", "agg"]
+        assert rec["args"]["steps"][1]["sql"].startswith("SELECT COUNT")
+        assert rec["result"]["step_count"] == 2 and rec["result"]["completed"] == 2
 
     def test_failed_call_logs_error_outcome(self, sqlite_file, tmp_path):
         log_path = tmp_path / "tool-calls.jsonl"
@@ -150,8 +207,6 @@ class TestAddSourceGating:
         try:
             names = {t.name for t in _run(build_server(session, allow_add_source=True).list_tools())}
             assert {"add_source", "remove_source"} <= names
-            # import_remote is registered too, since a fallback source can now be added at runtime.
-            assert "import_remote" in names
         finally:
             session.close()
 
@@ -167,24 +222,3 @@ class TestAddSourceGating:
             assert removed["removed"] is True
         finally:
             session.close()
-
-
-class TestFallbackToolGating:
-    def test_import_remote_registered_with_fallback(self, sqlite_file):
-        # An mssql:// DSN can't actually connect, but build_source defers the connect to a
-        # real engine; use monkeypatched fallback instead: a sqlite engine tagged fallback.
-        from spelunk.core import sources
-        from spelunk.core.connection import connect
-
-        src = sources.Source(name="remote", kind="fallback", locator="x", engine=connect(sqlite_file_dsn(sqlite_file)))
-        session = DuckSession.open([f"shop={sqlite_file}"])
-        session.sources.append(src)
-        try:
-            names = {t.name for t in _run(build_server(session).list_tools())}
-            assert "import_remote" in names
-        finally:
-            session.close()
-
-
-def sqlite_file_dsn(path: str) -> str:
-    return f"sqlite:///{path.replace(chr(92), '/')}"

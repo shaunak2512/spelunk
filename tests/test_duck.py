@@ -75,6 +75,150 @@ class TestQuery:
         r = session.query("SELECT * FROM orders", "o")
         assert "hints" not in r
 
+    def test_small_result_returns_all_rows_complete(self, session):
+        # 20 rows > 5-row head, but small on both axes -> whole result comes back, complete=True.
+        r = session.query("SELECT i AS x FROM range(20) t(i)", "small")
+        assert r["row_count"] == 20
+        assert len(r["sample"]) == 20
+        assert r["complete"] is True
+        assert r["sample"][0] == [0] and r["sample"][-1] == [19]
+
+    def test_large_result_falls_back_to_head(self, session):
+        # Over the row cap -> 5-row head, complete=False signals there's more.
+        r = session.query("SELECT i AS x FROM range(60) t(i)", "big")
+        assert r["row_count"] == 60
+        assert len(r["sample"]) == 5
+        assert r["complete"] is False
+
+    def test_wide_result_over_cell_cap_falls_back(self, session):
+        # 40 rows (<= row cap) but 30 cols -> 1200 cells > cell cap, so a head, not full rows.
+        cols = ", ".join(f"i AS c{k}" for k in range(30))
+        r = session.query(f"SELECT {cols} FROM range(40) t(i)", "wide")
+        assert r["row_count"] == 40
+        assert len(r["sample"]) == 5
+        assert r["complete"] is False
+
+    def test_tiny_result_is_complete(self, session):
+        r = session.query("SELECT 1 AS a", "one")
+        assert r["complete"] is True
+
+
+class TestQuerySteps:
+    def test_dependent_steps_run_in_order(self, session):
+        r = session.query_steps(
+            [
+                {"sql": 'SELECT * FROM "shop"."customers"', "name": "base"},
+                {"sql": "SELECT id, name FROM base WHERE id > 1", "name": "mid"},
+                {"sql": "SELECT COUNT(*) AS n FROM mid", "name": "top"},
+            ]
+        )
+        assert r["step_count"] == 3 and r["completed"] == 3
+        assert [s["status"] for s in r["steps"]] == ["ok", "ok", "ok"]
+        assert [s["row_count"] for s in r["steps"]] == [3, 2, 1]
+        # Compact intermediates: consumed steps carry no sample; the terminal step does.
+        assert "sample" not in r["steps"][0] and "sample" not in r["steps"][1]
+        assert r["steps"][2]["sample"] == [[2]]
+        assert r["steps"][2]["complete"] is True
+
+    def test_disconnected_batch_samples_every_step(self, session):
+        # Independent queries — each is terminal, so each small one returns full rows.
+        r = session.query_steps(
+            [
+                {"sql": "SELECT i AS x FROM range(3) t(i)", "name": "a"},
+                {"sql": "SELECT i AS y FROM range(4) t(i)", "name": "b"},
+                {"sql": "SELECT i AS z FROM range(5) t(i)", "name": "c"},
+            ]
+        )
+        assert all(s["complete"] is True for s in r["steps"])
+        assert [len(s["sample"]) for s in r["steps"]] == [3, 4, 5]
+
+    def test_mixed_batch_samples_only_terminals(self, session):
+        # base -> mid (a chain), plus an independent `solo`. Terminals: mid and solo.
+        r = session.query_steps(
+            [
+                {"sql": "SELECT i AS x FROM range(10) t(i)", "name": "base"},
+                {"sql": "SELECT x FROM base WHERE x > 5", "name": "mid"},
+                {"sql": "SELECT 42 AS answer", "name": "solo"},
+            ]
+        )
+        steps = {s["name"]: s for s in r["steps"]}
+        assert "sample" not in steps["base"]  # consumed by mid
+        assert steps["mid"]["complete"] is True and len(steps["mid"]["sample"]) == 4
+        assert steps["solo"]["complete"] is True and steps["solo"]["sample"] == [[42]]
+
+    def test_final_step_full_sample_when_small(self, session):
+        r = session.query_steps(
+            [
+                {"sql": "SELECT i AS x FROM range(60) t(i)", "name": "wide"},
+                {"sql": "SELECT x FROM wide WHERE x < 20", "name": "narrow"},
+            ]
+        )
+        # Final step is small -> every row returned with complete=True.
+        assert r["steps"][-1]["row_count"] == 20
+        assert len(r["steps"][-1]["sample"]) == 20
+        assert r["steps"][-1]["complete"] is True
+
+    def test_steps_record_lineage_like_sequential_calls(self, session):
+        session.query_steps(
+            [
+                {"sql": 'SELECT * FROM "shop"."customers"', "name": "base"},
+                {"sql": "SELECT id, name FROM base", "name": "top"},
+            ]
+        )
+        lin = session.lineage("top")
+        assert {n["name"] for n in lin["nodes"]} == {"base", "top"}
+        rep = session.replay(into="copy")
+        assert rep["order"] == ["base", "top"]
+
+    def test_fail_fast_keeps_earlier_skips_later(self, session):
+        r = session.query_steps(
+            [
+                {"sql": "SELECT 1 AS a", "name": "ok1"},
+                {"sql": "SELECT * FROM no_such_table", "name": "boom"},
+                {"sql": "SELECT 2 AS b", "name": "never"},
+            ]
+        )
+        assert r["failed_step"] == 1 and r["completed"] == 1
+        assert [s["status"] for s in r["steps"]] == ["ok", "failed", "skipped"]
+        assert "no_such_table" in r["steps"][1]["error"]
+        # ok1 stayed materialized; the skipped step never ran.
+        names = {t["name"] for t in session.catalog("default")["results"]}
+        assert "ok1" in names and "never" not in names
+
+    def test_static_validation_rejects_batch_before_any_side_effect(self, session):
+        with pytest.raises(ValueError, match=r"steps\[1\]"):
+            session.query_steps(
+                [
+                    {"sql": "SELECT 1 AS a", "name": "ok1"},
+                    {"sql": "SELECT 2 AS b", "name": "bad name!"},
+                ]
+            )
+        with pytest.raises(UnsafeSQLError):
+            session.query_steps(
+                [
+                    {"sql": "SELECT 1 AS a", "name": "ok1"},
+                    {"sql": "DELETE FROM orders", "name": "w"},
+                ]
+            )
+        assert session.catalog("default")["results"] == []  # nothing materialized
+
+    def test_empty_or_malformed_steps_rejected(self, session):
+        with pytest.raises(ValueError, match="non-empty"):
+            session.query_steps([])
+        with pytest.raises(ValueError, match=r"steps\[0\]"):
+            session.query_steps([{"sql": "SELECT 1"}])  # name missing
+
+    def test_batch_nudge_after_consecutive_single_queries(self, session):
+        r1 = session.query("SELECT 1 AS a", "t1")
+        r2 = session.query("SELECT 2 AS a", "t2")
+        assert "hints" not in r1 and "hints" not in r2
+        r3 = session.query("SELECT 3 AS a", "t3")
+        assert any("steps" in h for h in r3.get("hints", []))
+        # A batch resets the streak: the next single query is not nagged.
+        session.query_steps([{"sql": "SELECT 4 AS a", "name": "t4"}])
+        r5 = session.query("SELECT 5 AS a", "t5")
+        assert "hints" not in r5
+
 
 class TestProfile:
     def test_numeric_and_text_stats(self, session):
@@ -216,11 +360,14 @@ class TestPersistence:
         parent = str(tmp_path / "root")
         os.makedirs(parent, exist_ok=True)
         old = time.time() - 86_400  # a day ago: past the sweep grace window
-        # Five stale, unlocked workspaces, oldest -> newest by mtime.
+        # Five stale, unlocked, NON-empty workspaces (holding a result table — empty ones are
+        # reclaimed regardless of keep-N), oldest -> newest by mtime.
         for i in range(5):
             d = os.path.join(parent, f"00000-stale{i}")
             os.makedirs(d)
-            duckdb.connect(os.path.join(d, "workspace.duckdb")).close()  # free (no live owner)
+            con = duckdb.connect(os.path.join(d, "workspace.duckdb"))  # free (no live owner)
+            con.execute("CREATE SCHEMA work; CREATE TABLE work.t AS SELECT 1 AS a")
+            con.close()
             os.utime(d, (old + i, old + i))
 
         s = DuckSession.open([f"shop={sqlite_file}"], session_dir=parent, keep_workspaces=3)
@@ -236,6 +383,77 @@ class TestPersistence:
             assert "00000-stale0" not in remaining  # 3 oldest reclaimed
         finally:
             s.close()
+
+    def test_sweep_reclaims_empty_workspaces_within_keep_window(self, sqlite_file, tmp_path):
+        """Reconnect churn: stale EMPTY workspaces are reclaimed even inside the keep-N window.
+
+        Non-empty siblings (a result table, or a non-empty tool log) and dirs inside the grace
+        window are untouched.
+        """
+        parent = str(tmp_path / "root")
+        os.makedirs(parent, exist_ok=True)
+        old = time.time() - 86_400
+
+        def make_ws(name: str, *, table: bool = False, log_bytes: int = 0, stale: bool = True) -> str:
+            d = os.path.join(parent, name)
+            os.makedirs(d)
+            con = duckdb.connect(os.path.join(d, "workspace.duckdb"))
+            if table:
+                con.execute("CREATE SCHEMA work; CREATE TABLE work.t AS SELECT 1 AS a")
+            con.close()
+            with open(os.path.join(d, "tool-calls.jsonl"), "wb") as f:
+                f.write(b"x" * log_bytes)  # 0 bytes = the log churn leaves behind
+            if stale:
+                os.utime(d, (old, old))
+            return name
+
+        empty1 = make_ws("00000-empty1")
+        empty2 = make_ws("00000-empty2")
+        with_table = make_ws("00000-table", table=True)
+        with_log = make_ws("00000-logged", log_bytes=42)
+        fresh_empty = make_ws("00000-fresh", stale=False)  # inside the 60s grace window
+
+        s = DuckSession.open([f"shop={sqlite_file}"], session_dir=parent, keep_workspaces=10)
+        try:
+            remaining = set(os.listdir(parent))
+            assert empty1 not in remaining and empty2 not in remaining  # reclaimed despite keep=10
+            assert with_table in remaining  # has results: keep-N applies
+            assert with_log in remaining  # non-empty log is a postmortem artifact
+            assert fresh_empty in remaining  # grace window: never touched
+        finally:
+            s.close()
+
+    def test_close_reclaims_own_empty_per_process_workspace(self, sqlite_file, tmp_path):
+        """close(reclaim_if_empty=True) deletes this run's own dir iff it never did any work."""
+        parent = str(tmp_path / "root")
+
+        # Never materialized anything -> dir removed (a 0-byte log is not an artifact).
+        s1 = DuckSession.open([f"shop={sqlite_file}"], session_dir=parent)
+        d1 = s1.workspace_dir
+        open(os.path.join(d1, "tool-calls.jsonl"), "w").close()
+        s1.close(reclaim_if_empty=True)
+        assert not os.path.exists(d1)
+
+        # Materialized a result -> dir survives.
+        s2 = DuckSession.open([f"shop={sqlite_file}"], session_dir=parent)
+        d2 = s2.workspace_dir
+        s2.query("SELECT 1 AS a", "kept")
+        s2.close(reclaim_if_empty=True)
+        assert os.path.isfile(os.path.join(d2, "workspace.duckdb"))
+
+        # A non-empty tool log alone also blocks reclaim (it's the audit trail).
+        s3 = DuckSession.open([f"shop={sqlite_file}"], session_dir=parent)
+        d3 = s3.workspace_dir
+        with open(os.path.join(d3, "tool-calls.jsonl"), "w") as f:
+            f.write('{"tool": "query"}\n')
+        s3.close(reclaim_if_empty=True)
+        assert os.path.exists(d3)
+
+        # Plain close() never reclaims.
+        s4 = DuckSession.open([f"shop={sqlite_file}"], session_dir=parent)
+        d4 = s4.workspace_dir
+        s4.close()
+        assert os.path.exists(d4)
 
     def test_per_process_sweep_skips_live_workspace(self, sqlite_file, tmp_path):
         """A stale-looking workspace still held by a LIVE (separate) process is never reclaimed.

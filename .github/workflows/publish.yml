@@ -1,0 +1,67 @@
+name: Publish to PyPI
+
+# Publishes on a version tag (e.g. `git tag v0.1.0 && git push --tags`).
+# Uses PyPI Trusted Publishing (OIDC) — no API token stored in the repo.
+# One-time setup on PyPI: for the `spelunk-mcp` project, Settings -> Publishing
+# -> add a GitHub publisher for repo shaunak2512/spelunk, workflow `publish.yml`,
+# environment `pypi`. (New project? Use PyPI's "pending publisher" form with the
+# same values so the first tagged release can create it.)
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build distributions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      # A tag that disagrees with pyproject.toml would publish a version nobody asked for (or
+      # collide with one already on PyPI, which is unfixable — PyPI forbids re-uploads).
+      - name: Verify tag matches the package version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(python3 -c 'import tomllib, pathlib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')"
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::tag v$tag does not match pyproject.toml version $pkg"
+            exit 1
+          fi
+
+      - name: Build
+        run: uv build
+
+      - name: Check metadata
+        run: uvx twine check dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+
+  publish:
+    name: publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write   # required for Trusted Publishing (OIDC)
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Publish
+        # Pinned to a SHA, not the mutable release/v1 tag — this step holds the OIDC token that
+        # can publish to PyPI, so it's the one action worth freezing. Bump deliberately.
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b  # release/v1

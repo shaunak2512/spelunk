@@ -36,17 +36,17 @@ One DuckDB session, wrapped by a thin MCP front-end:
 spelunk/core/
   duck.py        # DuckSession — THE engine+workspace. open() attaches sources, configures
                  #   memory_limit/temp_directory; methods: query / profile / export / catalog /
-                 #   drop / import_remote + list_objects / describe (DuckDB-catalog introspection)
+                 #   drop / lineage / replay + list_objects / describe. query() records
+                 #   provenance (SQL + dep edges) into the internal _spelunk_meta.lineage
+                 #   table; lineage() reads that DAG, replay() rebuilds a flow from it.
   sources.py     # Source registry: spec -> DuckDB attach/scan SQL (files as VIEWs, DBs ATTACHed
-                 #   READ_ONLY). SQLAlchemy fallback Source for SQL Server / exotic auth.
+                 #   READ_ONLY). DuckDB-only — a source it can't attach (e.g. SQL Server) is
+                 #   rejected, not bridged. DSNs are parsed with stdlib urllib (no SQLAlchemy dep).
   guard.py       # sqlglot AST safety: assert_read_only(), enforce_limit() — called dialect="duckdb"
-  connection.py  # RETAINED, demoted: SQLAlchemy connect(), only for the fallback path
-  query.py       # RETAINED, demoted: run_sql(), only used by import_remote's remote pull
-  introspect.py  # RETAINED for the fallback path (SQLAlchemy reflection)
   types.py       # FROZEN contracts: TableInfo, TableDescription, ColumnInfo, errors
 
 spelunk/mcp/
-  server.py      # FastMCP wrapper: build_server(session) registers 5 tools + 2 resources;
+  server.py      # FastMCP wrapper: build_server(session) registers 7 tools + 2 resources;
                  #   main() parses --source specs and serves over stdio
 ```
 
@@ -59,12 +59,13 @@ One row-returning tool (`query`) owns every SELECT; inspection lives on the reso
 
 | Tool | Purpose |
 |---|---|
-| `query(sql, name, flow?)` | Run a read-only SELECT over sources + saved results; **materialize the full result** as table `name` (required). Returns columns, true row_count, head sample. The one tool for looking *and* building — results are named and immediately reusable. |
+| `query(sql, name, flow?)` | Run a read-only SELECT over sources + saved results; **materialize the full result** as table `name` (required). Returns columns, true row_count, and a sample — a 5-row head, or **every row** (with `complete: true`) when the result is small on both axes (row_count ≤ 50 and row_count×cols ≤ 1000), so an agent reads a small deliverable without paging it out into junk tables. The one tool for looking *and* building — results are named and immediately reusable. **Batch mode:** `query(steps=[{sql,name},...], flow?)` (mutually exclusive with `sql`/`name`) runs an ordered list in one call; later steps *may* reference earlier steps' names; semantics identical to N sequential calls (same guard, same lineage rows). Not only for pipelines — steps can be a dependent chain, unrelated queries, or a mix. Fail-fast — completed steps stay materialized, the failing step reports its error, the rest are skipped. Every **terminal** step (one no later step references — the last, plus any independent query) returns a sample (full rows when small, else a head); downstream-consumed intermediates stay compact. A hint after 3 consecutive single-query calls nudges agents toward the batch. |
 | `profile(sql, flow?)` | Per-column stats (null_rate, min/max/mean/std, p25/p50/p75/p95; unique/top/freq) — no row cap. |
 | `export(target, format, path, flow?)` | Write a saved result name **or** a full SELECT to csv/json/parquet. |
 | `catalog(flow?)` | No arg → list flows + counts; with a flow → its results. |
 | `drop(name?, flow?)` | Drop one result, or a whole flow (name omitted). |
-| `import_remote(sql, name, flow?)` | **Only registered when a SQL Server / SQLAlchemy-only source is configured** (or `--allow-add-source`, since one can be added at runtime) — DuckDB can't attach it, so pull a SELECT in, then query the table. |
+| `lineage(name?, flow?)` | Provenance graph: with `name`, the upstream closure (transitive, cross-flow) that built a result; without, the whole flow's DAG. Returns nodes (SQL, deps, sources, kind), edges, a dependency-first `order`, and `missing` deps. Read-only. |
+| `replay(flow?, into?, dry_run?)` | Rebuild a flow from its recorded SQL in dependency order (re-run each `query`). `into` → non-destructive rebuild into a fresh flow; omitted → in-place refresh; `dry_run` → plan only. Errors on a dependency cycle. Sources + cross-flow results are read, not rebuilt. |
 | `add_source(spec)` / `remove_source(name)` | **Only registered with `--allow-add-source`** — attach/detach a file or DB at runtime (`spec` is the same grammar as `--source`). Connection-global: a source is visible in **every flow**, not flow-scoped (DuckDB `ATTACH` can't be per-schema). Isolation comes from the process-per-agent model. |
 
 Resources: `db://tables` (queryable objects — attached-DB tables named `<source>.<table>`, file
@@ -80,6 +81,14 @@ views named bare) and `db://{table}` (columns, PK, sample, row count).
 - **Materialize-by-default:** `query` does `CREATE OR REPLACE TABLE` — computed once, cheap to
   reuse, correct for pipelines (a DuckDB *view* re-executes its whole upstream on every reference).
   A nudge fires on an unfiltered `SELECT *` that copies a large source table wholesale.
+- **Lineage & replay:** every `query` result upserts a row into the internal
+  `_spelunk_meta.lineage` table (a reserved schema, hidden from `catalog`/`drop`): its SQL, `kind`,
+  and dependency edges. Deps are found by parsing the SQL (sqlglot) and intersecting table refs with
+  the live `(flow, name)` result set — a ref that names an existing result is a dep, anything else is
+  an external *source* leaf. `CREATE OR REPLACE` re-derives the row so the store always reflects the
+  *current* definition (which permits logical cycles → `replay` topo-sorts and rejects them). This
+  makes a flow a reproducible pipeline: `lineage` shows the DAG, `replay(into=...)` rebuilds it
+  against (possibly changed) sources. Durable — survives `--shared-workspace` reopen.
 - **Disk-backed always + out-of-core:** the workspace is a real DuckDB file (under `--session-dir`,
   else a temp dir). Sources are read on demand with pushdown; buffering operators spill to
   `temp_directory`. A source larger than RAM is the normal case, not a failure.
@@ -123,13 +132,20 @@ dir.
 
 **Workspace GC:** to stop per-process subdirs accumulating, `open()` sweeps on startup — it keeps
 the `--keep-workspaces N` most recent (default 3, including the one just created) and reclaims older
-subdirs that have no *live* owner. Liveness is the DuckDB file lock: the sweep probes each candidate
+subdirs that have no *live* owner. **Empty workspaces are reclaimed even inside the keep window**: a
+dir whose DB has no tables outside the reserved schemas and no artifacts beyond a 0-byte tool log
+(MCP reconnect churn spawns servers that never handle a call) is garbage, so keep-N doesn't protect
+it. Liveness is the DuckDB file lock: the sweep probes each candidate
 with a read-write `connect` (a live server holds the single-writer lock → skip; a crashed/exited one
-opens → delete). This is cross-process only — two sessions in one process share DuckDB's cached
+opens → delete). Complementing the sweep, `main()` calls `session.close(reclaim_if_empty=True)` on
+clean shutdown (stdin closed), so a no-work server deletes its own dir immediately — after releasing
+the tool-log handler first (an open handle blocks `rmtree` on Windows). This is cross-process only — two sessions in one process share DuckDB's cached
 instance, so a sweep can't detect an in-process holder (irrelevant in production: each server is its
 own process). Dirs younger than a 60s grace window are never touched (a sibling may be mid-startup,
-lock not yet held). `--keep-workspaces 0` (or `<=0`) disables the sweep. The tool-log lives inside
-the workspace dir, so it's reclaimed with it — route `--tool-log` elsewhere to retain history.
+lock not yet held). `--keep-workspaces 0` (or `<=0`) disables the sweep **entirely** — empty-dir
+reclamation included; only the clean-shutdown `close(reclaim_if_empty=True)` still fires. The
+tool-log lives inside the workspace dir, so it's reclaimed with it — route `--tool-log` elsewhere to
+retain history.
 
 Pass `--shared-workspace` (CLI) / `per_process=False` (`DuckSession.open`) for the old single
 `<session-dir>/workspace.duckdb` that one caller can reopen across restarts — at the cost of
