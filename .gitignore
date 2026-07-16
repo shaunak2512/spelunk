@@ -15,6 +15,7 @@ build/
 *.html
 sample_data/
 potential_extensions.md
+data_source_support.md
 .spelunk_session/
 node_modules/
 market_position*.md
