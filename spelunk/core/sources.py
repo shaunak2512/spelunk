@@ -19,6 +19,7 @@ A spec is a string, optionally prefixed ``name=``::
 
     sales=./data/sales.parquet
     remote=https://example.com/data/sales.parquet
+    routes=csv:https://example.com/data/routes.dat  # force a reader for an odd/absent extension
     trips=s3://my-bucket/trips/*.parquet
     events=delta:./warehouse/events            # a Delta Lake table directory
     catalog=iceberg:./warehouse/catalog/table  # an Iceberg table
@@ -26,6 +27,10 @@ A spec is a string, optionally prefixed ``name=``::
     sqlite:///C:/data/app.db
     postgresql://user:pw@host/dbname
     ./reports/q1.csv               # name derived from the filename -> q1
+
+A file whose name lacks a recognised extension (an API endpoint, a ``.dat`` dump) is read by
+forcing the reader with a format prefix — ``csv:`` / ``tsv:`` / ``json:`` / ``parquet:`` /
+``excel:`` / ``avro:`` — placed on the locator (after any ``name=``): ``routes=csv:<url>``.
 
 Attached databases (and DuckLake) are referenced in SQL by ``"<source>"."<table>"``; file and
 lakehouse-scan sources by their bare view name.
@@ -65,6 +70,19 @@ _EXT_FILE_READERS: dict[str, tuple[str, str]] = {
 }
 # Extensions that mean "this path is a SQLite database file" (attach, don't scan).
 _SQLITE_EXTS = frozenset({".sqlite", ".sqlite3", ".db"})
+
+# Format-override prefixes: force a reader regardless of the locator's extension, for files whose
+# name doesn't reveal the format (a ``.dat`` dump, an extensionless API URL). Each maps to a
+# canonical extension resolved through the reader tables above, so excel/avro still INSTALL/LOAD
+# their extension. Written like the ``delta:``/``iceberg:`` scheme prefixes, e.g. ``csv:<url>``.
+_FORMAT_PREFIX: dict[str, str] = {
+    "csv": ".csv",
+    "tsv": ".tsv",
+    "json": ".json",
+    "parquet": ".parquet",
+    "excel": ".xlsx",
+    "avro": ".avro",
+}
 
 # Remote-path schemes reachable through a DuckDB filesystem extension, mapped to the extension
 # that provides them. httpfs covers http(s)/S3/GCS/R2; azure covers Azure Blob / ADLS.
@@ -127,8 +145,28 @@ def parse_spec(spec: str) -> tuple[str | None, str]:
     return None, spec.strip()
 
 
-def detect_kind(locator: str) -> SourceKind:
-    """Classify a locator into a :data:`SourceKind` by scheme/extension."""
+def _split_format_prefix(locator: str) -> tuple[str | None, str]:
+    """Split a leading format-override prefix (``csv:`` / ``json:`` / ...) off a locator.
+
+    Returns ``(canonical_ext, inner_locator)`` when the locator starts with a known format
+    prefix, else ``(None, locator)``. The prefix is matched case-insensitively; the inner
+    locator keeps its original case (URLs are case-sensitive). A Windows drive path such as
+    ``C:/x.dat`` never matches — a drive is one letter, every prefix is three or more.
+    """
+    head, sep, rest = locator.partition(":")
+    if sep and head.lower() in _FORMAT_PREFIX:
+        return _FORMAT_PREFIX[head.lower()], rest
+    return None, locator
+
+
+def detect_kind(locator: str, forced_ext: str | None = None) -> SourceKind:
+    """Classify a locator into a :data:`SourceKind` by scheme/extension.
+
+    ``forced_ext`` (the canonical extension from a ``csv:``/``json:``/... format prefix) pins the
+    locator to a ``file`` source regardless of its own extension.
+    """
+    if forced_ext is not None:
+        return "file"
     low = locator.lower()
     if low.startswith(("postgresql://", "postgres://")):
         return "postgres"
@@ -153,17 +191,21 @@ def detect_kind(locator: str) -> SourceKind:
     if ext in _SQLITE_EXTS:
         return "sqlite"
     raise ValueError(
-        f"Could not determine the source type of {locator!r}. Supported: files "
-        f"({', '.join(sorted(set(_FILE_READERS) | set(_EXT_FILE_READERS) | _SQLITE_EXTS))}) "
-        "local or via https://, s3://, gs://, az:// URL; delta:<path> / iceberg:<path> lakehouse "
-        "tables; or a sqlite:// / postgresql:// / mysql:// / ducklake: DSN."
+        f"Could not determine the source type of {locator!r}. If it is a data file with an "
+        "unrecognized or absent extension (a .dat dump, an extensionless API URL), force the "
+        f"reader with a format prefix — csv:/tsv:/json:/parquet:/excel:/avro: — e.g. csv:{locator}. "
+        "Recognized extensions: "
+        f"{', '.join(sorted(set(_FILE_READERS) | set(_EXT_FILE_READERS) | _SQLITE_EXTS))} "
+        "(local or via https://, s3://, gs://, az:// URL); or a delta:<path> / iceberg:<path> / "
+        "ducklake: locator; or a sqlite:// / postgresql:// / mysql:// DSN."
     )
 
 
 def build_source(spec: str) -> Source:
     """Parse a single spec into a :class:`Source` (no DuckDB connection touched yet)."""
     explicit, locator = parse_spec(spec)
-    kind = detect_kind(locator)
+    forced_ext, locator = _split_format_prefix(locator)
+    kind = detect_kind(locator, forced_ext=forced_ext)
     name = explicit or _derive_name(locator, kind)
     if not _NAME_RE.match(name):
         raise ValueError(
@@ -172,7 +214,7 @@ def build_source(spec: str) -> Source:
         )
 
     if kind == "file":
-        return _build_file_source(name, locator)
+        return _build_file_source(name, locator, forced_ext=forced_ext)
     if kind in _SCAN_KINDS:
         return _build_scan_source(name, kind, locator)
     if kind == "ducklake":
@@ -217,14 +259,16 @@ def attach_all(con: "duckdb.DuckDBPyConnection", specs: Iterable[str]) -> list[S
 # --------------------------------------------------------------------------- #
 # Builders
 # --------------------------------------------------------------------------- #
-def _build_file_source(name: str, locator: str) -> Source:
+def _build_file_source(name: str, locator: str, forced_ext: str | None = None) -> Source:
     """A file source becomes a VIEW in `main` over the matching read_* scan.
 
     The path may be local or a remote URL (``https://``/``s3://``/``gs://``/``az://``); a remote
     path loads the filesystem extension (``httpfs`` / ``azure``) first and is passed through
-    verbatim (not run through ``os.path.abspath``, which would mangle the scheme).
+    verbatim (not run through ``os.path.abspath``, which would mangle the scheme). ``forced_ext``
+    (from a ``csv:``/``json:``/... format prefix) overrides the extension-based reader choice, so a
+    file with an odd or absent extension still reads.
     """
-    ext = _path_ext(locator)
+    ext = forced_ext if forced_ext is not None else _path_ext(locator)
     path = _duck_path(locator)
     setup: list[str] = list(_remote_setup(locator))
     if ext in _EXT_FILE_READERS:
