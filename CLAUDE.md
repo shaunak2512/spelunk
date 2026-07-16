@@ -39,8 +39,11 @@ spelunk/core/
                  #   drop / lineage / replay + list_objects / describe. query() records
                  #   provenance (SQL + dep edges) into the internal _spelunk_meta.lineage
                  #   table; lineage() reads that DAG, replay() rebuilds a flow from it.
-  sources.py     # Source registry: spec -> DuckDB attach/scan SQL (files as VIEWs, DBs ATTACHed
-                 #   READ_ONLY). DuckDB-only — a source it can't attach (e.g. SQL Server) is
+  sources.py     # Source registry: spec -> DuckDB attach/scan SQL (files + lakehouse scans as
+                 #   VIEWs, DBs/DuckLake ATTACHed READ_ONLY). Kinds: file (local OR remote
+                 #   https://,s3://,gs://,az:// via httpfs/azure ext; ext-backed readers excel/avro),
+                 #   sqlite/postgres/mysql, delta:/iceberg: (delta_scan/iceberg_scan VIEWs),
+                 #   ducklake:. DuckDB-only — a source it can't attach (e.g. SQL Server) is
                  #   rejected, not bridged. DSNs are parsed with stdlib urllib (no SQLAlchemy dep).
   guard.py       # sqlglot AST safety: assert_read_only(), enforce_limit() — called dialect="duckdb"
   types.py       # FROZEN contracts: TableInfo, TableDescription, ColumnInfo, errors

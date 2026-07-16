@@ -42,6 +42,23 @@ class TestDetectKind:
     def test_detect(self, loc, kind):
         assert sources.detect_kind(loc) == kind
 
+    @pytest.mark.parametrize(
+        "loc,kind",
+        [
+            ("https://example.com/data/sales.parquet", "file"),
+            ("s3://bucket/trips/part.parquet", "file"),
+            ("az://container/data.csv", "file"),
+            ("data.avro", "file"),
+            ("https://host/data.parquet?token=abc", "file"),  # query string ignored for ext
+            ("delta:./warehouse/events", "delta"),
+            ("delta:s3://bucket/tbl", "delta"),
+            ("iceberg:./warehouse/tbl", "iceberg"),
+            ("ducklake:./catalog.ducklake", "ducklake"),
+        ],
+    )
+    def test_detect_new_kinds(self, loc, kind):
+        assert sources.detect_kind(loc) == kind
+
     def test_unknown_raises(self):
         with pytest.raises(ValueError):
             sources.detect_kind("mystery.xyz")
@@ -60,6 +77,62 @@ class TestDeriveName:
     def test_dsn_uses_db_name(self):
         src = sources.build_source("sqlite:///C:/data/financial.db")
         assert src.name == "financial"
+
+    def test_remote_url_stem(self):
+        src = sources.build_source("https://example.com/data/sales.parquet?token=x")
+        assert src.name == "sales"
+
+    def test_delta_scheme_stripped_from_name(self):
+        src = sources.build_source("delta:./warehouse/events")
+        assert src.name == "events"
+
+    def test_ducklake_scheme_stripped_from_name(self):
+        src = sources.build_source("ducklake:./my_catalog.ducklake")
+        assert src.name == "my_catalog"
+
+
+# --------------------------------------------------------------------------- #
+# Builders for the new source kinds emit the right setup SQL (no connection needed)
+# --------------------------------------------------------------------------- #
+class TestBuildNewKinds:
+    def test_remote_file_loads_httpfs_and_keeps_url(self):
+        src = sources.build_source("https://example.com/data/sales.parquet")
+        assert src.kind == "file"
+        assert ["INSTALL httpfs", "LOAD httpfs"] == src.setup_sql[:2]
+        # URL passed through verbatim — NOT run through os.path.abspath.
+        assert "read_parquet('https://example.com/data/sales.parquet')" in src.setup_sql[-1]
+
+    def test_azure_url_loads_azure(self):
+        src = sources.build_source("x=az://container/data.csv")
+        assert ["INSTALL azure", "LOAD azure"] == src.setup_sql[:2]
+
+    def test_avro_loads_avro_ext(self):
+        src = sources.build_source("events=./data/events.avro")
+        assert ["INSTALL avro", "LOAD avro"] == src.setup_sql[:2]
+        assert "read_avro(" in src.setup_sql[-1]
+
+    def test_delta_builds_scan_view(self):
+        src = sources.build_source("events=delta:./warehouse/events")
+        assert src.kind == "delta"
+        assert "INSTALL delta" in src.setup_sql and "LOAD delta" in src.setup_sql
+        assert "delta_scan(" in src.setup_sql[-1]
+        assert 'CREATE OR REPLACE VIEW main."events"' in src.setup_sql[-1]
+        assert sources.teardown_sql(src) == ['DROP VIEW IF EXISTS main."events"']
+
+    def test_iceberg_remote_loads_httpfs_and_iceberg(self):
+        src = sources.build_source("tbl=iceberg:s3://bucket/tbl")
+        assert src.kind == "iceberg"
+        # httpfs first (remote), then the iceberg reader.
+        assert src.setup_sql[:2] == ["INSTALL httpfs", "LOAD httpfs"]
+        # allow_moved_paths lets a relocated/relative-path table still resolve.
+        assert "iceberg_scan('s3://bucket/tbl', allow_moved_paths => true)" in src.setup_sql[-1]
+
+    def test_ducklake_attaches_read_only(self):
+        src = sources.build_source("lake=ducklake:./catalog.ducklake")
+        assert src.kind == "ducklake"
+        assert src.setup_sql[:2] == ["INSTALL ducklake", "LOAD ducklake"]
+        assert src.setup_sql[-1] == "ATTACH 'ducklake:./catalog.ducklake' AS \"lake\" (READ_ONLY)"
+        assert sources.teardown_sql(src) == ['DETACH "lake"']
 
 
 # --------------------------------------------------------------------------- #
