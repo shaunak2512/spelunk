@@ -65,7 +65,8 @@ _FILE_READERS: dict[str, str] = {
 _EXT_FILE_READERS: dict[str, tuple[str, str]] = {
     ".xlsx": ("excel", "read_xlsx"),
     ".xlsm": ("excel", "read_xlsx"),
-    ".xls": ("excel", "read_xlsx"),
+    # NB: legacy binary .xls is intentionally absent — DuckDB's excel reader (read_xlsx) handles
+    # the OOXML .xlsx/.xlsm formats only, so a .xls would fail at view creation.
     ".avro": ("avro", "read_avro"),
 }
 # Extensions that mean "this path is a SQLite database file" (attach, don't scan).

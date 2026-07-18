@@ -63,6 +63,12 @@ class TestDetectKind:
         with pytest.raises(ValueError):
             sources.detect_kind("mystery.xyz")
 
+    def test_unknown_extension_error_teaches_format_prefix(self):
+        # A genuinely unrecognized, unprefixed extension errors — and the message points at the
+        # format-prefix escape hatch so the agent can retry in one step.
+        with pytest.raises(ValueError, match="format prefix"):
+            sources.build_source("https://host/data/mystery.dat")
+
     def test_sql_server_unsupported(self):
         # DuckDB can't attach SQL Server; it's rejected with a clear message (no fallback).
         with pytest.raises(ValueError, match="SQL Server sources are not supported"):
@@ -133,6 +139,57 @@ class TestBuildNewKinds:
         assert src.setup_sql[:2] == ["INSTALL ducklake", "LOAD ducklake"]
         assert src.setup_sql[-1] == "ATTACH 'ducklake:./catalog.ducklake' AS \"lake\" (READ_ONLY)"
         assert sources.teardown_sql(src) == ['DETACH "lake"']
+
+
+# --------------------------------------------------------------------------- #
+# Format-override prefixes (csv:/tsv:/json:/parquet:/excel:/avro:) force a reader
+# --------------------------------------------------------------------------- #
+class TestFormatPrefix:
+    def test_csv_prefix_forces_reader_on_odd_extension(self):
+        # A .dat file that is really CSV: csv: forces read_csv_auto regardless of extension.
+        src = sources.build_source("routes=csv:https://host/data/routes.dat")
+        assert src.kind == "file"
+        # Remote → httpfs loaded first, URL kept verbatim (no os.path.abspath mangling).
+        assert src.setup_sql[:2] == ["INSTALL httpfs", "LOAD httpfs"]
+        assert "read_csv_auto('https://host/data/routes.dat')" in src.setup_sql[-1]
+
+    def test_parquet_prefix_overrides_bin_extension(self):
+        src = sources.build_source("d=parquet:./data.bin")
+        assert "read_parquet(" in src.setup_sql[-1]
+
+    def test_json_prefix_overrides_txt_extension(self):
+        src = sources.build_source("d=json:./data.txt")
+        assert "read_json_auto(" in src.setup_sql[-1]
+
+    def test_excel_prefix_loads_extension(self):
+        src = sources.build_source("book=excel:./data.bin")
+        assert ["INSTALL excel", "LOAD excel"] == src.setup_sql[-3:-1]
+        assert "read_xlsx(" in src.setup_sql[-1]
+
+    def test_prefix_is_case_insensitive(self):
+        src = sources.build_source("d=CSV:./data.dat")
+        assert "read_csv_auto(" in src.setup_sql[-1]
+
+    def test_name_composes_with_format_prefix(self):
+        # name= sets the source name; the format prefix is stripped from the locator.
+        src = sources.build_source("myname=csv:./file.dat")
+        assert src.name == "myname"
+
+    def test_derived_name_strips_format_prefix(self):
+        # With no name=, the name derives from the inner path, not the prefix.
+        src = sources.build_source("csv:https://host/path/routes.dat")
+        assert src.name == "routes"
+
+    def test_windows_drive_not_mistaken_for_prefix(self):
+        # A drive letter is one char; every format prefix is three+, so C:/ never matches.
+        assert sources.detect_kind("C:/data/foo.csv") == "file"
+        _, inner = sources._split_format_prefix("C:/data/foo.csv")
+        assert inner == "C:/data/foo.csv"
+
+    def test_unknown_prefix_falls_through_to_extension(self):
+        # An unrecognized prefix is not a format override; detection falls back to the real ext.
+        ext, inner = sources._split_format_prefix("foo:./bar.csv")
+        assert ext is None and inner == "foo:./bar.csv"
 
 
 # --------------------------------------------------------------------------- #

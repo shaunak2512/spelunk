@@ -414,7 +414,9 @@ def main() -> None:
             "A data source, repeatable. A file path (.csv/.parquet/.json/.xlsx/.avro) — local or a "
             "remote https:// / s3:// / gs:// / az:// URL — a SQLite file, a delta:<path> / "
             "iceberg:<path> lakehouse table, or a sqlite:// / postgresql:// / mysql:// / ducklake: "
-            "DSN. Prefix with name= to set the source name, e.g. sales=./sales.parquet."
+            "DSN. Prefix with name= to set the source name, e.g. sales=./sales.parquet. For a file "
+            "with an odd/absent extension, force the reader with a format prefix "
+            "(csv:/tsv:/json:/parquet:/excel:/avro:), e.g. routes=csv:https://host/routes.dat."
         ),
     )
     parser.add_argument("--dsn", default=None, help="Alias for a single --source (back-compat).")
