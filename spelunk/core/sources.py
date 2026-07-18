@@ -415,12 +415,21 @@ def _remote_setup(path: str) -> list[str]:
     (DuckDB otherwise leaves the region empty and the request 404s). ``us-east-1`` covers most AWS
     open-data buckets; this is only the fallback for anonymous access — a bucket in another region,
     or a private one, needs the user's own DuckDB S3 secret, whose REGION takes precedence.
+
+    Known limitation / possible extension: ``SET s3_region`` is connection-global, so registering
+    an S3 source overwrites the region for *every* later S3 read in the session. That's harmless
+    with secrets (a secret's REGION wins) but can clobber a region a caller set manually via
+    ``SET s3_region`` for a non-us-east-1 bucket. If that becomes a real need, make it
+    non-destructive — only set the fallback when the region is currently empty (guard on
+    ``current_setting('s3_region')``), or scope the region per source via a ``CREATE SECRET`` with
+    a bucket ``SCOPE`` instead of a global ``SET``.
     """
     low = path.lower()
     for scheme, ext_name in _REMOTE_EXT.items():
         if low.startswith(scheme):
             setup = [f"INSTALL {ext_name}", f"LOAD {ext_name}"]
             if scheme in ("s3://", "s3a://"):
+                # Global fallback region — see the "Known limitation" note above before changing.
                 setup.append("SET s3_region = 'us-east-1'")
             return setup
     return []
