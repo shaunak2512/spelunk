@@ -59,7 +59,7 @@ _RESERVED_SCHEMAS = frozenset(
 # ("<source>"."<schema>"."<table>"), so it is qualified. A kind with no default here (mysql, whose
 # default schema is the database name) always gets the schema segment — 3-part is always valid.
 _ATTACHED_SYSTEM_SCHEMAS = frozenset({"information_schema", "pg_catalog"})
-_ATTACHED_DEFAULT_SCHEMA = {"sqlite": "main", "postgres": "public"}
+_ATTACHED_DEFAULT_SCHEMA = {"sqlite": "main", "postgres": "public", "ducklake": "main"}
 
 # DuckDB base type names that mark a column as numeric (for profile stats). Matched against the
 # type name with any parametrisation stripped (e.g. DECIMAL(18,3) -> DECIMAL) — exact, not
@@ -1142,8 +1142,9 @@ class DuckSession:
 
         Attached-DB tables are named ``<source>.<table>`` (or ``<source>.<schema>.<table>`` for a
         non-default schema — paste-ready either way); file sources appear as their single view
-        name. Row counts are filled for SQLite/file sources (cheap) and left None for remote DBs
-        (a COUNT could be expensive).
+        name. Row counts are filled only where a COUNT is cheap (SQLite tables); file/lakehouse
+        views and remote DBs are left None (a COUNT could scan a whole remote object) — ``describe``
+        fills them on demand.
         """
         out: list[TableInfo] = []
         with self._lock:
@@ -1160,9 +1161,12 @@ class DuckSession:
         source often keeps its tables in a non-default schema). The attached DB's own system
         schemas (information_schema, pg_catalog) are metadata, not data, and are hidden.
         """
-        if src.kind == "file":
-            return [TableInfo(name=src.name, kind="view", row_count=self._safe_count(src.name))]
-        if src.kind in ("sqlite", "postgres", "mysql"):
+        if src.kind in ("file", "delta", "iceberg"):
+            # No eager COUNT(*): a file/lakehouse source can be remote (https/s3/...), so counting
+            # here would trigger a full scan while holding the session lock and stall every other
+            # tool call. describe() (db://{table}) fills the count lazily, on demand.
+            return [TableInfo(name=src.name, kind="view", row_count=None)]
+        if src.kind in ("sqlite", "postgres", "mysql", "ducklake"):
             rows = self._con.execute(
                 "SELECT table_schema, table_name, table_type FROM information_schema.tables "
                 "WHERE table_catalog = ? ORDER BY table_schema, table_name",

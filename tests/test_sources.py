@@ -42,9 +42,32 @@ class TestDetectKind:
     def test_detect(self, loc, kind):
         assert sources.detect_kind(loc) == kind
 
+    @pytest.mark.parametrize(
+        "loc,kind",
+        [
+            ("https://example.com/data/sales.parquet", "file"),
+            ("s3://bucket/trips/part.parquet", "file"),
+            ("az://container/data.csv", "file"),
+            ("data.avro", "file"),
+            ("https://host/data.parquet?token=abc", "file"),  # query string ignored for ext
+            ("delta:./warehouse/events", "delta"),
+            ("delta:s3://bucket/tbl", "delta"),
+            ("iceberg:./warehouse/tbl", "iceberg"),
+            ("ducklake:./catalog.ducklake", "ducklake"),
+        ],
+    )
+    def test_detect_new_kinds(self, loc, kind):
+        assert sources.detect_kind(loc) == kind
+
     def test_unknown_raises(self):
         with pytest.raises(ValueError):
             sources.detect_kind("mystery.xyz")
+
+    def test_unknown_extension_error_teaches_format_prefix(self):
+        # A genuinely unrecognized, unprefixed extension errors — and the message points at the
+        # format-prefix escape hatch so the agent can retry in one step.
+        with pytest.raises(ValueError, match="format prefix"):
+            sources.build_source("https://host/data/mystery.dat")
 
     def test_sql_server_unsupported(self):
         # DuckDB can't attach SQL Server; it's rejected with a clear message (no fallback).
@@ -60,6 +83,113 @@ class TestDeriveName:
     def test_dsn_uses_db_name(self):
         src = sources.build_source("sqlite:///C:/data/financial.db")
         assert src.name == "financial"
+
+    def test_remote_url_stem(self):
+        src = sources.build_source("https://example.com/data/sales.parquet?token=x")
+        assert src.name == "sales"
+
+    def test_delta_scheme_stripped_from_name(self):
+        src = sources.build_source("delta:./warehouse/events")
+        assert src.name == "events"
+
+    def test_ducklake_scheme_stripped_from_name(self):
+        src = sources.build_source("ducklake:./my_catalog.ducklake")
+        assert src.name == "my_catalog"
+
+
+# --------------------------------------------------------------------------- #
+# Builders for the new source kinds emit the right setup SQL (no connection needed)
+# --------------------------------------------------------------------------- #
+class TestBuildNewKinds:
+    def test_remote_file_loads_httpfs_and_keeps_url(self):
+        src = sources.build_source("https://example.com/data/sales.parquet")
+        assert src.kind == "file"
+        assert ["INSTALL httpfs", "LOAD httpfs"] == src.setup_sql[:2]
+        # URL passed through verbatim — NOT run through os.path.abspath.
+        assert "read_parquet('https://example.com/data/sales.parquet')" in src.setup_sql[-1]
+
+    def test_azure_url_loads_azure(self):
+        src = sources.build_source("x=az://container/data.csv")
+        assert ["INSTALL azure", "LOAD azure"] == src.setup_sql[:2]
+
+    def test_avro_loads_avro_ext(self):
+        src = sources.build_source("events=./data/events.avro")
+        assert ["INSTALL avro", "LOAD avro"] == src.setup_sql[:2]
+        assert "read_avro(" in src.setup_sql[-1]
+
+    def test_delta_builds_scan_view(self):
+        src = sources.build_source("events=delta:./warehouse/events")
+        assert src.kind == "delta"
+        assert "INSTALL delta" in src.setup_sql and "LOAD delta" in src.setup_sql
+        assert "delta_scan(" in src.setup_sql[-1]
+        assert 'CREATE OR REPLACE VIEW main."events"' in src.setup_sql[-1]
+        assert sources.teardown_sql(src) == ['DROP VIEW IF EXISTS main."events"']
+
+    def test_iceberg_remote_loads_httpfs_and_iceberg(self):
+        src = sources.build_source("tbl=iceberg:s3://bucket/tbl")
+        assert src.kind == "iceberg"
+        # httpfs first (remote), then the iceberg reader.
+        assert src.setup_sql[:2] == ["INSTALL httpfs", "LOAD httpfs"]
+        # allow_moved_paths lets a relocated/relative-path table still resolve.
+        assert "iceberg_scan('s3://bucket/tbl', allow_moved_paths => true)" in src.setup_sql[-1]
+
+    def test_ducklake_attaches_read_only(self):
+        src = sources.build_source("lake=ducklake:./catalog.ducklake")
+        assert src.kind == "ducklake"
+        assert src.setup_sql[:2] == ["INSTALL ducklake", "LOAD ducklake"]
+        assert src.setup_sql[-1] == "ATTACH 'ducklake:./catalog.ducklake' AS \"lake\" (READ_ONLY)"
+        assert sources.teardown_sql(src) == ['DETACH "lake"']
+
+
+# --------------------------------------------------------------------------- #
+# Format-override prefixes (csv:/tsv:/json:/parquet:/excel:/avro:) force a reader
+# --------------------------------------------------------------------------- #
+class TestFormatPrefix:
+    def test_csv_prefix_forces_reader_on_odd_extension(self):
+        # A .dat file that is really CSV: csv: forces read_csv_auto regardless of extension.
+        src = sources.build_source("routes=csv:https://host/data/routes.dat")
+        assert src.kind == "file"
+        # Remote → httpfs loaded first, URL kept verbatim (no os.path.abspath mangling).
+        assert src.setup_sql[:2] == ["INSTALL httpfs", "LOAD httpfs"]
+        assert "read_csv_auto('https://host/data/routes.dat')" in src.setup_sql[-1]
+
+    def test_parquet_prefix_overrides_bin_extension(self):
+        src = sources.build_source("d=parquet:./data.bin")
+        assert "read_parquet(" in src.setup_sql[-1]
+
+    def test_json_prefix_overrides_txt_extension(self):
+        src = sources.build_source("d=json:./data.txt")
+        assert "read_json_auto(" in src.setup_sql[-1]
+
+    def test_excel_prefix_loads_extension(self):
+        src = sources.build_source("book=excel:./data.bin")
+        assert ["INSTALL excel", "LOAD excel"] == src.setup_sql[-3:-1]
+        assert "read_xlsx(" in src.setup_sql[-1]
+
+    def test_prefix_is_case_insensitive(self):
+        src = sources.build_source("d=CSV:./data.dat")
+        assert "read_csv_auto(" in src.setup_sql[-1]
+
+    def test_name_composes_with_format_prefix(self):
+        # name= sets the source name; the format prefix is stripped from the locator.
+        src = sources.build_source("myname=csv:./file.dat")
+        assert src.name == "myname"
+
+    def test_derived_name_strips_format_prefix(self):
+        # With no name=, the name derives from the inner path, not the prefix.
+        src = sources.build_source("csv:https://host/path/routes.dat")
+        assert src.name == "routes"
+
+    def test_windows_drive_not_mistaken_for_prefix(self):
+        # A drive letter is one char; every format prefix is three+, so C:/ never matches.
+        assert sources.detect_kind("C:/data/foo.csv") == "file"
+        _, inner = sources._split_format_prefix("C:/data/foo.csv")
+        assert inner == "C:/data/foo.csv"
+
+    def test_unknown_prefix_falls_through_to_extension(self):
+        # An unrecognized prefix is not a format override; detection falls back to the real ext.
+        ext, inner = sources._split_format_prefix("foo:./bar.csv")
+        assert ext is None and inner == "foo:./bar.csv"
 
 
 # --------------------------------------------------------------------------- #

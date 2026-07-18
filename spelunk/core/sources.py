@@ -2,10 +2,14 @@
 
 The unified engine is a single DuckDB connection. Every source is reached through it:
 
-  * **files** (CSV/TSV/Parquet/JSON/Excel) are scanned with DuckDB's ``read_*`` functions and
+  * **files** (CSV/TSV/Parquet/JSON/Excel/Avro) are scanned with DuckDB's ``read_*`` functions and
     registered as VIEWs in the workspace ``main`` schema (the file stays the source of truth,
-    so queries push projection/filters down to the scan rather than copying the file in);
-  * **SQLite / PostgreSQL / MySQL** are ``ATTACH``ed read-only, each as its own catalog.
+    so queries push projection/filters down to the scan rather than copying the file in). A file
+    path may be local *or* a remote URL (``https://``, ``s3://``, ``gs://``, ``az://``) — the
+    matching filesystem extension (``httpfs`` / ``azure``) is loaded automatically;
+  * **lakehouse tables** (Delta / Iceberg) are scanned via ``delta_scan`` / ``iceberg_scan`` and
+    likewise registered as VIEWs — write ``delta:<path>`` / ``iceberg:<path>``;
+  * **SQLite / PostgreSQL / MySQL / DuckLake** are ``ATTACH``ed read-only, each as its own catalog.
 
 Everything reachable is reached through the one DuckDB connection — there is no out-of-engine
 fallback. A source DuckDB can't attach (e.g. SQL Server) is not supported; export it to a file
@@ -14,12 +18,22 @@ fallback. A source DuckDB can't attach (e.g. SQL Server) is not supported; expor
 A spec is a string, optionally prefixed ``name=``::
 
     sales=./data/sales.parquet
+    remote=https://example.com/data/sales.parquet
+    routes=csv:https://example.com/data/routes.dat  # force a reader for an odd/absent extension
+    trips=s3://my-bucket/trips/*.parquet
+    events=delta:./warehouse/events            # a Delta Lake table directory
+    catalog=iceberg:./warehouse/catalog/table  # an Iceberg table
+    lake=ducklake:./catalog.ducklake           # a DuckLake catalog
     sqlite:///C:/data/app.db
     postgresql://user:pw@host/dbname
     ./reports/q1.csv               # name derived from the filename -> q1
 
-Attached databases are referenced in SQL by ``"<source>"."<table>"``; file sources by their
-bare view name.
+A file whose name lacks a recognised extension (an API endpoint, a ``.dat`` dump) is read by
+forcing the reader with a format prefix — ``csv:`` / ``tsv:`` / ``json:`` / ``parquet:`` /
+``excel:`` / ``avro:`` — placed on the locator (after any ``name=``): ``routes=csv:<url>``.
+
+Attached databases (and DuckLake) are referenced in SQL by ``"<source>"."<table>"``; file and
+lakehouse-scan sources by their bare view name.
 """
 from __future__ import annotations
 
@@ -32,9 +46,10 @@ from urllib.parse import parse_qsl, unquote, urlsplit
 if TYPE_CHECKING:
     import duckdb
 
-SourceKind = Literal["file", "sqlite", "postgres", "mysql"]
+SourceKind = Literal["file", "sqlite", "postgres", "mysql", "delta", "iceberg", "ducklake"]
 
-# File extension -> DuckDB table function used to scan it.
+# File extension -> DuckDB table function used to scan it (readers in the core/statically-linked
+# build, no extension load needed).
 _FILE_READERS: dict[str, str] = {
     ".csv": "read_csv_auto",
     ".tsv": "read_csv_auto",
@@ -45,12 +60,58 @@ _FILE_READERS: dict[str, str] = {
     ".ndjson": "read_json_auto",
     ".jsonl": "read_json_auto",
 }
-# Excel is scanned via read_xlsx, which lives in the loadable `excel` extension.
-_EXCEL_EXTS = frozenset({".xlsx", ".xlsm", ".xls"})
+# Extension-backed file readers: ext -> (duckdb extension, read function). These need an
+# INSTALL/LOAD before the scan, unlike the statically-linked readers above.
+_EXT_FILE_READERS: dict[str, tuple[str, str]] = {
+    ".xlsx": ("excel", "read_xlsx"),
+    ".xlsm": ("excel", "read_xlsx"),
+    # NB: legacy binary .xls is intentionally absent — DuckDB's excel reader (read_xlsx) handles
+    # the OOXML .xlsx/.xlsm formats only, so a .xls would fail at view creation.
+    ".avro": ("avro", "read_avro"),
+}
 # Extensions that mean "this path is a SQLite database file" (attach, don't scan).
 _SQLITE_EXTS = frozenset({".sqlite", ".sqlite3", ".db"})
 
-# Map our attach kinds to (duckdb extension, ATTACH TYPE).
+# Format-override prefixes: force a reader regardless of the locator's extension, for files whose
+# name doesn't reveal the format (a ``.dat`` dump, an extensionless API URL). Each maps to a
+# canonical extension resolved through the reader tables above, so excel/avro still INSTALL/LOAD
+# their extension. Written like the ``delta:``/``iceberg:`` scheme prefixes, e.g. ``csv:<url>``.
+_FORMAT_PREFIX: dict[str, str] = {
+    "csv": ".csv",
+    "tsv": ".tsv",
+    "json": ".json",
+    "parquet": ".parquet",
+    "excel": ".xlsx",
+    "avro": ".avro",
+}
+
+# Remote-path schemes reachable through a DuckDB filesystem extension, mapped to the extension
+# that provides them. httpfs covers http(s)/S3/GCS/R2; azure covers Azure Blob / ADLS.
+_REMOTE_EXT: dict[str, str] = {
+    "http://": "httpfs",
+    "https://": "httpfs",
+    "s3://": "httpfs",
+    "s3a://": "httpfs",
+    "gs://": "httpfs",
+    "gcs://": "httpfs",
+    "r2://": "httpfs",
+    "az://": "azure",
+    "azure://": "azure",
+    "abfs://": "azure",
+    "abfss://": "azure",
+}
+
+# Lakehouse table scans: kind -> (duckdb extension, scan function, extra scan args). Written as a
+# VIEW like a file. iceberg_scan gets ``allow_moved_paths => true`` so a table whose manifests hold
+# paths written for a different location (relative, or an absolute path from generation) still reads
+# — DuckDB's own documented default for iceberg_scan; correct paths are unaffected.
+_SCAN_KINDS: dict[str, tuple[str, str, str]] = {
+    "delta": ("delta", "delta_scan", ""),
+    "iceberg": ("iceberg", "iceberg_scan", ", allow_moved_paths => true"),
+}
+
+# Map our attach kinds to (duckdb extension, ATTACH TYPE). DuckLake infers its TYPE from the
+# ``ducklake:`` locator prefix, so it has no explicit ATTACH TYPE.
 _ATTACH_EXT = {"sqlite": "sqlite", "postgres": "postgres", "mysql": "mysql"}
 
 _NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
@@ -85,8 +146,28 @@ def parse_spec(spec: str) -> tuple[str | None, str]:
     return None, spec.strip()
 
 
-def detect_kind(locator: str) -> SourceKind:
-    """Classify a locator into a :data:`SourceKind` by scheme/extension."""
+def _split_format_prefix(locator: str) -> tuple[str | None, str]:
+    """Split a leading format-override prefix (``csv:`` / ``json:`` / ...) off a locator.
+
+    Returns ``(canonical_ext, inner_locator)`` when the locator starts with a known format
+    prefix, else ``(None, locator)``. The prefix is matched case-insensitively; the inner
+    locator keeps its original case (URLs are case-sensitive). A Windows drive path such as
+    ``C:/x.dat`` never matches — a drive is one letter, every prefix is three or more.
+    """
+    head, sep, rest = locator.partition(":")
+    if sep and head.lower() in _FORMAT_PREFIX:
+        return _FORMAT_PREFIX[head.lower()], rest
+    return None, locator
+
+
+def detect_kind(locator: str, forced_ext: str | None = None) -> SourceKind:
+    """Classify a locator into a :data:`SourceKind` by scheme/extension.
+
+    ``forced_ext`` (the canonical extension from a ``csv:``/``json:``/... format prefix) pins the
+    locator to a ``file`` source regardless of its own extension.
+    """
+    if forced_ext is not None:
+        return "file"
     low = locator.lower()
     if low.startswith(("postgresql://", "postgres://")):
         return "postgres"
@@ -97,24 +178,35 @@ def detect_kind(locator: str) -> SourceKind:
             f"SQL Server sources are not supported: DuckDB cannot attach {locator!r}. "
             "Export the data to a file (Parquet/CSV) and point a --source at that instead."
         )
+    if low.startswith("ducklake:"):
+        return "ducklake"
+    if low.startswith("delta:"):
+        return "delta"
+    if low.startswith("iceberg:"):
+        return "iceberg"
     if low.startswith("sqlite://"):
         return "sqlite"
-    ext = os.path.splitext(low)[1]
-    if ext in _FILE_READERS or ext in _EXCEL_EXTS:
+    ext = _path_ext(locator)
+    if ext in _FILE_READERS or ext in _EXT_FILE_READERS:
         return "file"
     if ext in _SQLITE_EXTS:
         return "sqlite"
     raise ValueError(
-        f"Could not determine the source type of {locator!r}. Supported: files "
-        f"({', '.join(sorted(set(_FILE_READERS) | _EXCEL_EXTS | _SQLITE_EXTS))}), "
-        "or a sqlite:// / postgresql:// / mysql:// DSN."
+        f"Could not determine the source type of {locator!r}. If it is a data file with an "
+        "unrecognized or absent extension (a .dat dump, an extensionless API URL), force the "
+        f"reader with a format prefix — csv:/tsv:/json:/parquet:/excel:/avro: — e.g. csv:{locator}. "
+        "Recognized extensions: "
+        f"{', '.join(sorted(set(_FILE_READERS) | set(_EXT_FILE_READERS) | _SQLITE_EXTS))} "
+        "(local or via https://, s3://, gs://, az:// URL); or a delta:<path> / iceberg:<path> / "
+        "ducklake: locator; or a sqlite:// / postgresql:// / mysql:// DSN."
     )
 
 
 def build_source(spec: str) -> Source:
     """Parse a single spec into a :class:`Source` (no DuckDB connection touched yet)."""
     explicit, locator = parse_spec(spec)
-    kind = detect_kind(locator)
+    forced_ext, locator = _split_format_prefix(locator)
+    kind = detect_kind(locator, forced_ext=forced_ext)
     name = explicit or _derive_name(locator, kind)
     if not _NAME_RE.match(name):
         raise ValueError(
@@ -123,19 +215,23 @@ def build_source(spec: str) -> Source:
         )
 
     if kind == "file":
-        return _build_file_source(name, locator)
+        return _build_file_source(name, locator, forced_ext=forced_ext)
+    if kind in _SCAN_KINDS:
+        return _build_scan_source(name, kind, locator)
+    if kind == "ducklake":
+        return _build_ducklake_source(name, locator)
     return _build_attach_source(name, kind, locator)
 
 
 def teardown_sql(src: Source) -> list[str]:
     """Statements that undo a source's :attr:`Source.setup_sql` — the inverse of attaching.
 
-    A ``file`` source drops its ``main`` view; an attached database is ``DETACH``ed. Used by
-    ``DuckSession.remove_source``.
+    A view-backed source (``file`` / ``delta`` / ``iceberg``) drops its ``main`` view; an attached
+    database (SQLite/Postgres/MySQL/DuckLake) is ``DETACH``ed. Used by ``DuckSession.remove_source``.
     """
-    if src.kind == "file":
+    if src.kind == "file" or src.kind in _SCAN_KINDS:
         return [f'DROP VIEW IF EXISTS main."{src.name}"']
-    if src.kind in _ATTACH_EXT:
+    if src.kind in _ATTACH_EXT or src.kind == "ducklake":
         return [f'DETACH "{src.name}"']
     return []
 
@@ -164,18 +260,52 @@ def attach_all(con: "duckdb.DuckDBPyConnection", specs: Iterable[str]) -> list[S
 # --------------------------------------------------------------------------- #
 # Builders
 # --------------------------------------------------------------------------- #
-def _build_file_source(name: str, locator: str) -> Source:
-    """A file source becomes a VIEW in `main` over the matching read_* scan."""
-    ext = os.path.splitext(locator.lower())[1]
+def _build_file_source(name: str, locator: str, forced_ext: str | None = None) -> Source:
+    """A file source becomes a VIEW in `main` over the matching read_* scan.
+
+    The path may be local or a remote URL (``https://``/``s3://``/``gs://``/``az://``); a remote
+    path loads the filesystem extension (``httpfs`` / ``azure``) first and is passed through
+    verbatim (not run through ``os.path.abspath``, which would mangle the scheme). ``forced_ext``
+    (from a ``csv:``/``json:``/... format prefix) overrides the extension-based reader choice, so a
+    file with an odd or absent extension still reads.
+    """
+    ext = forced_ext if forced_ext is not None else _path_ext(locator)
     path = _duck_path(locator)
-    setup: list[str] = []
-    if ext in _EXCEL_EXTS:
-        setup += ["INSTALL excel", "LOAD excel"]
-        scan = f"read_xlsx('{path}')"
+    setup: list[str] = list(_remote_setup(locator))
+    if ext in _EXT_FILE_READERS:
+        ext_name, reader = _EXT_FILE_READERS[ext]
+        setup += [f"INSTALL {ext_name}", f"LOAD {ext_name}"]
+        scan = f"{reader}('{path}')"
     else:
         scan = f"{_FILE_READERS[ext]}('{path}')"
     setup.append(f'CREATE OR REPLACE VIEW main."{name}" AS SELECT * FROM {scan}')
     return Source(name=name, kind="file", locator=locator, setup_sql=setup)
+
+
+def _build_scan_source(name: str, kind: SourceKind, locator: str) -> Source:
+    """A Delta/Iceberg table becomes a VIEW in `main` over ``delta_scan`` / ``iceberg_scan``.
+
+    The spec is ``delta:<path>`` / ``iceberg:<path>`` where ``<path>`` is a local directory or a
+    remote URL; a remote path additionally loads its filesystem extension.
+    """
+    ext_name, scan_fn, extra_args = _SCAN_KINDS[kind]
+    inner = _strip_scheme(locator, kind)
+    path = _duck_path(inner)
+    setup: list[str] = list(_remote_setup(inner))
+    setup += [f"INSTALL {ext_name}", f"LOAD {ext_name}"]
+    setup.append(
+        f'CREATE OR REPLACE VIEW main."{name}" AS SELECT * FROM {scan_fn}(\'{path}\'{extra_args})'
+    )
+    return Source(name=name, kind=kind, locator=locator, setup_sql=setup)
+
+
+def _build_ducklake_source(name: str, locator: str) -> Source:
+    """A DuckLake catalog is ``ATTACH``ed read-only; its TYPE is inferred from the ``ducklake:``
+    locator prefix, which is kept intact and passed straight to ATTACH."""
+    target = locator.replace("'", "''")
+    setup = ["INSTALL ducklake", "LOAD ducklake"]
+    setup.append(f"ATTACH '{target}' AS \"{name}\" (READ_ONLY)")
+    return Source(name=name, kind="ducklake", locator=locator, setup_sql=setup)
 
 
 def _build_attach_source(name: str, kind: SourceKind, locator: str) -> Source:
@@ -238,6 +368,11 @@ def _conn_value(val: str) -> str:
 
 def _derive_name(locator: str, kind: SourceKind) -> str:
     """Derive a SQL-identifier source name from a locator (filename stem or DB name)."""
+    # Strip our own scheme prefixes so the name comes from the underlying path, not "delta"/etc.
+    if kind in _SCAN_KINDS:
+        locator = _strip_scheme(locator, kind)
+    elif kind == "ducklake":
+        locator = _strip_scheme(locator, "ducklake")
     if "://" in locator:
         try:
             url = urlsplit(locator)
@@ -247,6 +382,8 @@ def _derive_name(locator: str, kind: SourceKind) -> str:
             base = kind
     else:
         base = locator
+    # A remote/glob path may carry a query string or wildcard — keep only the last path segment.
+    base = base.split("?")[0].rstrip("/")
     stem = os.path.splitext(os.path.basename(base or kind))[0]
     name = _SANITIZE_RE.sub("_", stem).strip("_").lower() or kind
     if not re.match(r"[A-Za-z_]", name[0]):
@@ -254,6 +391,59 @@ def _derive_name(locator: str, kind: SourceKind) -> str:
     return name[:63]
 
 
+def _path_ext(locator: str) -> str:
+    """The lower-cased file extension of *locator*, ignoring any URL query string/fragment.
+
+    Uses ``urlsplit`` only for genuine ``scheme://`` URLs so a Windows drive path (``C:/x.csv``)
+    isn't misread as a scheme.
+    """
+    path = locator
+    if "://" in locator:
+        path = urlsplit(locator).path
+    return os.path.splitext(path.lower())[1]
+
+
+def _is_remote(path: str) -> bool:
+    """True if *path* is a remote URL served by a DuckDB filesystem extension."""
+    return path.lower().startswith(tuple(_REMOTE_EXT))
+
+
+def _remote_setup(path: str) -> list[str]:
+    """INSTALL/LOAD statements for the filesystem extension a remote *path* needs (empty if local).
+
+    For ``s3://`` paths a default ``s3_region`` is set so a *public* bucket reads with zero config
+    (DuckDB otherwise leaves the region empty and the request 404s). ``us-east-1`` covers most AWS
+    open-data buckets; this is only the fallback for anonymous access — a bucket in another region,
+    or a private one, needs the user's own DuckDB S3 secret, whose REGION takes precedence.
+
+    Known limitation / possible extension: ``SET s3_region`` is connection-global, so registering
+    an S3 source overwrites the region for *every* later S3 read in the session. That's harmless
+    with secrets (a secret's REGION wins) but can clobber a region a caller set manually via
+    ``SET s3_region`` for a non-us-east-1 bucket. If that becomes a real need, make it
+    non-destructive — only set the fallback when the region is currently empty (guard on
+    ``current_setting('s3_region')``), or scope the region per source via a ``CREATE SECRET`` with
+    a bucket ``SCOPE`` instead of a global ``SET``.
+    """
+    low = path.lower()
+    for scheme, ext_name in _REMOTE_EXT.items():
+        if low.startswith(scheme):
+            setup = [f"INSTALL {ext_name}", f"LOAD {ext_name}"]
+            if scheme in ("s3://", "s3a://"):
+                # Global fallback region — see the "Known limitation" note above before changing.
+                setup.append("SET s3_region = 'us-east-1'")
+            return setup
+    return []
+
+
+def _strip_scheme(locator: str, kind: str) -> str:
+    """Strip a leading ``<kind>:`` scheme prefix (``delta:`` / ``iceberg:`` / ``ducklake:``)."""
+    prefix = f"{kind}:"
+    return locator[len(prefix):] if locator.lower().startswith(prefix) else locator
+
+
 def _duck_path(path: str) -> str:
-    """Absolute, forward-slashed, single-quote-escaped path for a DuckDB string literal."""
+    """A path as a DuckDB string literal: remote URLs pass through verbatim; local paths are made
+    absolute and forward-slashed. Single quotes are escaped in both cases."""
+    if _is_remote(path):
+        return path.replace("'", "''")
     return os.path.abspath(path).replace("\\", "/").replace("'", "''")
