@@ -210,6 +210,34 @@ class TestMermaidRender:
         lin = session.lineage("base", render="mermaid")
         assert "all customers" in lin["mermaid"]
 
+    def test_dot_render_is_valid_digraph(self, session):
+        _build_chain(session)
+        lin = session.lineage("top", render="dot")
+        dot = lin["dot"]
+        assert dot.startswith("digraph lineage {")
+        assert dot.rstrip().endswith("}")
+        for nm in ("base", "mid", "top"):
+            assert f'label="{nm} (' in dot
+        assert " -> " in dot
+        assert "orders" in dot
+        # Reproducible with no LLM in the loop.
+        assert session.lineage("top", render="dot")["dot"] == dot
+
+    def test_dot_and_mermaid_share_node_ids(self, session):
+        _build_chain(session)
+        import re
+
+        mmd = session.lineage("top", render="mermaid")["mermaid"]
+        dot = session.lineage("top", render="dot")["dot"]
+        mmd_edges = set(re.findall(r"(n\d+) --> (n\d+)", mmd))
+        dot_edges = set(re.findall(r"(n\d+) -> (n\d+)", dot))
+        assert mmd_edges == dot_edges
+
+    def test_path_defaults_to_mermaid_not_dot(self, session, tmp_path):
+        _build_chain(session)
+        lin = session.lineage("top", path=str(tmp_path / "g.mmd"))
+        assert "mermaid" in lin and "dot" not in lin
+
 
 class TestReplay:
     def test_dry_run_plans_without_executing(self, session):

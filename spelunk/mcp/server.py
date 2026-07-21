@@ -432,11 +432,11 @@ def build_server(
             "transitively depends on, across flows); with no `name`, the whole flow. Returns nodes "
             "(name, kind, description, sql, deps, sources, created_at), edges, a dependency-first "
             "`order`, and `missing` (deps whose lineage is gone). `description` is a one-line, "
-            "plain-English label (null if none was given). Pass `render='mermaid'` to also get a "
-            "ready-to-display Mermaid `flowchart` string (under `mermaid`) built deterministically "
-            "from the same graph — no parsing needed; paste it into markdown or an artifact. "
-            "`path` writes that diagram to a file (implies `render='mermaid'`) and returns its "
-            "absolute path under `rendered_to`. Read-only."
+            "plain-English label (null if none was given). Pass `render='mermaid'` (or `'dot'`) to "
+            "also get a ready-to-display diagram string (under that key) built deterministically "
+            "from the same graph — no parsing needed; paste Mermaid into markdown/an artifact, or "
+            "run DOT through `dot -Tsvg`. `path` writes the diagram to a file (implies "
+            "`render='mermaid'`) and returns its absolute path under `rendered_to`. Read-only."
         ),
     )
     @_logged

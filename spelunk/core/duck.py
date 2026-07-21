@@ -1094,10 +1094,13 @@ class DuckSession:
         if path is not None and render is None:
             render = "mermaid"
         if render is not None:
-            if render != "mermaid":
-                raise ValueError(f"Unsupported render {render!r}. Only 'mermaid' is supported.")
-            diagram = self._to_mermaid(nodes, edges)
-            result["mermaid"] = diagram
+            renderers = {"mermaid": self._to_mermaid, "dot": self._to_dot}
+            if render not in renderers:
+                raise ValueError(
+                    f"Unsupported render {render!r}. Choose 'mermaid' or 'dot'."
+                )
+            diagram = renderers[render](nodes, edges)
+            result[render] = diagram
             if path is not None:
                 abs_path = os.path.abspath(path)
                 parent = os.path.dirname(abs_path)
@@ -1109,30 +1112,20 @@ class DuckSession:
         return result
 
     @staticmethod
-    def _to_mermaid(nodes: list[dict[str, Any]], edges: list[dict[str, str]]) -> str:
-        """Serialize a lineage graph to a Mermaid ``flowchart TD`` string.
+    def _graph_layout(
+        nodes: list[dict[str, Any]], edges: list[dict[str, str]]
+    ) -> tuple[list[str], list[tuple[str, str]], dict[str, str]]:
+        """Shared layout for the diagram renderers: leaf refs, leaf edges, and stable node ids.
 
-        Result nodes render as rectangles labelled with their name, kind, and description; external
-        leaves — the sources each result reads (files, DB tables) plus any dependency whose lineage
-        row is gone — render as rounded nodes with an edge into the result that consumes them, so
-        the diagram has no dangling edges and shows where data enters. Node ids are assigned
-        deterministically, so the same graph always yields byte-identical output.
+        Leaf edges are ``(source_or_missing_ref -> result_ref)``: the sources each result reads
+        (files, DB tables) plus any dependency whose lineage row is gone (an edge ``from`` that is
+        not a materialized result). Ids ``n0, n1, ...`` are assigned deterministically — results in
+        ``seq`` order first, then leaves in first-seen order — so a given graph always lays out
+        identically regardless of output format.
         """
-        def esc(text: str) -> str:
-            # Mermaid label text: neutralize quotes/newlines and the reserved bracket chars.
-            return (
-                text.replace("\\", "/")
-                .replace('"', "'")
-                .replace("\n", " ")
-                .replace("[", "(")
-                .replace("]", ")")
-            )
-
         result_refs = [f"{n['flow']}.{n['name']}" for n in nodes]
         result_set = set(result_refs)
 
-        # Leaf edges: (source_or_missing_ref -> result_ref). Sources come from each node's
-        # `sources` list; dropped/external deps show up as an edge `from` that is not a result.
         leaf_edges: list[tuple[str, str]] = []
         for n in nodes:
             ref = f"{n['flow']}.{n['name']}"
@@ -1144,7 +1137,27 @@ class DuckSession:
 
         leaf_refs = list(dict.fromkeys(src for src, _ in leaf_edges))
         ids = {ref: f"n{i}" for i, ref in enumerate(result_refs + leaf_refs)}
+        return leaf_refs, leaf_edges, ids
 
+    @classmethod
+    def _to_mermaid(cls, nodes: list[dict[str, Any]], edges: list[dict[str, str]]) -> str:
+        """Serialize a lineage graph to a Mermaid ``flowchart TD`` string.
+
+        Result nodes render as rectangles labelled with their name, kind, and description; external
+        leaves (sources + dropped deps) render as rounded nodes with an edge into the result that
+        consumes them, so the diagram has no dangling edges and shows where data enters.
+        """
+        def esc(text: str) -> str:
+            # Mermaid label text: neutralize quotes/newlines and the reserved bracket chars.
+            return (
+                text.replace("\\", "/")
+                .replace('"', "'")
+                .replace("\n", " ")
+                .replace("[", "(")
+                .replace("]", ")")
+            )
+
+        leaf_refs, leaf_edges, ids = cls._graph_layout(nodes, edges)
         lines = ["flowchart TD"]
         for n in nodes:
             ref = f"{n['flow']}.{n['name']}"
@@ -1160,6 +1173,35 @@ class DuckSession:
             lines.append(f'    {ids[e["from"]]} --> {ids[e["to"]]}')
         for src, dst in leaf_edges:
             lines.append(f'    {ids[src]} --> {ids[dst]}')
+        return "\n".join(lines)
+
+    @classmethod
+    def _to_dot(cls, nodes: list[dict[str, Any]], edges: list[dict[str, str]]) -> str:
+        """Serialize a lineage graph to a Graphviz DOT ``digraph`` string.
+
+        Same layout as the Mermaid renderer — result nodes are boxes (name, kind, optional
+        description on a second line), external leaves are ellipses — so ``dot -Tsvg`` yields a
+        real image. Node ids match ``_graph_layout`` for byte-identical output per graph.
+        """
+        def esc(text: str) -> str:
+            # DOT double-quoted string: escape backslashes and quotes; \n is a line break.
+            return text.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
+
+        leaf_refs, leaf_edges, ids = cls._graph_layout(nodes, edges)
+        lines = ["digraph lineage {", "  rankdir=TB;", '  node [fontname="Helvetica"];']
+        for n in nodes:
+            ref = f"{n['flow']}.{n['name']}"
+            label = esc(f"{n['name']} ({n['kind']})")
+            if n["description"]:
+                label += f"\\n{esc(n['description'])}"
+            lines.append(f'  {ids[ref]} [shape=box, label="{label}"];')
+        for ref in leaf_refs:
+            lines.append(f'  {ids[ref]} [shape=ellipse, label="{esc(ref)}"];')
+        for e in edges:
+            lines.append(f'  {ids[e["from"]]} -> {ids[e["to"]]};')
+        for src, dst in leaf_edges:
+            lines.append(f'  {ids[src]} -> {ids[dst]};')
+        lines.append("}")
         return "\n".join(lines)
 
     @staticmethod
