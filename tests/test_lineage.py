@@ -99,6 +99,59 @@ class TestLineageRecording:
         assert lin["nodes"] == []
 
 
+class TestDescriptions:
+    def test_description_recorded_in_lineage_and_catalog(self, session):
+        session.query(
+            'SELECT id, name FROM "shop"."customers"',
+            "people",
+            description="List of every customer with their name.",
+        )
+        node = {n["name"]: n for n in session.lineage("people")["nodes"]}["people"]
+        assert node["description"] == "List of every customer with their name."
+        # catalog surfaces the same label alongside the result.
+        cat = {r["name"]: r for r in session.catalog("default")["results"]}
+        assert cat["people"]["description"] == "List of every customer with their name."
+
+    def test_description_optional_defaults_to_none(self, session):
+        session.query("SELECT 1 AS x", "plain")
+        node = {n["name"]: n for n in session.lineage("plain")["nodes"]}["plain"]
+        assert node["description"] is None
+        cat = {r["name"]: r for r in session.catalog("default")["results"]}
+        assert cat["plain"]["description"] is None
+
+    def test_blank_description_normalised_to_none(self, session):
+        session.query("SELECT 1 AS x", "blank", description="   ")
+        node = {n["name"]: n for n in session.lineage("blank")["nodes"]}["blank"]
+        assert node["description"] is None
+
+    def test_replace_updates_description(self, session):
+        session.query("SELECT 1 AS x", "r", description="first label")
+        session.query("SELECT 2 AS x", "r", description="second label")
+        node = {n["name"]: n for n in session.lineage("r")["nodes"]}["r"]
+        assert node["description"] == "second label"
+
+    def test_batch_step_descriptions(self, session):
+        session.query_steps([
+            {"sql": 'SELECT * FROM "shop"."customers"', "name": "base",
+             "description": "All customers, raw."},
+            {"sql": "SELECT COUNT(*) AS n FROM base", "name": "agg",
+             "description": "How many customers there are."},
+        ])
+        nodes = {n["name"]: n for n in session.lineage("agg")["nodes"]}
+        assert nodes["base"]["description"] == "All customers, raw."
+        assert nodes["agg"]["description"] == "How many customers there are."
+
+    def test_replay_preserves_descriptions(self, session):
+        session.query('SELECT id, name FROM "shop"."customers"', "base",
+                      description="Raw customer list.")
+        session.query("SELECT COUNT(*) AS n FROM base", "cnt",
+                      description="Customer count.")
+        session.replay(into="v2")
+        nodes = {n["name"]: n for n in session.lineage("cnt", "v2")["nodes"]}
+        assert nodes["base"]["description"] == "Raw customer list."
+        assert nodes["cnt"]["description"] == "Customer count."
+
+
 class TestLineageErrors:
     def test_unknown_result_raises(self, session):
         with pytest.raises(ValueError, match="No lineage"):

@@ -300,15 +300,21 @@ class DuckSession:
         A result is keyed by (flow, name); ``CREATE OR REPLACE`` of a result overwrites its
         row, so the store always reflects the *current* definition. ``deps`` and ``sources``
         are JSON arrays; ``seq`` is a monotonic creation counter used as a stable tie-break
-        when ordering independent nodes for replay.
+        when ordering independent nodes for replay. ``description`` is an optional one-line,
+        plain-English label (nullable) carried through to ``lineage`` / ``catalog``.
         """
         self._con.execute(f'CREATE SCHEMA IF NOT EXISTS "{_META_SCHEMA}"')
         self._con.execute(
             f'CREATE TABLE IF NOT EXISTS "{_META_SCHEMA}".lineage ('
             "flow VARCHAR NOT NULL, name VARCHAR NOT NULL, sql VARCHAR NOT NULL, "
             "kind VARCHAR NOT NULL, deps VARCHAR NOT NULL, sources VARCHAR NOT NULL, "
-            "created_at VARCHAR NOT NULL, seq BIGINT NOT NULL, "
+            "created_at VARCHAR NOT NULL, seq BIGINT NOT NULL, description VARCHAR, "
             "PRIMARY KEY (flow, name))"
+        )
+        # Migrate a durable workspace whose lineage table predates the description column
+        # (a shared/per-process workspace created before this feature). No-op on a fresh table.
+        self._con.execute(
+            f'ALTER TABLE "{_META_SCHEMA}".lineage ADD COLUMN IF NOT EXISTS description VARCHAR'
         )
 
     # ------------------------------------------------------------------ open / close --- #
@@ -589,14 +595,18 @@ class DuckSession:
                 refs.add(tname)
         return refs
 
-    def _record_lineage(self, flow: str, name: str, sql: str, kind: str) -> None:
+    def _record_lineage(
+        self, flow: str, name: str, sql: str, kind: str, description: str | None = None
+    ) -> None:
         """Upsert the lineage row for a just-materialized result (caller holds ``_lock``).
 
         Called from ``query`` right after the CREATE, so the result set is already current.
-        Dependencies are computed against every *other* live result.
+        Dependencies are computed against every *other* live result. ``description`` is an
+        optional one-line label; blank/whitespace-only is normalised to NULL.
         """
         results = self._existing_results()
         deps, sources = self._classify_refs(sql, flow, results, (flow, name))
+        description = (description or "").strip() or None
         seq = self._con.execute(
             f'SELECT COALESCE(MAX(seq), 0) + 1 FROM "{_META_SCHEMA}".lineage'
         ).fetchone()[0]
@@ -605,7 +615,8 @@ class DuckSession:
         )
         self._con.execute(
             f'INSERT INTO "{_META_SCHEMA}".lineage '
-            "(flow, name, sql, kind, deps, sources, created_at, seq) VALUES (?,?,?,?,?,?,?,?)",
+            "(flow, name, sql, kind, deps, sources, created_at, seq, description) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
             [
                 flow,
                 name,
@@ -615,6 +626,7 @@ class DuckSession:
                 json.dumps(sources),
                 datetime.now(timezone.utc).isoformat(),
                 int(seq),
+                description,
             ],
         )
 
@@ -635,6 +647,13 @@ class DuckSession:
         ).fetchall()
         return [r[0] for r in rows]
 
+    def _descriptions_for_flow(self, flow: str) -> dict[str, str | None]:
+        """Map each result name in ``flow`` to its recorded description (caller holds ``_lock``)."""
+        rows = self._con.execute(
+            f'SELECT name, description FROM "{_META_SCHEMA}".lineage WHERE flow = ?', [flow]
+        ).fetchall()
+        return {name: desc for name, desc in rows}
+
     def _columns_of(self, flow: str, name: str) -> list[dict[str, str]]:
         rows = self._con.execute(
             "SELECT column_name, data_type FROM information_schema.columns "
@@ -649,7 +668,9 @@ class DuckSession:
         return [[_to_python(v) for v in row] for row in cur.fetchall()]
 
     # ------------------------------------------------------------------ query --------- #
-    def query(self, sql: str, name: str, flow: str | None = None) -> dict:
+    def query(
+        self, sql: str, name: str, flow: str | None = None, description: str | None = None
+    ) -> dict:
         """Run a read-only SELECT over sources + flow results, materialize it as a table.
 
         ``name`` is required and the result is stored as ``"<flow>"."<name>"`` (replacing any
@@ -657,12 +678,14 @@ class DuckSession:
         ``complete`` flag, and any nudges. The sample is a 5-row head, but when the result is
         small on both axes (row_count <= 50 and row_count*columns <= 1000) it is the *whole*
         result — ``complete`` is True exactly when ``sample`` holds every row, so an agent can
-        read a small deliverable directly instead of paging it out.
+        read a small deliverable directly instead of paging it out. ``description`` is an
+        optional one-line, plain-English label stored in lineage (surfaced by ``lineage`` /
+        ``catalog``).
         """
         flow = self._resolve_flow(flow)
         _validate_name(name)
         guard.assert_read_only(sql, "duckdb")
-        out = self._materialize_query(sql, name, flow)
+        out = self._materialize_query(sql, name, flow, description)
         self._single_query_streak += 1
         if self._single_query_streak == _BATCH_NUDGE_AT:
             out.setdefault("hints", []).append(
@@ -675,11 +698,12 @@ class DuckSession:
     def query_steps(self, steps: list[dict], flow: str | None = None) -> dict:
         """Run an ordered batch of queries in one call — each step materialized like ``query``.
 
-        ``steps`` is a list of ``{"sql": ..., "name": ...}`` items executed in list order in a
-        single flow, so a later step can reference an earlier step's ``name`` (it is a live,
-        lineage-recorded result by then). Semantics are identical to calling :meth:`query` once
-        per step — same guard, same ``CREATE OR REPLACE``, same lineage rows — so ``lineage`` /
-        ``replay`` see no difference. Steps need not form a single pipeline — a batch can be a
+        ``steps`` is a list of ``{"sql": ..., "name": ..., "description"?: ...}`` items executed
+        in list order in a single flow, so a later step can reference an earlier step's ``name``
+        (it is a live, lineage-recorded result by then). Semantics are identical to calling
+        :meth:`query` once per step — same guard, same ``CREATE OR REPLACE``, same lineage rows
+        (including the optional one-line ``description``) — so ``lineage`` / ``replay`` see no
+        difference. Steps need not form a single pipeline — a batch can be a
         dependent chain, a bundle of unrelated queries, or a mix; use it whenever you want more
         than one result in one round trip. All steps are statically validated (name, read-only
         SQL) before anything runs; execution is fail-fast — the failing step reports its error,
@@ -692,22 +716,23 @@ class DuckSession:
         flow = self._resolve_flow(flow)
         if not steps:
             raise ValueError("steps must be a non-empty list of {sql, name} items.")
-        parsed: list[tuple[str, str]] = []
+        parsed: list[tuple[str, str, str | None]] = []
         for i, step in enumerate(steps):
             sql = step.get("sql") if isinstance(step, dict) else None
             name = step.get("name") if isinstance(step, dict) else None
+            description = step.get("description") if isinstance(step, dict) else None
             if not sql or not name:
                 raise ValueError(f"steps[{i}] must have both 'sql' and 'name'.")
             _validate_name(name, f"steps[{i}] name")
             guard.assert_read_only(sql, "duckdb")
-            parsed.append((sql, name))
+            parsed.append((sql, name, description))
 
         # A step is terminal when no later step references its name → it's a deliverable, not
         # scaffolding, so it earns a sample. Refs are a static parse of each step's SQL.
-        step_refs = [self._referenced_names(sql, flow) for sql, _ in parsed]
+        step_refs = [self._referenced_names(sql, flow) for sql, _, _ in parsed]
         terminal = [
             not any(name in step_refs[j] for j in range(i + 1, len(parsed)))
-            for i, (_, name) in enumerate(parsed)
+            for i, (_, name, _) in enumerate(parsed)
         ]
 
         self._single_query_streak = 0
@@ -715,12 +740,12 @@ class DuckSession:
         completed = 0
         failed_step: int | None = None
         t0 = time.perf_counter()
-        for i, (sql, name) in enumerate(parsed):
+        for i, (sql, name, description) in enumerate(parsed):
             if failed_step is not None:
                 results.append({"name": name, "status": "skipped"})
                 continue
             try:
-                full = self._materialize_query(sql, name, flow)
+                full = self._materialize_query(sql, name, flow, description)
             except Exception as exc:
                 failed_step = i
                 results.append({"name": name, "status": "failed", "error": str(exc)})
@@ -750,7 +775,9 @@ class DuckSession:
             out["failed_step"] = failed_step
         return out
 
-    def _materialize_query(self, sql: str, name: str, flow: str) -> dict:
+    def _materialize_query(
+        self, sql: str, name: str, flow: str, description: str | None = None
+    ) -> dict:
         """CREATE OR REPLACE the result table + record lineage (caller validated name + SQL)."""
         with self._lock:
             self._con.execute(f'CREATE SCHEMA IF NOT EXISTS "{flow}"')
@@ -763,7 +790,7 @@ class DuckSession:
             columns = self._columns_of(flow, name)
             n = row_count if _full_sample_fits(row_count, len(columns)) else _SAMPLE_ROWS
             sample = self._head_sample(flow, name, n)
-            self._record_lineage(flow, name, sql, "query")
+            self._record_lineage(flow, name, sql, "query", description)
         out = {
             "name": name,
             "flow": flow,
@@ -919,10 +946,16 @@ class DuckSession:
 
             _validate_name(flow, "flow name")
             self._con.execute(f'CREATE SCHEMA IF NOT EXISTS "{flow}"')
+            descriptions = self._descriptions_for_flow(flow)
             results = []
             for tname in self._result_names(flow):
                 count = self._con.execute(f'SELECT COUNT(*) FROM "{flow}"."{tname}"').fetchone()[0]
-                results.append({"name": tname, "row_count": int(count), "columns": self._columns_of(flow, tname)})
+                results.append({
+                    "name": tname,
+                    "row_count": int(count),
+                    "columns": self._columns_of(flow, tname),
+                    "description": descriptions.get(tname),
+                })
             return {"flow": flow, "results": results}
 
     def drop(self, name: str | None = None, flow: str | None = None) -> dict:
@@ -952,10 +985,11 @@ class DuckSession:
     def _load_all_lineage(self) -> dict[tuple[str, str], dict[str, Any]]:
         """Every recorded result across all flows, keyed by (flow, name) (caller holds lock)."""
         rows = self._con.execute(
-            f'SELECT flow, name, sql, kind, deps, sources, created_at, seq FROM "{_META_SCHEMA}".lineage'
+            "SELECT flow, name, sql, kind, deps, sources, created_at, seq, description "
+            f'FROM "{_META_SCHEMA}".lineage'
         ).fetchall()
         nodes: dict[tuple[str, str], dict[str, Any]] = {}
-        for flow, name, sql, kind, deps, sources, created_at, seq in rows:
+        for flow, name, sql, kind, deps, sources, created_at, seq, description in rows:
             nodes[(flow, name)] = {
                 "flow": flow,
                 "name": name,
@@ -965,6 +999,7 @@ class DuckSession:
                 "sources": json.loads(sources),
                 "created_at": created_at,
                 "seq": seq,
+                "description": description,
             }
         return nodes
 
@@ -978,7 +1013,9 @@ class DuckSession:
         With ``name``: the upstream closure that produced that result — the node plus every
         result it (transitively) depends on, following cross-flow edges. With no ``name``: every
         result in ``flow``. ``missing`` lists dependency refs with no lineage row (dropped, or an
-        external input). Nodes are ordered so a dependency always precedes its dependents.
+        external input). Nodes are ordered so a dependency always precedes its dependents. Each
+        node carries its optional one-line ``description`` (``None`` when none was given) so the
+        DAG reads as a plain-English, sequential story for a non-technical audience.
         """
         flow = self._resolve_flow(flow)
         with self._lock:
@@ -1029,6 +1066,7 @@ class DuckSession:
                     "flow": n["flow"],
                     "name": n["name"],
                     "kind": n["kind"],
+                    "description": n["description"],
                     "sql": n["sql"],
                     "deps": n["deps"],
                     "sources": n["sources"],
@@ -1126,7 +1164,7 @@ class DuckSession:
                 rc = self._con.execute(
                     f'SELECT COUNT(*) FROM "{target}"."{nm}"'
                 ).fetchone()[0]
-                self._record_lineage(target, nm, node["sql"], "query")
+                self._record_lineage(target, nm, node["sql"], "query", node.get("description"))
                 rebuilt.append({"name": nm, "kind": node["kind"], "row_count": int(rc)})
         return {
             "source_flow": flow,
