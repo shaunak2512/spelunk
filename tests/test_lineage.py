@@ -162,6 +162,55 @@ class TestLineageErrors:
             session.lineage(flow="_spelunk_meta")
 
 
+class TestMermaidRender:
+    def test_render_returns_deterministic_flowchart(self, session):
+        _build_chain(session)
+        lin = session.lineage("top", render="mermaid")
+        diagram = lin["mermaid"]
+        assert diagram.startswith("flowchart TD")
+        # A result node per built table, with kind in the label.
+        for nm in ("base", "mid", "top"):
+            assert f'"{nm} (' in diagram
+        # At least one arrow per recorded result edge (base->mid, mid->top); source leaves
+        # (orders, shop.customers) add more.
+        assert diagram.count(" --> ") >= len(lin["edges"])
+        assert "orders" in diagram
+        # Byte-identical on re-render — no LLM in the loop, so it's reproducible.
+        assert session.lineage("top", render="mermaid")["mermaid"] == diagram
+
+    def test_source_leaves_have_no_dangling_edges(self, session):
+        _build_chain(session)
+        lin = session.lineage("top", render="mermaid")
+        # Every id referenced by an edge must be declared as a node line.
+        import re
+
+        declared = set(re.findall(r"^\s+(n\d+)[\[(]", lin["mermaid"], re.MULTILINE))
+        endpoints = set(re.findall(r"(n\d+) --> (n\d+)", lin["mermaid"]))
+        used = {a for a, _ in endpoints} | {b for _, b in endpoints}
+        assert used <= declared
+
+    def test_path_writes_file_and_reports_absolute_path(self, session, tmp_path):
+        import os
+
+        _build_chain(session)
+        out = tmp_path / "sub" / "lineage.mmd"
+        lin = session.lineage("top", path=str(out))
+        # path implies mermaid render, writes the file, and echoes the absolute path.
+        assert lin["mermaid"].startswith("flowchart TD")
+        assert lin["rendered_to"] == os.path.abspath(str(out))
+        assert out.read_text(encoding="utf-8").rstrip("\n") == lin["mermaid"]
+
+    def test_unknown_render_rejected(self, session):
+        _build_chain(session)
+        with pytest.raises(ValueError, match="Unsupported render"):
+            session.lineage("top", render="graphviz")
+
+    def test_description_appears_in_label(self, session):
+        session.query('SELECT id FROM "shop"."customers"', "base", description="all customers")
+        lin = session.lineage("base", render="mermaid")
+        assert "all customers" in lin["mermaid"]
+
+
 class TestReplay:
     def test_dry_run_plans_without_executing(self, session):
         _build_chain(session)

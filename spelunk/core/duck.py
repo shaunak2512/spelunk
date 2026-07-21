@@ -1007,7 +1007,13 @@ class DuckSession:
     def _ref(flow: str, name: str) -> str:
         return f"{flow}.{name}"
 
-    def lineage(self, name: str | None = None, flow: str | None = None) -> dict:
+    def lineage(
+        self,
+        name: str | None = None,
+        flow: str | None = None,
+        render: str | None = None,
+        path: str | None = None,
+    ) -> dict:
         """Return the provenance graph of results: the SQL and dependency edges that built them.
 
         With ``name``: the upstream closure that produced that result — the node plus every
@@ -1016,6 +1022,11 @@ class DuckSession:
         external input). Nodes are ordered so a dependency always precedes its dependents. Each
         node carries its optional one-line ``description`` (``None`` when none was given) so the
         DAG reads as a plain-English, sequential story for a non-technical audience.
+
+        ``render`` (currently only ``"mermaid"``) adds a ready-to-display diagram string under the
+        ``"mermaid"`` key — built deterministically from the same nodes/edges, so no downstream
+        parsing is needed. ``path`` writes that diagram to a file (defaulting ``render`` to
+        ``"mermaid"``) and reports the absolute path under ``"rendered_to"``.
         """
         flow = self._resolve_flow(flow)
         with self._lock:
@@ -1058,26 +1069,98 @@ class DuckSession:
             for dep in node["deps"]:
                 edges.append({"from": self._ref(dep["flow"], dep["name"]), "to": self._ref(*key)})
         order = self._topo_order(selected)
-        return {
+        nodes = [
+            {
+                "flow": n["flow"],
+                "name": n["name"],
+                "kind": n["kind"],
+                "description": n["description"],
+                "sql": n["sql"],
+                "deps": n["deps"],
+                "sources": n["sources"],
+                "created_at": n["created_at"],
+            }
+            for n in sorted(selected.values(), key=lambda n: n["seq"])
+        ]
+        result = {
             "flow": flow,
             "root": name,
-            "nodes": [
-                {
-                    "flow": n["flow"],
-                    "name": n["name"],
-                    "kind": n["kind"],
-                    "description": n["description"],
-                    "sql": n["sql"],
-                    "deps": n["deps"],
-                    "sources": n["sources"],
-                    "created_at": n["created_at"],
-                }
-                for n in sorted(selected.values(), key=lambda n: n["seq"])
-            ],
+            "nodes": nodes,
             "edges": edges,
             "order": [self._ref(f, nm) for (f, nm) in order],
             "missing": sorted(set(missing)),
         }
+
+        if path is not None and render is None:
+            render = "mermaid"
+        if render is not None:
+            if render != "mermaid":
+                raise ValueError(f"Unsupported render {render!r}. Only 'mermaid' is supported.")
+            diagram = self._to_mermaid(nodes, edges)
+            result["mermaid"] = diagram
+            if path is not None:
+                abs_path = os.path.abspath(path)
+                parent = os.path.dirname(abs_path)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                with open(abs_path, "w", encoding="utf-8") as fh:
+                    fh.write(diagram + "\n")
+                result["rendered_to"] = abs_path
+        return result
+
+    @staticmethod
+    def _to_mermaid(nodes: list[dict[str, Any]], edges: list[dict[str, str]]) -> str:
+        """Serialize a lineage graph to a Mermaid ``flowchart TD`` string.
+
+        Result nodes render as rectangles labelled with their name, kind, and description; external
+        leaves — the sources each result reads (files, DB tables) plus any dependency whose lineage
+        row is gone — render as rounded nodes with an edge into the result that consumes them, so
+        the diagram has no dangling edges and shows where data enters. Node ids are assigned
+        deterministically, so the same graph always yields byte-identical output.
+        """
+        def esc(text: str) -> str:
+            # Mermaid label text: neutralize quotes/newlines and the reserved bracket chars.
+            return (
+                text.replace("\\", "/")
+                .replace('"', "'")
+                .replace("\n", " ")
+                .replace("[", "(")
+                .replace("]", ")")
+            )
+
+        result_refs = [f"{n['flow']}.{n['name']}" for n in nodes]
+        result_set = set(result_refs)
+
+        # Leaf edges: (source_or_missing_ref -> result_ref). Sources come from each node's
+        # `sources` list; dropped/external deps show up as an edge `from` that is not a result.
+        leaf_edges: list[tuple[str, str]] = []
+        for n in nodes:
+            ref = f"{n['flow']}.{n['name']}"
+            for src in n["sources"]:
+                leaf_edges.append((src, ref))
+        for e in edges:
+            if e["from"] not in result_set:
+                leaf_edges.append((e["from"], e["to"]))
+
+        leaf_refs = list(dict.fromkeys(src for src, _ in leaf_edges))
+        ids = {ref: f"n{i}" for i, ref in enumerate(result_refs + leaf_refs)}
+
+        lines = ["flowchart TD"]
+        for n in nodes:
+            ref = f"{n['flow']}.{n['name']}"
+            label = f"{n['name']} ({n['kind']})"
+            if n["description"]:
+                label += f"<br/>{esc(n['description'])}"
+            else:
+                label = esc(label)
+            lines.append(f'    {ids[ref]}["{label}"]')
+        for ref in leaf_refs:
+            lines.append(f'    {ids[ref]}("{esc(ref)}")')
+        for e in edges:
+            lines.append(f'    {ids[e["from"]]} --> {ids[e["to"]]}')
+        for src, dst in leaf_edges:
+            lines.append(f'    {ids[src]} --> {ids[dst]}')
+        return "\n".join(lines)
 
     @staticmethod
     def _topo_order(nodes: dict[tuple[str, str], dict[str, Any]]) -> list[tuple[str, str]]:

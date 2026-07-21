@@ -140,6 +140,14 @@ class TestOtherTools:
         cat = _run(mcp_server.call_tool("catalog", {"flow": "copy"})).structured_content
         assert {r["name"] for r in cat["results"]} == {"base", "top"}
 
+    def test_lineage_render_mermaid_passthrough(self, mcp_server):
+        _run(mcp_server.call_tool("query", {"sql": 'SELECT * FROM "shop"."customers"', "name": "base"}))
+        _run(mcp_server.call_tool("query", {"sql": "SELECT id FROM base", "name": "top"}))
+        lin = _run(
+            mcp_server.call_tool("lineage", {"name": "top", "render": "mermaid"})
+        ).structured_content
+        assert lin["mermaid"].startswith("flowchart TD")
+
 
 class TestToolLogging:
     def test_each_call_logs_one_json_line(self, sqlite_file, csv_file, tmp_path):
