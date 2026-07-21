@@ -1,0 +1,30 @@
+flowchart TD
+    n0["<b>luca_line_items_raw</b><br/><i>Break each of Luca's completed till sales into its individual items sold.</i>"]
+    n1["<b>luca_item_sales</b><br/><i>Turn each sold item into tidy columns: name, quantity, price, discount and tax.</i>"]
+    n2["<b>luca_item_recipe_map</b><br/><i>Build the link between each till button name and the kitchen recipe behind it.</i>"]
+    n3["<b>luca_mapping_fixes</b><br/><i>Hand-checked corrections linking eleven till items to the right menu recipe.</i>"]
+    n4["<b>luca_item_totals</b><br/><i>Total each till item's units and GST-free revenue, with its corrected recipe link.</i>"]
+    n5["<b>luca_item_profitability</b><br/><i>The core table: revenue, ingredient cost and gross profit for every properly costed menu item.</i>"]
+    n6["<b>luca_answer_best</b><br/><i>The single best item for Luca: the biggest total profit earner on the menu.</i>"]
+    n7["<b>luca_answer_worst</b><br/><i>The single worst item for Luca: the only line recorded as losing money.</i>"]
+    n8["<b>luca_final_answer</b><br/><i>Luca's best and worst menu items by profitability, side by side.</i>"]
+    n9[("<b>hospo.pos_squarepayment</b>")]
+    n10[("<b>hospo.pos_ingredientdeduction</b>")]
+    n11[("<b>hospo.recipes_recipe</b>")]
+    n6 --> n8
+    n7 --> n8
+    n5 --> n7
+    n4 --> n5
+    n1 --> n4
+    n2 --> n4
+    n3 --> n4
+    n0 --> n1
+    n5 --> n6
+    n9 --> n0
+    n10 --> n2
+    n9 --> n2
+    n11 --> n5
+    classDef source fill:#dbeafe,stroke:#2563eb,stroke-width:2px,color:#0f172a
+    classDef result fill:#f1f5f9,stroke:#334155,stroke-width:2px,color:#0f172a
+    class n0,n1,n2,n3,n4,n5,n6,n7,n8 result
+    class n9,n10,n11 source
