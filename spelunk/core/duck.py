@@ -1143,60 +1143,90 @@ class DuckSession:
     def _to_mermaid(cls, nodes: list[dict[str, Any]], edges: list[dict[str, str]]) -> str:
         """Serialize a lineage graph to a Mermaid ``flowchart TD`` string.
 
-        Result nodes render as rectangles labelled with their name, kind, and description; external
-        leaves (sources + dropped deps) render as rounded nodes with an edge into the result that
-        consumes them, so the diagram has no dangling edges and shows where data enters.
+        Results render as grey boxes with a **bold** name over an *italic* description; external
+        leaves (sources + dropped deps) render as blue cylinders — the datastore glyph — with an
+        edge into the result that consumes them, so shape *and* colour distinguish an input from a
+        computed step, the diagram has no dangling edges, and it shows where data enters.
         """
         def esc(text: str) -> str:
-            # Mermaid label text: neutralize quotes/newlines and the reserved bracket chars.
+            # Mermaid HTML labels: entity-escape (& first) so markup in user text can't break out.
             return (
                 text.replace("\\", "/")
-                .replace('"', "'")
+                .replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+                .replace('"', "&quot;")
                 .replace("\n", " ")
-                .replace("[", "(")
-                .replace("]", ")")
             )
 
         leaf_refs, leaf_edges, ids = cls._graph_layout(nodes, edges)
         lines = ["flowchart TD"]
         for n in nodes:
             ref = f"{n['flow']}.{n['name']}"
-            label = f"{n['name']} ({n['kind']})"
+            # kind is "query" for every result today — only surface it if that ever changes.
+            suffix = "" if n["kind"] == "query" else f" ({esc(n['kind'])})"
+            label = f"<b>{esc(n['name'])}</b>{suffix}"
             if n["description"]:
-                label += f"<br/>{esc(n['description'])}"
-            else:
-                label = esc(label)
+                label += f"<br/><i>{esc(n['description'])}</i>"
             lines.append(f'    {ids[ref]}["{label}"]')
         for ref in leaf_refs:
-            lines.append(f'    {ids[ref]}("{esc(ref)}")')
+            lines.append(f'    {ids[ref]}[("<b>{esc(ref)}</b>")]')
         for e in edges:
             lines.append(f'    {ids[e["from"]]} --> {ids[e["to"]]}')
         for src, dst in leaf_edges:
             lines.append(f'    {ids[src]} --> {ids[dst]}')
+        # Explicit fills + text colour so the diagram reads the same on a light or dark page.
+        lines.append(
+            "    classDef source fill:#dbeafe,stroke:#2563eb,stroke-width:2px,color:#0f172a"
+        )
+        lines.append(
+            "    classDef result fill:#f1f5f9,stroke:#334155,stroke-width:2px,color:#0f172a"
+        )
+        result_ids = [ids[f"{n['flow']}.{n['name']}"] for n in nodes]
+        if result_ids:
+            lines.append(f"    class {','.join(result_ids)} result")
+        if leaf_refs:
+            lines.append(f"    class {','.join(ids[r] for r in leaf_refs)} source")
         return "\n".join(lines)
 
     @classmethod
     def _to_dot(cls, nodes: list[dict[str, Any]], edges: list[dict[str, str]]) -> str:
         """Serialize a lineage graph to a Graphviz DOT ``digraph`` string.
 
-        Same layout as the Mermaid renderer — result nodes are boxes (name, kind, optional
-        description on a second line), external leaves are ellipses — so ``dot -Tsvg`` yields a
+        Mirrors the Mermaid renderer — results are grey boxes with a bold name over an italic
+        description, sources are blue cylinders — using HTML-like labels, so ``dot -Tsvg`` yields a
         real image. Node ids match ``_graph_layout`` for byte-identical output per graph.
         """
         def esc(text: str) -> str:
-            # DOT double-quoted string: escape backslashes and quotes; \n is a line break.
-            return text.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
+            # DOT HTML-like label (<...> delimited): entity-escape, & first.
+            return (
+                text.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+                .replace("\n", " ")
+            )
 
         leaf_refs, leaf_edges, ids = cls._graph_layout(nodes, edges)
-        lines = ["digraph lineage {", "  rankdir=TB;", '  node [fontname="Helvetica"];']
+        lines = [
+            "digraph lineage {",
+            "  rankdir=TB;",
+            '  node [fontname="Helvetica", style=filled, penwidth=2];',
+        ]
         for n in nodes:
             ref = f"{n['flow']}.{n['name']}"
-            label = esc(f"{n['name']} ({n['kind']})")
+            suffix = "" if n["kind"] == "query" else f" ({esc(n['kind'])})"
+            label = f"<B>{esc(n['name'])}</B>{suffix}"
             if n["description"]:
-                label += f"\\n{esc(n['description'])}"
-            lines.append(f'  {ids[ref]} [shape=box, label="{label}"];')
+                label += f"<BR/><I>{esc(n['description'])}</I>"
+            lines.append(
+                f"  {ids[ref]} [shape=box, fillcolor=\"#f1f5f9\", color=\"#334155\", "
+                f"fontcolor=\"#0f172a\", label=<{label}>];"
+            )
         for ref in leaf_refs:
-            lines.append(f'  {ids[ref]} [shape=ellipse, label="{esc(ref)}"];')
+            lines.append(
+                f"  {ids[ref]} [shape=cylinder, fillcolor=\"#dbeafe\", color=\"#2563eb\", "
+                f"fontcolor=\"#0f172a\", label=<<B>{esc(ref)}</B>>];"
+            )
         for e in edges:
             lines.append(f'  {ids[e["from"]]} -> {ids[e["to"]]};')
         for src, dst in leaf_edges:

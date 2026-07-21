@@ -443,8 +443,8 @@ def build_server(
     def _lineage(
         name: str | None = None,
         flow: str = "default",
-        render: str | None = None,
-        path: str | None = None,
+        render: str | None = "mermaid",
+        path: str | None = "dag/lineage.mmd",
     ) -> dict:
         return session.lineage(name, flow, render, path)
 

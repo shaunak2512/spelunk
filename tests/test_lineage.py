@@ -168,9 +168,12 @@ class TestMermaidRender:
         lin = session.lineage("top", render="mermaid")
         diagram = lin["mermaid"]
         assert diagram.startswith("flowchart TD")
-        # A result node per built table, with kind in the label.
+        # A result node per built table, name in bold.
         for nm in ("base", "mid", "top"):
-            assert f'"{nm} (' in diagram
+            assert f"<b>{nm}</b>" in diagram
+        # Sources and results are visually distinct: cylinder+source class vs box+result class.
+        assert "classDef source" in diagram and "classDef result" in diagram
+        assert '[("<b>orders</b>")]' in diagram
         # At least one arrow per recorded result edge (base->mid, mid->top); source leaves
         # (orders, shop.customers) add more.
         assert diagram.count(" --> ") >= len(lin["edges"])
@@ -205,10 +208,22 @@ class TestMermaidRender:
         with pytest.raises(ValueError, match="Unsupported render"):
             session.lineage("top", render="graphviz")
 
-    def test_description_appears_in_label(self, session):
+    def test_name_and_description_are_styled_differently(self, session):
         session.query('SELECT id FROM "shop"."customers"', "base", description="all customers")
-        lin = session.lineage("base", render="mermaid")
-        assert "all customers" in lin["mermaid"]
+        mmd = session.lineage("base", render="mermaid")["mermaid"]
+        assert "<b>base</b><br/><i>all customers</i>" in mmd
+        dot = session.lineage("base", render="dot")["dot"]
+        assert "<B>base</B><BR/><I>all customers</I>" in dot
+
+    def test_markup_in_description_is_escaped(self, session):
+        session.query(
+            'SELECT id FROM "shop"."customers"', "base", description='a <b>& "x"</b>'
+        )
+        mmd = session.lineage("base", render="mermaid")["mermaid"]
+        # User text can't break out of the label or inject its own markup.
+        assert "&lt;b&gt;&amp; &quot;x&quot;&lt;/b&gt;" in mmd
+        dot = session.lineage("base", render="dot")["dot"]
+        assert "&lt;b&gt;&amp; \"x\"&lt;/b&gt;" in dot
 
     def test_dot_render_is_valid_digraph(self, session):
         _build_chain(session)
@@ -217,9 +232,11 @@ class TestMermaidRender:
         assert dot.startswith("digraph lineage {")
         assert dot.rstrip().endswith("}")
         for nm in ("base", "mid", "top"):
-            assert f'label="{nm} (' in dot
+            assert f"<B>{nm}</B>" in dot
         assert " -> " in dot
         assert "orders" in dot
+        # Results are boxes, sources are cylinders.
+        assert dot.count("shape=box") == 3 and "shape=cylinder" in dot
         # Reproducible with no LLM in the loop.
         assert session.lineage("top", render="dot")["dot"] == dot
 
