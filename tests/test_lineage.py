@@ -250,6 +250,28 @@ class TestMermaidRender:
         dot_edges = set(re.findall(r"(n\d+) -> (n\d+)", dot))
         assert mmd_edges == dot_edges
 
+    def test_dropped_dep_edge_is_not_drawn_twice(self, session):
+        """A dropped dep is both an `edges` entry and a leaf — it must still draw one arrow."""
+        _build_chain(session)
+        session.drop("mid")  # top now depends on a result with no lineage row
+        lin = session.lineage("top", render="mermaid")
+        assert lin["missing"] == ["default.mid"]
+        arrows = [ln.strip() for ln in lin["mermaid"].splitlines() if "-->" in ln]
+        assert len(arrows) == len(set(arrows)), f"duplicate edges: {arrows}"
+        dot = session.lineage("top", render="dot")["dot"]
+        dot_arrows = [ln.strip() for ln in dot.splitlines() if " -> " in ln]
+        assert len(dot_arrows) == len(set(dot_arrows)), f"duplicate edges: {dot_arrows}"
+
+    def test_render_is_opt_in_and_writes_nothing_by_default(self, session, tmp_path, monkeypatch):
+        """lineage() is read-only: no diagram, and no file touched, unless asked."""
+        _build_chain(session)
+        cwd = tmp_path / "cwd"  # empty: fixture files live in tmp_path itself
+        cwd.mkdir()
+        monkeypatch.chdir(cwd)  # any stray relative write would land here
+        lin = session.lineage("top")
+        assert "mermaid" not in lin and "dot" not in lin and "rendered_to" not in lin
+        assert list(cwd.iterdir()) == []
+
     def test_path_defaults_to_mermaid_not_dot(self, session, tmp_path):
         _build_chain(session)
         lin = session.lineage("top", path=str(tmp_path / "g.mmd"))

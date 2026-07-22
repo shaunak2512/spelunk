@@ -1023,10 +1023,10 @@ class DuckSession:
         node carries its optional one-line ``description`` (``None`` when none was given) so the
         DAG reads as a plain-English, sequential story for a non-technical audience.
 
-        ``render`` (currently only ``"mermaid"``) adds a ready-to-display diagram string under the
-        ``"mermaid"`` key — built deterministically from the same nodes/edges, so no downstream
-        parsing is needed. ``path`` writes that diagram to a file (defaulting ``render`` to
-        ``"mermaid"``) and reports the absolute path under ``"rendered_to"``.
+        ``render`` (``"mermaid"`` or ``"dot"``) adds a ready-to-display diagram string under the
+        key matching the requested format — built deterministically from the same nodes/edges, so
+        no downstream parsing is needed. ``path`` writes that diagram to a file (defaulting
+        ``render`` to ``"mermaid"``) and reports the absolute path under ``"rendered_to"``.
         """
         flow = self._resolve_flow(flow)
         with self._lock:
@@ -1115,17 +1115,23 @@ class DuckSession:
     def _graph_layout(
         nodes: list[dict[str, Any]], edges: list[dict[str, str]]
     ) -> tuple[list[str], list[tuple[str, str]], dict[str, str]]:
-        """Shared layout for the diagram renderers: leaf refs, leaf edges, and stable node ids.
+        """Shared layout for the diagram renderers: leaf refs, the edges to draw, and node ids.
 
-        Leaf edges are ``(source_or_missing_ref -> result_ref)``: the sources each result reads
-        (files, DB tables) plus any dependency whose lineage row is gone (an edge ``from`` that is
-        not a materialized result). Ids ``n0, n1, ...`` are assigned deterministically — results in
-        ``seq`` order first, then leaves in first-seen order — so a given graph always lays out
-        identically regardless of output format.
+        Leaves are the external inputs a result reads — the sources (files, DB tables) plus any
+        dependency whose lineage row is gone (an edge ``from`` that is not a materialized result),
+        each drawn with an edge into the result that consumes it. The returned edge list is the
+        *complete, de-duplicated* set to draw, so a renderer emits it in one pass and cannot
+        double-draw a dropped dependency (which appears both in ``edges`` and as a leaf). Ids
+        ``n0, n1, ...`` are assigned deterministically — results in ``seq`` order first, then
+        leaves in first-seen order — so a given graph lays out identically in every format.
         """
         result_refs = [f"{n['flow']}.{n['name']}" for n in nodes]
         result_set = set(result_refs)
 
+        # Result-to-result edges, then the leaf edges feeding each result.
+        draw_edges: list[tuple[str, str]] = [
+            (e["from"], e["to"]) for e in edges if e["from"] in result_set
+        ]
         leaf_edges: list[tuple[str, str]] = []
         for n in nodes:
             ref = f"{n['flow']}.{n['name']}"
@@ -1136,8 +1142,11 @@ class DuckSession:
                 leaf_edges.append((e["from"], e["to"]))
 
         leaf_refs = list(dict.fromkeys(src for src, _ in leaf_edges))
+        # dict.fromkeys de-dups while preserving first-seen order (a source read by two results
+        # keeps both edges; the same edge recorded twice collapses to one).
+        draw_edges = list(dict.fromkeys(draw_edges + leaf_edges))
         ids = {ref: f"n{i}" for i, ref in enumerate(result_refs + leaf_refs)}
-        return leaf_refs, leaf_edges, ids
+        return leaf_refs, draw_edges, ids
 
     @classmethod
     def _to_mermaid(cls, nodes: list[dict[str, Any]], edges: list[dict[str, str]]) -> str:
@@ -1159,7 +1168,7 @@ class DuckSession:
                 .replace("\n", " ")
             )
 
-        leaf_refs, leaf_edges, ids = cls._graph_layout(nodes, edges)
+        leaf_refs, draw_edges, ids = cls._graph_layout(nodes, edges)
         lines = ["flowchart TD"]
         for n in nodes:
             ref = f"{n['flow']}.{n['name']}"
@@ -1171,9 +1180,7 @@ class DuckSession:
             lines.append(f'    {ids[ref]}["{label}"]')
         for ref in leaf_refs:
             lines.append(f'    {ids[ref]}[("<b>{esc(ref)}</b>")]')
-        for e in edges:
-            lines.append(f'    {ids[e["from"]]} --> {ids[e["to"]]}')
-        for src, dst in leaf_edges:
+        for src, dst in draw_edges:
             lines.append(f'    {ids[src]} --> {ids[dst]}')
         # Explicit fills + text colour so the diagram reads the same on a light or dark page.
         lines.append(
@@ -1206,7 +1213,7 @@ class DuckSession:
                 .replace("\n", " ")
             )
 
-        leaf_refs, leaf_edges, ids = cls._graph_layout(nodes, edges)
+        leaf_refs, draw_edges, ids = cls._graph_layout(nodes, edges)
         lines = [
             "digraph lineage {",
             "  rankdir=TB;",
@@ -1227,9 +1234,7 @@ class DuckSession:
                 f"  {ids[ref]} [shape=cylinder, fillcolor=\"#dbeafe\", color=\"#2563eb\", "
                 f"fontcolor=\"#0f172a\", label=<<B>{esc(ref)}</B>>];"
             )
-        for e in edges:
-            lines.append(f'  {ids[e["from"]]} -> {ids[e["to"]]};')
-        for src, dst in leaf_edges:
+        for src, dst in draw_edges:
             lines.append(f'  {ids[src]} -> {ids[dst]};')
         lines.append("}")
         return "\n".join(lines)
