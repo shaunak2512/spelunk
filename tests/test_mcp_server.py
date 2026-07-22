@@ -266,6 +266,23 @@ class TestDescriptionGating:
         finally:
             session.close()
 
+    def test_top_level_description_with_steps_rejected(self, sqlite_file):
+        from fastmcp.exceptions import ToolError
+
+        session = DuckSession.open([f"shop={sqlite_file}"])
+        srv = build_server(session, require_descriptions=True)
+        try:
+            # A top-level description has nothing to attach to in batch mode. Say so instead of
+            # dropping it — otherwise the step's own description silently wins and the caller
+            # never learns theirs was discarded.
+            with pytest.raises(ToolError, match="description on each step"):
+                _run(srv.call_tool("query", {
+                    "description": "Counts the customers.",
+                    "steps": [{"sql": "SELECT 1 AS x", "name": "x", "description": "One row."}],
+                }))
+        finally:
+            session.close()
+
     def test_batch_step_blank_description_rejected(self, sqlite_file):
         from fastmcp.exceptions import ToolError
 

@@ -183,6 +183,14 @@ def _dispatch_query(
     if steps is not None:
         if sql is not None or name is not None:
             raise ValueError("Pass either sql+name (single query) or steps (batch), not both.")
+        if description is not None:
+            # Batch descriptions are per step; a top-level one has nothing to attach to. Reject
+            # rather than drop it silently — a caller who thinks it landed would see the result
+            # come back undescribed in `lineage` with no clue why.
+            raise ValueError(
+                "description applies to a single query; in batch mode put a description on each "
+                "step: steps=[{sql, name, description}, ...]."
+            )
         step_dicts = [s.model_dump() for s in steps]
         if require_descriptions:
             for i, step in enumerate(step_dicts):

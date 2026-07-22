@@ -133,6 +133,26 @@ class TestBuildNewKinds:
         # allow_moved_paths lets a relocated/relative-path table still resolve.
         assert "iceberg_scan('s3://bucket/tbl', allow_moved_paths => true)" in src.setup_sql[-1]
 
+    def test_s3_region_fallback_is_non_destructive(self):
+        # The zero-config region for public buckets is a connection-global SET, so it must not
+        # clobber a region the caller already chose — it re-sets the current value when there is
+        # one and only falls back to us-east-1 when unset/empty. Executed against a real DuckDB
+        # connection because the guarantee lives in the SQL expression, not in Python.
+        src = sources.build_source("s3://bucket/data.parquet")
+        region_stmt = next(s for s in src.setup_sql if s.startswith("SET s3_region"))
+
+        con = duckdb.connect()
+        con.execute("INSTALL httpfs")
+        con.execute("LOAD httpfs")
+        # Unset (DuckDB reports NULL) → the fallback applies.
+        con.execute(region_stmt)
+        assert con.execute("SELECT current_setting('s3_region')").fetchone()[0] == "us-east-1"
+        # Already configured → preserved.
+        con.execute("SET s3_region = 'ap-southeast-2'")
+        con.execute(region_stmt)
+        assert con.execute("SELECT current_setting('s3_region')").fetchone()[0] == "ap-southeast-2"
+        con.close()
+
     def test_ducklake_attaches_read_only(self):
         src = sources.build_source("lake=ducklake:./catalog.ducklake")
         assert src.kind == "ducklake"

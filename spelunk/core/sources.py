@@ -416,21 +416,23 @@ def _remote_setup(path: str) -> list[str]:
     open-data buckets; this is only the fallback for anonymous access — a bucket in another region,
     or a private one, needs the user's own DuckDB S3 secret, whose REGION takes precedence.
 
-    Known limitation / possible extension: ``SET s3_region`` is connection-global, so registering
-    an S3 source overwrites the region for *every* later S3 read in the session. That's harmless
-    with secrets (a secret's REGION wins) but can clobber a region a caller set manually via
-    ``SET s3_region`` for a non-us-east-1 bucket. If that becomes a real need, make it
-    non-destructive — only set the fallback when the region is currently empty (guard on
-    ``current_setting('s3_region')``), or scope the region per source via a ``CREATE SECRET`` with
-    a bucket ``SCOPE`` instead of a global ``SET``.
+    ``SET s3_region`` is connection-global, so the fallback is applied *non-destructively*: the
+    statement re-sets the region to its own current value when one is already set, and only falls
+    back to ``us-east-1`` when it is unset (DuckDB reports NULL) or empty. Registering an S3 source
+    therefore can't clobber a region the caller configured by hand for a non-us-east-1 bucket. The
+    per-source alternative, if a session ever needs two regions at once, is a ``CREATE SECRET`` with
+    a bucket ``SCOPE`` rather than a global ``SET``.
     """
     low = path.lower()
     for scheme, ext_name in _REMOTE_EXT.items():
         if low.startswith(scheme):
             setup = [f"INSTALL {ext_name}", f"LOAD {ext_name}"]
             if scheme in ("s3://", "s3a://"):
-                # Global fallback region — see the "Known limitation" note above before changing.
-                setup.append("SET s3_region = 'us-east-1'")
+                # Global but non-destructive — keeps any region already set. See the note above.
+                setup.append(
+                    "SET s3_region = coalesce(nullif(current_setting('s3_region'), ''), "
+                    "'us-east-1')"
+                )
             return setup
     return []
 

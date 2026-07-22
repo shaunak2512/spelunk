@@ -30,7 +30,7 @@ necessarily a DuckDB one — most are a few lines away.
 | Source | Auth | DuckDB method | Core/Comm. | Spelunk |
 |---|---|---|---|---|
 | HTTP/HTTPS URL | no | `httpfs` + `read_parquet('https://…')` | core | ✅ (URL passed through, `httpfs` auto-loaded) |
-| S3 (public bucket) | no | `httpfs`, `read_*('s3://…')` | core | ✅ (`httpfs` auto-loaded; `s3_region` defaults to `us-east-1`) |
+| S3 (public bucket) | no | `httpfs`, `read_*('s3://…')` | core | ✅ (`httpfs` auto-loaded; `s3_region` falls back to `us-east-1` only when unset — a region you configured is kept) |
 | S3 (private) | ✅ | `httpfs` + `CREATE SECRET (TYPE s3, KEY_ID, SECRET, REGION)` | core | ⚠️ reachable (`s3://` wired) but Spelunk has no secret mechanism — needs a DuckDB secret in the environment |
 | Google Cloud Storage | ✅ | `httpfs` + `CREATE SECRET (TYPE gcs, …)` (HMAC) | core | ⚠️ `gs://` wired (`httpfs`); private/HMAC access needs a user secret |
 | Azure Blob / ADLS | no / ✅ | `azure` ext + `CREATE SECRET (TYPE azure, …)` | core | ⚠️ `az://` wired (`azure` ext auto-loaded); auth needs a user secret |
