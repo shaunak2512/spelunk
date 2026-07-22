@@ -39,8 +39,11 @@ spelunk/core/
                  #   drop / lineage / replay + list_objects / describe. query() records
                  #   provenance (SQL + dep edges) into the internal _spelunk_meta.lineage
                  #   table; lineage() reads that DAG, replay() rebuilds a flow from it.
-  sources.py     # Source registry: spec -> DuckDB attach/scan SQL (files as VIEWs, DBs ATTACHed
-                 #   READ_ONLY). DuckDB-only — a source it can't attach (e.g. SQL Server) is
+  sources.py     # Source registry: spec -> DuckDB attach/scan SQL (files + lakehouse scans as
+                 #   VIEWs, DBs/DuckLake ATTACHed READ_ONLY). Kinds: file (local OR remote
+                 #   https://,s3://,gs://,az:// via httpfs/azure ext; ext-backed readers excel/avro),
+                 #   sqlite/postgres/mysql, delta:/iceberg: (delta_scan/iceberg_scan VIEWs),
+                 #   ducklake:. DuckDB-only — a source it can't attach (e.g. SQL Server) is
                  #   rejected, not bridged. DSNs are parsed with stdlib urllib (no SQLAlchemy dep).
   guard.py       # sqlglot AST safety: assert_read_only(), enforce_limit() — called dialect="duckdb"
   types.py       # FROZEN contracts: TableInfo, TableDescription, ColumnInfo, errors
@@ -64,7 +67,7 @@ One row-returning tool (`query`) owns every SELECT; inspection lives on the reso
 | `export(target, format, path, flow?)` | Write a saved result name **or** a full SELECT to csv/json/parquet. |
 | `catalog(flow?)` | No arg → list flows + counts; with a flow → its results. |
 | `drop(name?, flow?)` | Drop one result, or a whole flow (name omitted). |
-| `lineage(name?, flow?)` | Provenance graph: with `name`, the upstream closure (transitive, cross-flow) that built a result; without, the whole flow's DAG. Returns nodes (SQL, deps, sources, kind), edges, a dependency-first `order`, and `missing` deps. Read-only. |
+| `lineage(name?, flow?, render?, path?)` | Provenance graph: with `name`, the upstream closure (transitive, cross-flow) that built a result; without, the whole flow's DAG. Returns nodes (SQL, deps, sources, kind), edges, a dependency-first `order`, and `missing` deps. `render="mermaid"` (or `"dot"`) adds a deterministic, ready-to-display diagram string (key = the format name) built server-side from the same nodes/edges — no agent parsing; Mermaid pastes into markdown/artifacts, DOT runs through `dot -Tsvg`. `path` writes it to a file (implies `render="mermaid"`, echoes `rendered_to`). Read-only. |
 | `replay(flow?, into?, dry_run?)` | Rebuild a flow from its recorded SQL in dependency order (re-run each `query`). `into` → non-destructive rebuild into a fresh flow; omitted → in-place refresh; `dry_run` → plan only. Errors on a dependency cycle. Sources + cross-flow results are read, not rebuilt. |
 | `add_source(spec)` / `remove_source(name)` | **Only registered with `--allow-add-source`** — attach/detach a file or DB at runtime (`spec` is the same grammar as `--source`). Connection-global: a source is visible in **every flow**, not flow-scoped (DuckDB `ATTACH` can't be per-schema). Isolation comes from the process-per-agent model. |
 

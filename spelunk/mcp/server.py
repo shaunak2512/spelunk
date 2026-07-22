@@ -20,6 +20,7 @@ import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Annotated
 
 from fastmcp import FastMCP
 from pydantic import BaseModel, Field
@@ -27,12 +28,27 @@ from pydantic import BaseModel, Field
 from spelunk import __version__
 from spelunk.core.duck import DuckSession
 
+# Shared help text for the plain-English `description` — kept identical on the single-query
+# parameter and the per-step field so the agent sees one consistent instruction.
+_DESCRIPTION_HELP = (
+    "One-line, plain-English summary of what this query does for a NON-TECHNICAL reader "
+    "(keep to ~20 words, one line). Stored with the result and surfaced by `lineage` and "
+    "`catalog` so the pipeline reads as a clear, sequential story."
+)
+
 
 class QueryStep(BaseModel):
     """One step of a batch `query` call: a SELECT and the result name it materializes as."""
 
     sql: str = Field(description="Read-only DuckDB SELECT; may reference earlier steps' names.")
     name: str = Field(description="Result table name this step materializes as (SQL identifier).")
+
+
+class DescribedQueryStep(QueryStep):
+    """A batch `query` step for a server run with `--require-descriptions`: adds a required
+    one-line, plain-English `description` on top of `sql` + `name`."""
+
+    description: str = Field(description=_DESCRIPTION_HELP)
 
 # One JSON line per tool call lands here so agent usage can be analysed offline. Handlers are
 # (re)attached by _configure_tool_logging; until then a NullHandler keeps library/test use silent.
@@ -45,6 +61,7 @@ _tool_logger.propagate = False
 # and row payloads are summarised, never dumped. `steps` is a batch of {sql, name} — full SQL kept.
 _LOGGED_ARGS = (
     "sql", "name", "flow", "target", "format", "path", "spec", "steps", "into", "dry_run",
+    "description",
 )
 _LOGGED_RESULT_FIELDS = (
     "name", "flow", "row_count", "format", "path", "dropped_results", "kind",
@@ -151,8 +168,56 @@ def _logged(fn):
     return wrapper
 
 
+def _dispatch_query(
+    session: DuckSession,
+    *,
+    sql: str | None,
+    name: str | None,
+    steps: list[QueryStep] | None,
+    flow: str,
+    description: str | None,
+    require_descriptions: bool,
+) -> dict:
+    """Shared body for the `query` tool — single and batch modes — with optional enforcement of
+    a mandatory ``description`` when the server runs with ``--require-descriptions``."""
+    if steps is not None:
+        if sql is not None or name is not None:
+            raise ValueError("Pass either sql+name (single query) or steps (batch), not both.")
+        if description is not None:
+            # Batch descriptions are per step; a top-level one has nothing to attach to. Reject
+            # rather than drop it silently — a caller who thinks it landed would see the result
+            # come back undescribed in `lineage` with no clue why.
+            raise ValueError(
+                "description applies to a single query; in batch mode put a description on each "
+                "step: steps=[{sql, name, description}, ...]."
+            )
+        step_dicts = [s.model_dump() for s in steps]
+        if require_descriptions:
+            for i, step in enumerate(step_dicts):
+                if not (step.get("description") or "").strip():
+                    raise ValueError(
+                        f"steps[{i}] needs a one-line, plain-English description (~20 words) — "
+                        "this server was started with --require-descriptions."
+                    )
+        return session.query_steps(step_dicts, flow)
+    if sql is None or name is None:
+        raise ValueError(
+            "A single query needs both sql and name; a batch needs steps=[{sql, name}, ...]."
+        )
+    if require_descriptions and not (description or "").strip():
+        raise ValueError(
+            "This query needs a one-line, plain-English description (~20 words) — this server "
+            "was started with --require-descriptions."
+        )
+    return session.query(sql, name, flow, description)
+
+
 def build_server(
-    session: DuckSession, tool_log: str | None = None, *, allow_add_source: bool = False
+    session: DuckSession,
+    tool_log: str | None = None,
+    *,
+    allow_add_source: bool = False,
+    require_descriptions: bool = False,
 ) -> FastMCP:
     """Build a FastMCP instance wired to an open :class:`DuckSession`.
 
@@ -165,6 +230,11 @@ def build_server(
     ``allow_add_source`` (off by default) additionally registers ``add_source`` / ``remove_source``
     so the agent can attach and detach files and databases at runtime. This lets the agent reach
     any file/DB the host process can — only enable it for a trusted, process-per-agent setup.
+
+    ``require_descriptions`` (off by default) gates the plain-English description feature: when on,
+    the ``query`` tool exposes a required one-line ``description`` on every single query and every
+    batch step (stored in lineage, surfaced by ``lineage`` / ``catalog``); when off, the parameter
+    is absent from the tool schema entirely.
     """
     _configure_tool_logging(tool_log)
 
@@ -203,7 +273,15 @@ def build_server(
             "skipped. Every terminal step (one no later step references — the last, plus any "
             "independent query) returns a sample (full rows when small, else a head); "
             "intermediate steps consumed downstream stay compact (row_count + columns).\n"
-            "- `profile(sql, flow?)` — per-column stats (null_rate, min/max/mean/std, "
+            + (
+                "- REQUIRED here: every single query and every batch step takes a one-line, "
+                "plain-English `description` (~20 words) of what it does for a non-technical "
+                "reader. It's stored with the result and shown in `lineage` and `catalog`, so "
+                "the pipeline reads as a clear, sequential story.\n"
+                if require_descriptions
+                else ""
+            )
+            + "- `profile(sql, flow?)` — per-column stats (null_rate, min/max/mean/std, "
             "p25/p50/p75/p95 for numerics; unique/top/freq for text) over the full result. Use "
             "this instead of writing manual aggregation queries.\n"
             "- `export(target, format, path, flow?)` — write a saved result name OR a full SELECT "
@@ -258,43 +336,55 @@ def build_server(
         return session.describe(table).model_dump_json()
 
     # --- Tools ----------------------------------------------------------------------- #
-    @mcp.tool(
-        name="query",
-        description=(
-            "Run read-only DuckDB SELECTs over sources and saved results, storing each full "
-            "result (no row cap) as a named table in the flow for immediate reuse. Two modes: "
-            "single (`sql` + `name`) or batch (`steps=[{sql, name}, ...]`). ALWAYS prefer one "
-            "batch call over sequential single calls: steps run in list order and a later step "
-            "may reference an earlier step's `name` like any saved result. Batch is not only for "
-            "pipelines — the steps can be a dependent chain, a bundle of unrelated queries, or a "
-            "mix; batch whenever you want more than one result in one round trip. Fail-fast — "
-            "completed steps stay materialized, the failing step reports its error, the rest are "
-            "skipped. Every terminal step (one no later step references — the last, plus any "
-            "independent query) returns a sample — every row with `complete: true` when small, "
-            "else a 5-row head; downstream-consumed intermediates return row_count + columns. "
-            "Reference attached DB tables as \"<source>\".\"<table>\"; files and prior results by "
-            "bare name. Writes/DDL are rejected."
-        ),
+    query_tool_description = (
+        "Run read-only DuckDB SELECTs over sources and saved results, storing each full "
+        "result (no row cap) as a named table in the flow for immediate reuse. Two modes: "
+        "single (`sql` + `name`) or batch (`steps=[{sql, name}, ...]`). ALWAYS prefer one "
+        "batch call over sequential single calls: steps run in list order and a later step "
+        "may reference an earlier step's `name` like any saved result. Batch is not only for "
+        "pipelines — the steps can be a dependent chain, a bundle of unrelated queries, or a "
+        "mix; batch whenever you want more than one result in one round trip. Fail-fast — "
+        "completed steps stay materialized, the failing step reports its error, the rest are "
+        "skipped. Every terminal step (one no later step references — the last, plus any "
+        "independent query) returns a sample — every row with `complete: true` when small, "
+        "else a 5-row head; downstream-consumed intermediates return row_count + columns. "
+        "Reference attached DB tables as \"<source>\".\"<table>\"; files and prior results by "
+        "bare name. Writes/DDL are rejected."
     )
-    @_logged
-    def _query(
-        sql: str | None = None,
-        name: str | None = None,
-        steps: list[QueryStep] | None = None,
-        flow: str = "default",
-    ) -> dict:
-        if steps is not None:
-            if sql is not None or name is not None:
-                raise ValueError(
-                    "Pass either sql+name (single query) or steps (batch), not both."
-                )
-            return session.query_steps([s.model_dump() for s in steps], flow)
-        if sql is None or name is None:
-            raise ValueError(
-                "A single query needs both sql and name; a batch needs "
-                "steps=[{sql, name}, ...]."
+    if require_descriptions:
+        query_tool_description += (
+            " This server REQUIRES a one-line, plain-English `description` (~20 words, for a "
+            "non-technical reader) on every single query and every batch step; it is stored "
+            "with the result and shown in `lineage` and `catalog`."
+        )
+
+    if require_descriptions:
+        @mcp.tool(name="query", description=query_tool_description)
+        @_logged
+        def _query(
+            sql: str | None = None,
+            name: str | None = None,
+            description: Annotated[str | None, Field(description=_DESCRIPTION_HELP)] = None,
+            steps: list[DescribedQueryStep] | None = None,
+            flow: str = "default",
+        ) -> dict:
+            return _dispatch_query(
+                session, sql=sql, name=name, steps=steps, flow=flow,
+                description=description, require_descriptions=True,
             )
-        return session.query(sql, name, flow)
+    else:
+        @mcp.tool(name="query", description=query_tool_description)
+        @_logged
+        def _query(
+            sql: str | None = None,
+            name: str | None = None,
+            steps: list[QueryStep] | None = None,
+            flow: str = "default",
+        ) -> dict:
+            return _dispatch_query(
+                session, sql=sql, name=name, steps=steps, flow=flow,
+                description=None, require_descriptions=False,
+            )
 
     @mcp.tool(
         name="profile",
@@ -323,7 +413,8 @@ def build_server(
         name="catalog",
         description=(
             "With no argument: list active flows and how many results each holds. With a flow: "
-            "list that flow's saved results with their columns, types, and row counts."
+            "list that flow's saved results with their columns, types, row counts, and the "
+            "one-line plain-English description recorded for each (null if none)."
         ),
     )
     @_logged
@@ -347,13 +438,23 @@ def build_server(
             "Show how results were built: the SQL and dependency edges behind them. With `name`, "
             "return the upstream closure that produced that result (the node plus every result it "
             "transitively depends on, across flows); with no `name`, the whole flow. Returns nodes "
-            "(name, kind, sql, deps, sources, created_at), edges, a dependency-first `order`, and "
-            "`missing` (deps whose lineage is gone). Read-only."
+            "(name, kind, description, sql, deps, sources, created_at), edges, a dependency-first "
+            "`order`, and `missing` (deps whose lineage is gone). `description` is a one-line, "
+            "plain-English label (null if none was given). Pass `render='mermaid'` (or `'dot'`) to "
+            "also get a ready-to-display diagram string (under that key) built deterministically "
+            "from the same graph — no parsing needed; paste Mermaid into markdown/an artifact, or "
+            "run DOT through `dot -Tsvg`. `path` writes the diagram to a file (implies "
+            "`render='mermaid'`) and returns its absolute path under `rendered_to`. Read-only."
         ),
     )
     @_logged
-    def _lineage(name: str | None = None, flow: str = "default") -> dict:
-        return session.lineage(name, flow)
+    def _lineage(
+        name: str | None = None,
+        flow: str = "default",
+        render: str | None = None,
+        path: str | None = None,
+    ) -> dict:
+        return session.lineage(name, flow, render, path)
 
     @mcp.tool(
         name="replay",
@@ -411,9 +512,12 @@ def main() -> None:
         default=[],
         metavar="SPEC",
         help=(
-            "A data source, repeatable. A file path (.csv/.parquet/.json/.xlsx), a SQLite file, "
-            "or a sqlite:// / postgresql:// / mysql:// DSN. Prefix with name= to set "
-            "the source name, e.g. sales=./sales.parquet."
+            "A data source, repeatable. A file path (.csv/.parquet/.json/.xlsx/.avro) — local or a "
+            "remote https:// / s3:// / gs:// / az:// URL — a SQLite file, a delta:<path> / "
+            "iceberg:<path> lakehouse table, or a sqlite:// / postgresql:// / mysql:// / ducklake: "
+            "DSN. Prefix with name= to set the source name, e.g. sales=./sales.parquet. For a file "
+            "with an odd/absent extension, force the reader with a format prefix "
+            "(csv:/tsv:/json:/parquet:/excel:/avro:), e.g. routes=csv:https://host/routes.dat."
         ),
     )
     parser.add_argument("--dsn", default=None, help="Alias for a single --source (back-compat).")
@@ -458,6 +562,16 @@ def main() -> None:
             "default."
         ),
     )
+    parser.add_argument(
+        "--require-descriptions",
+        action="store_true",
+        help=(
+            "Require a one-line, plain-English description (~20 words, for a non-technical "
+            "reader) on every query and every batch step. Descriptions are stored in lineage and "
+            "surfaced by the lineage / catalog tools, so a flow reads as a clear, sequential "
+            "story. Off by default (the description parameter is then absent entirely)."
+        ),
+    )
     parser.add_argument("--memory-limit", default=None, help="DuckDB memory_limit, e.g. 4GB.")
     parser.add_argument("--temp-dir", default=None, help="Directory for DuckDB spill files.")
     parser.add_argument("--max-temp-size", default=None, help="Cap on spill size, e.g. 50GB.")
@@ -498,7 +612,12 @@ def main() -> None:
     else:
         tool_log = "-"  # stderr
 
-    server = build_server(session, tool_log=tool_log, allow_add_source=args.allow_add_source)
+    server = build_server(
+        session,
+        tool_log=tool_log,
+        allow_add_source=args.allow_add_source,
+        require_descriptions=args.require_descriptions,
+    )
     try:
         server.run(transport="stdio")
     finally:

@@ -59,7 +59,7 @@ _RESERVED_SCHEMAS = frozenset(
 # ("<source>"."<schema>"."<table>"), so it is qualified. A kind with no default here (mysql, whose
 # default schema is the database name) always gets the schema segment — 3-part is always valid.
 _ATTACHED_SYSTEM_SCHEMAS = frozenset({"information_schema", "pg_catalog"})
-_ATTACHED_DEFAULT_SCHEMA = {"sqlite": "main", "postgres": "public"}
+_ATTACHED_DEFAULT_SCHEMA = {"sqlite": "main", "postgres": "public", "ducklake": "main"}
 
 # DuckDB base type names that mark a column as numeric (for profile stats). Matched against the
 # type name with any parametrisation stripped (e.g. DECIMAL(18,3) -> DECIMAL) — exact, not
@@ -300,15 +300,21 @@ class DuckSession:
         A result is keyed by (flow, name); ``CREATE OR REPLACE`` of a result overwrites its
         row, so the store always reflects the *current* definition. ``deps`` and ``sources``
         are JSON arrays; ``seq`` is a monotonic creation counter used as a stable tie-break
-        when ordering independent nodes for replay.
+        when ordering independent nodes for replay. ``description`` is an optional one-line,
+        plain-English label (nullable) carried through to ``lineage`` / ``catalog``.
         """
         self._con.execute(f'CREATE SCHEMA IF NOT EXISTS "{_META_SCHEMA}"')
         self._con.execute(
             f'CREATE TABLE IF NOT EXISTS "{_META_SCHEMA}".lineage ('
             "flow VARCHAR NOT NULL, name VARCHAR NOT NULL, sql VARCHAR NOT NULL, "
             "kind VARCHAR NOT NULL, deps VARCHAR NOT NULL, sources VARCHAR NOT NULL, "
-            "created_at VARCHAR NOT NULL, seq BIGINT NOT NULL, "
+            "created_at VARCHAR NOT NULL, seq BIGINT NOT NULL, description VARCHAR, "
             "PRIMARY KEY (flow, name))"
+        )
+        # Migrate a durable workspace whose lineage table predates the description column
+        # (a shared/per-process workspace created before this feature). No-op on a fresh table.
+        self._con.execute(
+            f'ALTER TABLE "{_META_SCHEMA}".lineage ADD COLUMN IF NOT EXISTS description VARCHAR'
         )
 
     # ------------------------------------------------------------------ open / close --- #
@@ -589,14 +595,18 @@ class DuckSession:
                 refs.add(tname)
         return refs
 
-    def _record_lineage(self, flow: str, name: str, sql: str, kind: str) -> None:
+    def _record_lineage(
+        self, flow: str, name: str, sql: str, kind: str, description: str | None = None
+    ) -> None:
         """Upsert the lineage row for a just-materialized result (caller holds ``_lock``).
 
         Called from ``query`` right after the CREATE, so the result set is already current.
-        Dependencies are computed against every *other* live result.
+        Dependencies are computed against every *other* live result. ``description`` is an
+        optional one-line label; blank/whitespace-only is normalised to NULL.
         """
         results = self._existing_results()
         deps, sources = self._classify_refs(sql, flow, results, (flow, name))
+        description = (description or "").strip() or None
         seq = self._con.execute(
             f'SELECT COALESCE(MAX(seq), 0) + 1 FROM "{_META_SCHEMA}".lineage'
         ).fetchone()[0]
@@ -605,7 +615,8 @@ class DuckSession:
         )
         self._con.execute(
             f'INSERT INTO "{_META_SCHEMA}".lineage '
-            "(flow, name, sql, kind, deps, sources, created_at, seq) VALUES (?,?,?,?,?,?,?,?)",
+            "(flow, name, sql, kind, deps, sources, created_at, seq, description) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
             [
                 flow,
                 name,
@@ -615,6 +626,7 @@ class DuckSession:
                 json.dumps(sources),
                 datetime.now(timezone.utc).isoformat(),
                 int(seq),
+                description,
             ],
         )
 
@@ -635,6 +647,13 @@ class DuckSession:
         ).fetchall()
         return [r[0] for r in rows]
 
+    def _descriptions_for_flow(self, flow: str) -> dict[str, str | None]:
+        """Map each result name in ``flow`` to its recorded description (caller holds ``_lock``)."""
+        rows = self._con.execute(
+            f'SELECT name, description FROM "{_META_SCHEMA}".lineage WHERE flow = ?', [flow]
+        ).fetchall()
+        return {name: desc for name, desc in rows}
+
     def _columns_of(self, flow: str, name: str) -> list[dict[str, str]]:
         rows = self._con.execute(
             "SELECT column_name, data_type FROM information_schema.columns "
@@ -649,7 +668,9 @@ class DuckSession:
         return [[_to_python(v) for v in row] for row in cur.fetchall()]
 
     # ------------------------------------------------------------------ query --------- #
-    def query(self, sql: str, name: str, flow: str | None = None) -> dict:
+    def query(
+        self, sql: str, name: str, flow: str | None = None, description: str | None = None
+    ) -> dict:
         """Run a read-only SELECT over sources + flow results, materialize it as a table.
 
         ``name`` is required and the result is stored as ``"<flow>"."<name>"`` (replacing any
@@ -657,12 +678,14 @@ class DuckSession:
         ``complete`` flag, and any nudges. The sample is a 5-row head, but when the result is
         small on both axes (row_count <= 50 and row_count*columns <= 1000) it is the *whole*
         result — ``complete`` is True exactly when ``sample`` holds every row, so an agent can
-        read a small deliverable directly instead of paging it out.
+        read a small deliverable directly instead of paging it out. ``description`` is an
+        optional one-line, plain-English label stored in lineage (surfaced by ``lineage`` /
+        ``catalog``).
         """
         flow = self._resolve_flow(flow)
         _validate_name(name)
         guard.assert_read_only(sql, "duckdb")
-        out = self._materialize_query(sql, name, flow)
+        out = self._materialize_query(sql, name, flow, description)
         self._single_query_streak += 1
         if self._single_query_streak == _BATCH_NUDGE_AT:
             out.setdefault("hints", []).append(
@@ -675,11 +698,12 @@ class DuckSession:
     def query_steps(self, steps: list[dict], flow: str | None = None) -> dict:
         """Run an ordered batch of queries in one call — each step materialized like ``query``.
 
-        ``steps`` is a list of ``{"sql": ..., "name": ...}`` items executed in list order in a
-        single flow, so a later step can reference an earlier step's ``name`` (it is a live,
-        lineage-recorded result by then). Semantics are identical to calling :meth:`query` once
-        per step — same guard, same ``CREATE OR REPLACE``, same lineage rows — so ``lineage`` /
-        ``replay`` see no difference. Steps need not form a single pipeline — a batch can be a
+        ``steps`` is a list of ``{"sql": ..., "name": ..., "description"?: ...}`` items executed
+        in list order in a single flow, so a later step can reference an earlier step's ``name``
+        (it is a live, lineage-recorded result by then). Semantics are identical to calling
+        :meth:`query` once per step — same guard, same ``CREATE OR REPLACE``, same lineage rows
+        (including the optional one-line ``description``) — so ``lineage`` / ``replay`` see no
+        difference. Steps need not form a single pipeline — a batch can be a
         dependent chain, a bundle of unrelated queries, or a mix; use it whenever you want more
         than one result in one round trip. All steps are statically validated (name, read-only
         SQL) before anything runs; execution is fail-fast — the failing step reports its error,
@@ -692,22 +716,23 @@ class DuckSession:
         flow = self._resolve_flow(flow)
         if not steps:
             raise ValueError("steps must be a non-empty list of {sql, name} items.")
-        parsed: list[tuple[str, str]] = []
+        parsed: list[tuple[str, str, str | None]] = []
         for i, step in enumerate(steps):
             sql = step.get("sql") if isinstance(step, dict) else None
             name = step.get("name") if isinstance(step, dict) else None
+            description = step.get("description") if isinstance(step, dict) else None
             if not sql or not name:
                 raise ValueError(f"steps[{i}] must have both 'sql' and 'name'.")
             _validate_name(name, f"steps[{i}] name")
             guard.assert_read_only(sql, "duckdb")
-            parsed.append((sql, name))
+            parsed.append((sql, name, description))
 
         # A step is terminal when no later step references its name → it's a deliverable, not
         # scaffolding, so it earns a sample. Refs are a static parse of each step's SQL.
-        step_refs = [self._referenced_names(sql, flow) for sql, _ in parsed]
+        step_refs = [self._referenced_names(sql, flow) for sql, _, _ in parsed]
         terminal = [
             not any(name in step_refs[j] for j in range(i + 1, len(parsed)))
-            for i, (_, name) in enumerate(parsed)
+            for i, (_, name, _) in enumerate(parsed)
         ]
 
         self._single_query_streak = 0
@@ -715,12 +740,12 @@ class DuckSession:
         completed = 0
         failed_step: int | None = None
         t0 = time.perf_counter()
-        for i, (sql, name) in enumerate(parsed):
+        for i, (sql, name, description) in enumerate(parsed):
             if failed_step is not None:
                 results.append({"name": name, "status": "skipped"})
                 continue
             try:
-                full = self._materialize_query(sql, name, flow)
+                full = self._materialize_query(sql, name, flow, description)
             except Exception as exc:
                 failed_step = i
                 results.append({"name": name, "status": "failed", "error": str(exc)})
@@ -750,7 +775,9 @@ class DuckSession:
             out["failed_step"] = failed_step
         return out
 
-    def _materialize_query(self, sql: str, name: str, flow: str) -> dict:
+    def _materialize_query(
+        self, sql: str, name: str, flow: str, description: str | None = None
+    ) -> dict:
         """CREATE OR REPLACE the result table + record lineage (caller validated name + SQL)."""
         with self._lock:
             self._con.execute(f'CREATE SCHEMA IF NOT EXISTS "{flow}"')
@@ -763,7 +790,7 @@ class DuckSession:
             columns = self._columns_of(flow, name)
             n = row_count if _full_sample_fits(row_count, len(columns)) else _SAMPLE_ROWS
             sample = self._head_sample(flow, name, n)
-            self._record_lineage(flow, name, sql, "query")
+            self._record_lineage(flow, name, sql, "query", description)
         out = {
             "name": name,
             "flow": flow,
@@ -919,10 +946,16 @@ class DuckSession:
 
             _validate_name(flow, "flow name")
             self._con.execute(f'CREATE SCHEMA IF NOT EXISTS "{flow}"')
+            descriptions = self._descriptions_for_flow(flow)
             results = []
             for tname in self._result_names(flow):
                 count = self._con.execute(f'SELECT COUNT(*) FROM "{flow}"."{tname}"').fetchone()[0]
-                results.append({"name": tname, "row_count": int(count), "columns": self._columns_of(flow, tname)})
+                results.append({
+                    "name": tname,
+                    "row_count": int(count),
+                    "columns": self._columns_of(flow, tname),
+                    "description": descriptions.get(tname),
+                })
             return {"flow": flow, "results": results}
 
     def drop(self, name: str | None = None, flow: str | None = None) -> dict:
@@ -952,10 +985,11 @@ class DuckSession:
     def _load_all_lineage(self) -> dict[tuple[str, str], dict[str, Any]]:
         """Every recorded result across all flows, keyed by (flow, name) (caller holds lock)."""
         rows = self._con.execute(
-            f'SELECT flow, name, sql, kind, deps, sources, created_at, seq FROM "{_META_SCHEMA}".lineage'
+            "SELECT flow, name, sql, kind, deps, sources, created_at, seq, description "
+            f'FROM "{_META_SCHEMA}".lineage'
         ).fetchall()
         nodes: dict[tuple[str, str], dict[str, Any]] = {}
-        for flow, name, sql, kind, deps, sources, created_at, seq in rows:
+        for flow, name, sql, kind, deps, sources, created_at, seq, description in rows:
             nodes[(flow, name)] = {
                 "flow": flow,
                 "name": name,
@@ -965,6 +999,7 @@ class DuckSession:
                 "sources": json.loads(sources),
                 "created_at": created_at,
                 "seq": seq,
+                "description": description,
             }
         return nodes
 
@@ -972,13 +1007,26 @@ class DuckSession:
     def _ref(flow: str, name: str) -> str:
         return f"{flow}.{name}"
 
-    def lineage(self, name: str | None = None, flow: str | None = None) -> dict:
+    def lineage(
+        self,
+        name: str | None = None,
+        flow: str | None = None,
+        render: str | None = None,
+        path: str | None = None,
+    ) -> dict:
         """Return the provenance graph of results: the SQL and dependency edges that built them.
 
         With ``name``: the upstream closure that produced that result — the node plus every
         result it (transitively) depends on, following cross-flow edges. With no ``name``: every
         result in ``flow``. ``missing`` lists dependency refs with no lineage row (dropped, or an
-        external input). Nodes are ordered so a dependency always precedes its dependents.
+        external input). Nodes are ordered so a dependency always precedes its dependents. Each
+        node carries its optional one-line ``description`` (``None`` when none was given) so the
+        DAG reads as a plain-English, sequential story for a non-technical audience.
+
+        ``render`` (``"mermaid"`` or ``"dot"``) adds a ready-to-display diagram string under the
+        key matching the requested format — built deterministically from the same nodes/edges, so
+        no downstream parsing is needed. ``path`` writes that diagram to a file (defaulting
+        ``render`` to ``"mermaid"``) and reports the absolute path under ``"rendered_to"``.
         """
         flow = self._resolve_flow(flow)
         with self._lock:
@@ -1021,25 +1069,175 @@ class DuckSession:
             for dep in node["deps"]:
                 edges.append({"from": self._ref(dep["flow"], dep["name"]), "to": self._ref(*key)})
         order = self._topo_order(selected)
-        return {
+        nodes = [
+            {
+                "flow": n["flow"],
+                "name": n["name"],
+                "kind": n["kind"],
+                "description": n["description"],
+                "sql": n["sql"],
+                "deps": n["deps"],
+                "sources": n["sources"],
+                "created_at": n["created_at"],
+            }
+            for n in sorted(selected.values(), key=lambda n: n["seq"])
+        ]
+        result = {
             "flow": flow,
             "root": name,
-            "nodes": [
-                {
-                    "flow": n["flow"],
-                    "name": n["name"],
-                    "kind": n["kind"],
-                    "sql": n["sql"],
-                    "deps": n["deps"],
-                    "sources": n["sources"],
-                    "created_at": n["created_at"],
-                }
-                for n in sorted(selected.values(), key=lambda n: n["seq"])
-            ],
+            "nodes": nodes,
             "edges": edges,
             "order": [self._ref(f, nm) for (f, nm) in order],
             "missing": sorted(set(missing)),
         }
+
+        if path is not None and render is None:
+            render = "mermaid"
+        if render is not None:
+            renderers = {"mermaid": self._to_mermaid, "dot": self._to_dot}
+            if render not in renderers:
+                raise ValueError(
+                    f"Unsupported render {render!r}. Choose 'mermaid' or 'dot'."
+                )
+            diagram = renderers[render](nodes, edges)
+            result[render] = diagram
+            if path is not None:
+                abs_path = os.path.abspath(path)
+                parent = os.path.dirname(abs_path)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                with open(abs_path, "w", encoding="utf-8") as fh:
+                    fh.write(diagram + "\n")
+                result["rendered_to"] = abs_path
+        return result
+
+    @staticmethod
+    def _graph_layout(
+        nodes: list[dict[str, Any]], edges: list[dict[str, str]]
+    ) -> tuple[list[str], list[tuple[str, str]], dict[str, str]]:
+        """Shared layout for the diagram renderers: leaf refs, the edges to draw, and node ids.
+
+        Leaves are the external inputs a result reads — the sources (files, DB tables) plus any
+        dependency whose lineage row is gone (an edge ``from`` that is not a materialized result),
+        each drawn with an edge into the result that consumes it. The returned edge list is the
+        *complete, de-duplicated* set to draw, so a renderer emits it in one pass and cannot
+        double-draw a dropped dependency (which appears both in ``edges`` and as a leaf). Ids
+        ``n0, n1, ...`` are assigned deterministically — results in ``seq`` order first, then
+        leaves in first-seen order — so a given graph lays out identically in every format.
+        """
+        result_refs = [f"{n['flow']}.{n['name']}" for n in nodes]
+        result_set = set(result_refs)
+
+        # Result-to-result edges, then the leaf edges feeding each result.
+        draw_edges: list[tuple[str, str]] = [
+            (e["from"], e["to"]) for e in edges if e["from"] in result_set
+        ]
+        leaf_edges: list[tuple[str, str]] = []
+        for n in nodes:
+            ref = f"{n['flow']}.{n['name']}"
+            for src in n["sources"]:
+                leaf_edges.append((src, ref))
+        for e in edges:
+            if e["from"] not in result_set:
+                leaf_edges.append((e["from"], e["to"]))
+
+        leaf_refs = list(dict.fromkeys(src for src, _ in leaf_edges))
+        # dict.fromkeys de-dups while preserving first-seen order (a source read by two results
+        # keeps both edges; the same edge recorded twice collapses to one).
+        draw_edges = list(dict.fromkeys(draw_edges + leaf_edges))
+        ids = {ref: f"n{i}" for i, ref in enumerate(result_refs + leaf_refs)}
+        return leaf_refs, draw_edges, ids
+
+    @classmethod
+    def _to_mermaid(cls, nodes: list[dict[str, Any]], edges: list[dict[str, str]]) -> str:
+        """Serialize a lineage graph to a Mermaid ``flowchart TD`` string.
+
+        Results render as grey boxes with a **bold** name over an *italic* description; external
+        leaves (sources + dropped deps) render as blue cylinders — the datastore glyph — with an
+        edge into the result that consumes them, so shape *and* colour distinguish an input from a
+        computed step, the diagram has no dangling edges, and it shows where data enters.
+        """
+        def esc(text: str) -> str:
+            # Mermaid HTML labels: entity-escape (& first) so markup in user text can't break out.
+            return (
+                text.replace("\\", "/")
+                .replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+                .replace('"', "&quot;")
+                .replace("\n", " ")
+            )
+
+        leaf_refs, draw_edges, ids = cls._graph_layout(nodes, edges)
+        lines = ["flowchart TD"]
+        for n in nodes:
+            ref = f"{n['flow']}.{n['name']}"
+            # kind is "query" for every result today — only surface it if that ever changes.
+            suffix = "" if n["kind"] == "query" else f" ({esc(n['kind'])})"
+            label = f"<b>{esc(n['name'])}</b>{suffix}"
+            if n["description"]:
+                label += f"<br/><i>{esc(n['description'])}</i>"
+            lines.append(f'    {ids[ref]}["{label}"]')
+        for ref in leaf_refs:
+            lines.append(f'    {ids[ref]}[("<b>{esc(ref)}</b>")]')
+        for src, dst in draw_edges:
+            lines.append(f'    {ids[src]} --> {ids[dst]}')
+        # Explicit fills + text colour so the diagram reads the same on a light or dark page.
+        lines.append(
+            "    classDef source fill:#dbeafe,stroke:#2563eb,stroke-width:2px,color:#0f172a"
+        )
+        lines.append(
+            "    classDef result fill:#f1f5f9,stroke:#334155,stroke-width:2px,color:#0f172a"
+        )
+        result_ids = [ids[f"{n['flow']}.{n['name']}"] for n in nodes]
+        if result_ids:
+            lines.append(f"    class {','.join(result_ids)} result")
+        if leaf_refs:
+            lines.append(f"    class {','.join(ids[r] for r in leaf_refs)} source")
+        return "\n".join(lines)
+
+    @classmethod
+    def _to_dot(cls, nodes: list[dict[str, Any]], edges: list[dict[str, str]]) -> str:
+        """Serialize a lineage graph to a Graphviz DOT ``digraph`` string.
+
+        Mirrors the Mermaid renderer — results are grey boxes with a bold name over an italic
+        description, sources are blue cylinders — using HTML-like labels, so ``dot -Tsvg`` yields a
+        real image. Node ids match ``_graph_layout`` for byte-identical output per graph.
+        """
+        def esc(text: str) -> str:
+            # DOT HTML-like label (<...> delimited): entity-escape, & first.
+            return (
+                text.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+                .replace("\n", " ")
+            )
+
+        leaf_refs, draw_edges, ids = cls._graph_layout(nodes, edges)
+        lines = [
+            "digraph lineage {",
+            "  rankdir=TB;",
+            '  node [fontname="Helvetica", style=filled, penwidth=2];',
+        ]
+        for n in nodes:
+            ref = f"{n['flow']}.{n['name']}"
+            suffix = "" if n["kind"] == "query" else f" ({esc(n['kind'])})"
+            label = f"<B>{esc(n['name'])}</B>{suffix}"
+            if n["description"]:
+                label += f"<BR/><I>{esc(n['description'])}</I>"
+            lines.append(
+                f"  {ids[ref]} [shape=box, fillcolor=\"#f1f5f9\", color=\"#334155\", "
+                f"fontcolor=\"#0f172a\", label=<{label}>];"
+            )
+        for ref in leaf_refs:
+            lines.append(
+                f"  {ids[ref]} [shape=cylinder, fillcolor=\"#dbeafe\", color=\"#2563eb\", "
+                f"fontcolor=\"#0f172a\", label=<<B>{esc(ref)}</B>>];"
+            )
+        for src, dst in draw_edges:
+            lines.append(f'  {ids[src]} -> {ids[dst]};')
+        lines.append("}")
+        return "\n".join(lines)
 
     @staticmethod
     def _topo_order(nodes: dict[tuple[str, str], dict[str, Any]]) -> list[tuple[str, str]]:
@@ -1126,7 +1324,7 @@ class DuckSession:
                 rc = self._con.execute(
                     f'SELECT COUNT(*) FROM "{target}"."{nm}"'
                 ).fetchone()[0]
-                self._record_lineage(target, nm, node["sql"], "query")
+                self._record_lineage(target, nm, node["sql"], "query", node.get("description"))
                 rebuilt.append({"name": nm, "kind": node["kind"], "row_count": int(rc)})
         return {
             "source_flow": flow,
@@ -1142,8 +1340,9 @@ class DuckSession:
 
         Attached-DB tables are named ``<source>.<table>`` (or ``<source>.<schema>.<table>`` for a
         non-default schema — paste-ready either way); file sources appear as their single view
-        name. Row counts are filled for SQLite/file sources (cheap) and left None for remote DBs
-        (a COUNT could be expensive).
+        name. Row counts are filled only where a COUNT is cheap (SQLite tables); file/lakehouse
+        views and remote DBs are left None (a COUNT could scan a whole remote object) — ``describe``
+        fills them on demand.
         """
         out: list[TableInfo] = []
         with self._lock:
@@ -1160,9 +1359,12 @@ class DuckSession:
         source often keeps its tables in a non-default schema). The attached DB's own system
         schemas (information_schema, pg_catalog) are metadata, not data, and are hidden.
         """
-        if src.kind == "file":
-            return [TableInfo(name=src.name, kind="view", row_count=self._safe_count(src.name))]
-        if src.kind in ("sqlite", "postgres", "mysql"):
+        if src.kind in ("file", "delta", "iceberg"):
+            # No eager COUNT(*): a file/lakehouse source can be remote (https/s3/...), so counting
+            # here would trigger a full scan while holding the session lock and stall every other
+            # tool call. describe() (db://{table}) fills the count lazily, on demand.
+            return [TableInfo(name=src.name, kind="view", row_count=None)]
+        if src.kind in ("sqlite", "postgres", "mysql", "ducklake"):
             rows = self._con.execute(
                 "SELECT table_schema, table_name, table_type FROM information_schema.tables "
                 "WHERE table_catalog = ? ORDER BY table_schema, table_name",

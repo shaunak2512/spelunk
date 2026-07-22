@@ -140,6 +140,24 @@ class TestOtherTools:
         cat = _run(mcp_server.call_tool("catalog", {"flow": "copy"})).structured_content
         assert {r["name"] for r in cat["results"]} == {"base", "top"}
 
+    def test_lineage_tool_renders_nothing_by_default(self, mcp_server, tmp_path, monkeypatch):
+        """The tool's defaults must stay opt-in — a bare lineage call writes no file."""
+        _run(mcp_server.call_tool("query", {"sql": 'SELECT * FROM "shop"."customers"', "name": "base"}))
+        cwd = tmp_path / "cwd"  # empty: fixture files live in tmp_path itself
+        cwd.mkdir()
+        monkeypatch.chdir(cwd)
+        lin = _run(mcp_server.call_tool("lineage", {"name": "base"})).structured_content
+        assert "mermaid" not in lin and "rendered_to" not in lin
+        assert list(cwd.iterdir()) == []
+
+    def test_lineage_render_mermaid_passthrough(self, mcp_server):
+        _run(mcp_server.call_tool("query", {"sql": 'SELECT * FROM "shop"."customers"', "name": "base"}))
+        _run(mcp_server.call_tool("query", {"sql": "SELECT id FROM base", "name": "top"}))
+        lin = _run(
+            mcp_server.call_tool("lineage", {"name": "top", "render": "mermaid"})
+        ).structured_content
+        assert lin["mermaid"].startswith("flowchart TD")
+
 
 class TestToolLogging:
     def test_each_call_logs_one_json_line(self, sqlite_file, csv_file, tmp_path):
@@ -195,6 +213,88 @@ class TestToolLogging:
         assert rec["tool"] == "query"
         assert rec["outcome"] == "error"
         assert rec["error"]
+
+
+class TestDescriptionGating:
+    def test_param_absent_without_flag(self, mcp_server):
+        q = next(t for t in _run(mcp_server.list_tools()) if t.name == "query")
+        assert "description" not in q.parameters["properties"]
+
+    def test_param_present_with_flag(self, sqlite_file):
+        session = DuckSession.open([f"shop={sqlite_file}"])
+        try:
+            srv = build_server(session, require_descriptions=True)
+            q = next(t for t in _run(srv.list_tools()) if t.name == "query")
+            assert "description" in q.parameters["properties"]
+        finally:
+            session.close()
+
+    def test_single_query_stores_description(self, sqlite_file):
+        session = DuckSession.open([f"shop={sqlite_file}"])
+        srv = build_server(session, require_descriptions=True)
+        try:
+            _run(srv.call_tool("query", {
+                "sql": 'SELECT * FROM "shop"."customers"', "name": "c",
+                "description": "Every customer in the shop.",
+            }))
+            lin = _run(srv.call_tool("lineage", {"name": "c"})).structured_content
+            assert lin["nodes"][0]["description"] == "Every customer in the shop."
+        finally:
+            session.close()
+
+    def test_single_query_without_description_rejected(self, sqlite_file):
+        from fastmcp.exceptions import ToolError
+
+        session = DuckSession.open([f"shop={sqlite_file}"])
+        srv = build_server(session, require_descriptions=True)
+        try:
+            with pytest.raises(ToolError, match="require-descriptions"):
+                _run(srv.call_tool("query", {"sql": "SELECT 1 AS x", "name": "x"}))
+        finally:
+            session.close()
+
+    def test_batch_step_missing_description_rejected(self, sqlite_file):
+        from pydantic import ValidationError
+
+        session = DuckSession.open([f"shop={sqlite_file}"])
+        srv = build_server(session, require_descriptions=True)
+        try:
+            # `description` is a required field of the step model, so a step that omits it fails
+            # FastMCP's argument-schema validation before the tool body ever runs.
+            with pytest.raises(ValidationError, match="description"):
+                _run(srv.call_tool("query", {"steps": [{"sql": "SELECT 1 AS x", "name": "x"}]}))
+        finally:
+            session.close()
+
+    def test_top_level_description_with_steps_rejected(self, sqlite_file):
+        from fastmcp.exceptions import ToolError
+
+        session = DuckSession.open([f"shop={sqlite_file}"])
+        srv = build_server(session, require_descriptions=True)
+        try:
+            # A top-level description has nothing to attach to in batch mode. Say so instead of
+            # dropping it — otherwise the step's own description silently wins and the caller
+            # never learns theirs was discarded.
+            with pytest.raises(ToolError, match="description on each step"):
+                _run(srv.call_tool("query", {
+                    "description": "Counts the customers.",
+                    "steps": [{"sql": "SELECT 1 AS x", "name": "x", "description": "One row."}],
+                }))
+        finally:
+            session.close()
+
+    def test_batch_step_blank_description_rejected(self, sqlite_file):
+        from fastmcp.exceptions import ToolError
+
+        session = DuckSession.open([f"shop={sqlite_file}"])
+        srv = build_server(session, require_descriptions=True)
+        try:
+            with pytest.raises(ToolError, match="require-descriptions"):
+                _run(srv.call_tool("query", {"steps": [
+                    {"sql": "SELECT 1 AS x", "name": "x", "description": "  "},
+                ]}))
+        finally:
+            session.close()
 
 
 class TestAddSourceGating:
