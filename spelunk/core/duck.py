@@ -1007,7 +1007,13 @@ class DuckSession:
     def _ref(flow: str, name: str) -> str:
         return f"{flow}.{name}"
 
-    def lineage(self, name: str | None = None, flow: str | None = None) -> dict:
+    def lineage(
+        self,
+        name: str | None = None,
+        flow: str | None = None,
+        render: str | None = None,
+        path: str | None = None,
+    ) -> dict:
         """Return the provenance graph of results: the SQL and dependency edges that built them.
 
         With ``name``: the upstream closure that produced that result — the node plus every
@@ -1016,6 +1022,11 @@ class DuckSession:
         external input). Nodes are ordered so a dependency always precedes its dependents. Each
         node carries its optional one-line ``description`` (``None`` when none was given) so the
         DAG reads as a plain-English, sequential story for a non-technical audience.
+
+        ``render`` (``"mermaid"`` or ``"dot"``) adds a ready-to-display diagram string under the
+        key matching the requested format — built deterministically from the same nodes/edges, so
+        no downstream parsing is needed. ``path`` writes that diagram to a file (defaulting
+        ``render`` to ``"mermaid"``) and reports the absolute path under ``"rendered_to"``.
         """
         flow = self._resolve_flow(flow)
         with self._lock:
@@ -1058,26 +1069,175 @@ class DuckSession:
             for dep in node["deps"]:
                 edges.append({"from": self._ref(dep["flow"], dep["name"]), "to": self._ref(*key)})
         order = self._topo_order(selected)
-        return {
+        nodes = [
+            {
+                "flow": n["flow"],
+                "name": n["name"],
+                "kind": n["kind"],
+                "description": n["description"],
+                "sql": n["sql"],
+                "deps": n["deps"],
+                "sources": n["sources"],
+                "created_at": n["created_at"],
+            }
+            for n in sorted(selected.values(), key=lambda n: n["seq"])
+        ]
+        result = {
             "flow": flow,
             "root": name,
-            "nodes": [
-                {
-                    "flow": n["flow"],
-                    "name": n["name"],
-                    "kind": n["kind"],
-                    "description": n["description"],
-                    "sql": n["sql"],
-                    "deps": n["deps"],
-                    "sources": n["sources"],
-                    "created_at": n["created_at"],
-                }
-                for n in sorted(selected.values(), key=lambda n: n["seq"])
-            ],
+            "nodes": nodes,
             "edges": edges,
             "order": [self._ref(f, nm) for (f, nm) in order],
             "missing": sorted(set(missing)),
         }
+
+        if path is not None and render is None:
+            render = "mermaid"
+        if render is not None:
+            renderers = {"mermaid": self._to_mermaid, "dot": self._to_dot}
+            if render not in renderers:
+                raise ValueError(
+                    f"Unsupported render {render!r}. Choose 'mermaid' or 'dot'."
+                )
+            diagram = renderers[render](nodes, edges)
+            result[render] = diagram
+            if path is not None:
+                abs_path = os.path.abspath(path)
+                parent = os.path.dirname(abs_path)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                with open(abs_path, "w", encoding="utf-8") as fh:
+                    fh.write(diagram + "\n")
+                result["rendered_to"] = abs_path
+        return result
+
+    @staticmethod
+    def _graph_layout(
+        nodes: list[dict[str, Any]], edges: list[dict[str, str]]
+    ) -> tuple[list[str], list[tuple[str, str]], dict[str, str]]:
+        """Shared layout for the diagram renderers: leaf refs, the edges to draw, and node ids.
+
+        Leaves are the external inputs a result reads — the sources (files, DB tables) plus any
+        dependency whose lineage row is gone (an edge ``from`` that is not a materialized result),
+        each drawn with an edge into the result that consumes it. The returned edge list is the
+        *complete, de-duplicated* set to draw, so a renderer emits it in one pass and cannot
+        double-draw a dropped dependency (which appears both in ``edges`` and as a leaf). Ids
+        ``n0, n1, ...`` are assigned deterministically — results in ``seq`` order first, then
+        leaves in first-seen order — so a given graph lays out identically in every format.
+        """
+        result_refs = [f"{n['flow']}.{n['name']}" for n in nodes]
+        result_set = set(result_refs)
+
+        # Result-to-result edges, then the leaf edges feeding each result.
+        draw_edges: list[tuple[str, str]] = [
+            (e["from"], e["to"]) for e in edges if e["from"] in result_set
+        ]
+        leaf_edges: list[tuple[str, str]] = []
+        for n in nodes:
+            ref = f"{n['flow']}.{n['name']}"
+            for src in n["sources"]:
+                leaf_edges.append((src, ref))
+        for e in edges:
+            if e["from"] not in result_set:
+                leaf_edges.append((e["from"], e["to"]))
+
+        leaf_refs = list(dict.fromkeys(src for src, _ in leaf_edges))
+        # dict.fromkeys de-dups while preserving first-seen order (a source read by two results
+        # keeps both edges; the same edge recorded twice collapses to one).
+        draw_edges = list(dict.fromkeys(draw_edges + leaf_edges))
+        ids = {ref: f"n{i}" for i, ref in enumerate(result_refs + leaf_refs)}
+        return leaf_refs, draw_edges, ids
+
+    @classmethod
+    def _to_mermaid(cls, nodes: list[dict[str, Any]], edges: list[dict[str, str]]) -> str:
+        """Serialize a lineage graph to a Mermaid ``flowchart TD`` string.
+
+        Results render as grey boxes with a **bold** name over an *italic* description; external
+        leaves (sources + dropped deps) render as blue cylinders — the datastore glyph — with an
+        edge into the result that consumes them, so shape *and* colour distinguish an input from a
+        computed step, the diagram has no dangling edges, and it shows where data enters.
+        """
+        def esc(text: str) -> str:
+            # Mermaid HTML labels: entity-escape (& first) so markup in user text can't break out.
+            return (
+                text.replace("\\", "/")
+                .replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+                .replace('"', "&quot;")
+                .replace("\n", " ")
+            )
+
+        leaf_refs, draw_edges, ids = cls._graph_layout(nodes, edges)
+        lines = ["flowchart TD"]
+        for n in nodes:
+            ref = f"{n['flow']}.{n['name']}"
+            # kind is "query" for every result today — only surface it if that ever changes.
+            suffix = "" if n["kind"] == "query" else f" ({esc(n['kind'])})"
+            label = f"<b>{esc(n['name'])}</b>{suffix}"
+            if n["description"]:
+                label += f"<br/><i>{esc(n['description'])}</i>"
+            lines.append(f'    {ids[ref]}["{label}"]')
+        for ref in leaf_refs:
+            lines.append(f'    {ids[ref]}[("<b>{esc(ref)}</b>")]')
+        for src, dst in draw_edges:
+            lines.append(f'    {ids[src]} --> {ids[dst]}')
+        # Explicit fills + text colour so the diagram reads the same on a light or dark page.
+        lines.append(
+            "    classDef source fill:#dbeafe,stroke:#2563eb,stroke-width:2px,color:#0f172a"
+        )
+        lines.append(
+            "    classDef result fill:#f1f5f9,stroke:#334155,stroke-width:2px,color:#0f172a"
+        )
+        result_ids = [ids[f"{n['flow']}.{n['name']}"] for n in nodes]
+        if result_ids:
+            lines.append(f"    class {','.join(result_ids)} result")
+        if leaf_refs:
+            lines.append(f"    class {','.join(ids[r] for r in leaf_refs)} source")
+        return "\n".join(lines)
+
+    @classmethod
+    def _to_dot(cls, nodes: list[dict[str, Any]], edges: list[dict[str, str]]) -> str:
+        """Serialize a lineage graph to a Graphviz DOT ``digraph`` string.
+
+        Mirrors the Mermaid renderer — results are grey boxes with a bold name over an italic
+        description, sources are blue cylinders — using HTML-like labels, so ``dot -Tsvg`` yields a
+        real image. Node ids match ``_graph_layout`` for byte-identical output per graph.
+        """
+        def esc(text: str) -> str:
+            # DOT HTML-like label (<...> delimited): entity-escape, & first.
+            return (
+                text.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+                .replace("\n", " ")
+            )
+
+        leaf_refs, draw_edges, ids = cls._graph_layout(nodes, edges)
+        lines = [
+            "digraph lineage {",
+            "  rankdir=TB;",
+            '  node [fontname="Helvetica", style=filled, penwidth=2];',
+        ]
+        for n in nodes:
+            ref = f"{n['flow']}.{n['name']}"
+            suffix = "" if n["kind"] == "query" else f" ({esc(n['kind'])})"
+            label = f"<B>{esc(n['name'])}</B>{suffix}"
+            if n["description"]:
+                label += f"<BR/><I>{esc(n['description'])}</I>"
+            lines.append(
+                f"  {ids[ref]} [shape=box, fillcolor=\"#f1f5f9\", color=\"#334155\", "
+                f"fontcolor=\"#0f172a\", label=<{label}>];"
+            )
+        for ref in leaf_refs:
+            lines.append(
+                f"  {ids[ref]} [shape=cylinder, fillcolor=\"#dbeafe\", color=\"#2563eb\", "
+                f"fontcolor=\"#0f172a\", label=<<B>{esc(ref)}</B>>];"
+            )
+        for src, dst in draw_edges:
+            lines.append(f'  {ids[src]} -> {ids[dst]};')
+        lines.append("}")
+        return "\n".join(lines)
 
     @staticmethod
     def _topo_order(nodes: dict[tuple[str, str], dict[str, Any]]) -> list[tuple[str, str]]:

@@ -162,6 +162,122 @@ class TestLineageErrors:
             session.lineage(flow="_spelunk_meta")
 
 
+class TestMermaidRender:
+    def test_render_returns_deterministic_flowchart(self, session):
+        _build_chain(session)
+        lin = session.lineage("top", render="mermaid")
+        diagram = lin["mermaid"]
+        assert diagram.startswith("flowchart TD")
+        # A result node per built table, name in bold.
+        for nm in ("base", "mid", "top"):
+            assert f"<b>{nm}</b>" in diagram
+        # Sources and results are visually distinct: cylinder+source class vs box+result class.
+        assert "classDef source" in diagram and "classDef result" in diagram
+        assert '[("<b>orders</b>")]' in diagram
+        # At least one arrow per recorded result edge (base->mid, mid->top); source leaves
+        # (orders, shop.customers) add more.
+        assert diagram.count(" --> ") >= len(lin["edges"])
+        assert "orders" in diagram
+        # Byte-identical on re-render — no LLM in the loop, so it's reproducible.
+        assert session.lineage("top", render="mermaid")["mermaid"] == diagram
+
+    def test_source_leaves_have_no_dangling_edges(self, session):
+        _build_chain(session)
+        lin = session.lineage("top", render="mermaid")
+        # Every id referenced by an edge must be declared as a node line.
+        import re
+
+        declared = set(re.findall(r"^\s+(n\d+)[\[(]", lin["mermaid"], re.MULTILINE))
+        endpoints = set(re.findall(r"(n\d+) --> (n\d+)", lin["mermaid"]))
+        used = {a for a, _ in endpoints} | {b for _, b in endpoints}
+        assert used <= declared
+
+    def test_path_writes_file_and_reports_absolute_path(self, session, tmp_path):
+        import os
+
+        _build_chain(session)
+        out = tmp_path / "sub" / "lineage.mmd"
+        lin = session.lineage("top", path=str(out))
+        # path implies mermaid render, writes the file, and echoes the absolute path.
+        assert lin["mermaid"].startswith("flowchart TD")
+        assert lin["rendered_to"] == os.path.abspath(str(out))
+        assert out.read_text(encoding="utf-8").rstrip("\n") == lin["mermaid"]
+
+    def test_unknown_render_rejected(self, session):
+        _build_chain(session)
+        with pytest.raises(ValueError, match="Unsupported render"):
+            session.lineage("top", render="graphviz")
+
+    def test_name_and_description_are_styled_differently(self, session):
+        session.query('SELECT id FROM "shop"."customers"', "base", description="all customers")
+        mmd = session.lineage("base", render="mermaid")["mermaid"]
+        assert "<b>base</b><br/><i>all customers</i>" in mmd
+        dot = session.lineage("base", render="dot")["dot"]
+        assert "<B>base</B><BR/><I>all customers</I>" in dot
+
+    def test_markup_in_description_is_escaped(self, session):
+        session.query(
+            'SELECT id FROM "shop"."customers"', "base", description='a <b>& "x"</b>'
+        )
+        mmd = session.lineage("base", render="mermaid")["mermaid"]
+        # User text can't break out of the label or inject its own markup.
+        assert "&lt;b&gt;&amp; &quot;x&quot;&lt;/b&gt;" in mmd
+        dot = session.lineage("base", render="dot")["dot"]
+        assert "&lt;b&gt;&amp; \"x\"&lt;/b&gt;" in dot
+
+    def test_dot_render_is_valid_digraph(self, session):
+        _build_chain(session)
+        lin = session.lineage("top", render="dot")
+        dot = lin["dot"]
+        assert dot.startswith("digraph lineage {")
+        assert dot.rstrip().endswith("}")
+        for nm in ("base", "mid", "top"):
+            assert f"<B>{nm}</B>" in dot
+        assert " -> " in dot
+        assert "orders" in dot
+        # Results are boxes, sources are cylinders.
+        assert dot.count("shape=box") == 3 and "shape=cylinder" in dot
+        # Reproducible with no LLM in the loop.
+        assert session.lineage("top", render="dot")["dot"] == dot
+
+    def test_dot_and_mermaid_share_node_ids(self, session):
+        _build_chain(session)
+        import re
+
+        mmd = session.lineage("top", render="mermaid")["mermaid"]
+        dot = session.lineage("top", render="dot")["dot"]
+        mmd_edges = set(re.findall(r"(n\d+) --> (n\d+)", mmd))
+        dot_edges = set(re.findall(r"(n\d+) -> (n\d+)", dot))
+        assert mmd_edges == dot_edges
+
+    def test_dropped_dep_edge_is_not_drawn_twice(self, session):
+        """A dropped dep is both an `edges` entry and a leaf — it must still draw one arrow."""
+        _build_chain(session)
+        session.drop("mid")  # top now depends on a result with no lineage row
+        lin = session.lineage("top", render="mermaid")
+        assert lin["missing"] == ["default.mid"]
+        arrows = [ln.strip() for ln in lin["mermaid"].splitlines() if "-->" in ln]
+        assert len(arrows) == len(set(arrows)), f"duplicate edges: {arrows}"
+        dot = session.lineage("top", render="dot")["dot"]
+        dot_arrows = [ln.strip() for ln in dot.splitlines() if " -> " in ln]
+        assert len(dot_arrows) == len(set(dot_arrows)), f"duplicate edges: {dot_arrows}"
+
+    def test_render_is_opt_in_and_writes_nothing_by_default(self, session, tmp_path, monkeypatch):
+        """lineage() is read-only: no diagram, and no file touched, unless asked."""
+        _build_chain(session)
+        cwd = tmp_path / "cwd"  # empty: fixture files live in tmp_path itself
+        cwd.mkdir()
+        monkeypatch.chdir(cwd)  # any stray relative write would land here
+        lin = session.lineage("top")
+        assert "mermaid" not in lin and "dot" not in lin and "rendered_to" not in lin
+        assert list(cwd.iterdir()) == []
+
+    def test_path_defaults_to_mermaid_not_dot(self, session, tmp_path):
+        _build_chain(session)
+        lin = session.lineage("top", path=str(tmp_path / "g.mmd"))
+        assert "mermaid" in lin and "dot" not in lin
+
+
 class TestReplay:
     def test_dry_run_plans_without_executing(self, session):
         _build_chain(session)

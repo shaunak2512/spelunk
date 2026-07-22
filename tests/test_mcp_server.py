@@ -140,6 +140,24 @@ class TestOtherTools:
         cat = _run(mcp_server.call_tool("catalog", {"flow": "copy"})).structured_content
         assert {r["name"] for r in cat["results"]} == {"base", "top"}
 
+    def test_lineage_tool_renders_nothing_by_default(self, mcp_server, tmp_path, monkeypatch):
+        """The tool's defaults must stay opt-in — a bare lineage call writes no file."""
+        _run(mcp_server.call_tool("query", {"sql": 'SELECT * FROM "shop"."customers"', "name": "base"}))
+        cwd = tmp_path / "cwd"  # empty: fixture files live in tmp_path itself
+        cwd.mkdir()
+        monkeypatch.chdir(cwd)
+        lin = _run(mcp_server.call_tool("lineage", {"name": "base"})).structured_content
+        assert "mermaid" not in lin and "rendered_to" not in lin
+        assert list(cwd.iterdir()) == []
+
+    def test_lineage_render_mermaid_passthrough(self, mcp_server):
+        _run(mcp_server.call_tool("query", {"sql": 'SELECT * FROM "shop"."customers"', "name": "base"}))
+        _run(mcp_server.call_tool("query", {"sql": "SELECT id FROM base", "name": "top"}))
+        lin = _run(
+            mcp_server.call_tool("lineage", {"name": "top", "render": "mermaid"})
+        ).structured_content
+        assert lin["mermaid"].startswith("flowchart TD")
+
 
 class TestToolLogging:
     def test_each_call_logs_one_json_line(self, sqlite_file, csv_file, tmp_path):
