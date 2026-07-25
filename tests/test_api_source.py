@@ -283,6 +283,18 @@ class TestPagination:
         assert info["row_count"] == 4
         assert info["pages"] == 2
 
+    def test_404_mid_pagination_is_end_of_data(self, api, tmp_path):
+        # TVMaze-style: pages past the end 404 instead of returning [] — the fetch must keep
+        # the pages it has, not fail. (A 404 on the FIRST page is still an error.)
+        api.handlers["/p"] = lambda n, q: (
+            (200, _rows(2, 2 * (n - 1)), {}) if n <= 2 else (404, {"error": "no such page"}, {})
+        )
+        dest = str(tmp_path / "s.ndjson")
+        info = fetch_snapshot(ApiSpec(url=f"{api.base}/p", paginate="page"), dest)
+        assert info["row_count"] == 4
+        assert info["pages"] == 2
+        assert "truncated" not in info
+
     def test_max_pages_truncates(self, api, tmp_path):
         api.handlers["/p"] = lambda n, q: (200, _rows(2, 2 * (int(q["page"]) - 1)), {})
         spec = ApiSpec(url=f"{api.base}/p", paginate="page", max_pages=3)

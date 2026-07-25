@@ -73,6 +73,19 @@ _INT_OPTIONS = frozenset({"start", "page_size", "max_pages", "max_rows"})
 _LINK_NEXT_RE = re.compile(r'<([^>]+)>\s*;[^,]*\brel="?next"?')
 
 
+class ApiHttpError(ValueError):
+    """A non-retryable HTTP error response, carrying its status code.
+
+    A ``ValueError`` like every other fetch failure (callers that don't care about the code
+    handle it uniformly), but the pagination loop needs the status: a 404 *mid-pagination* is
+    how some APIs (e.g. TVMaze) say "past the last page" and must end the fetch, not fail it.
+    """
+
+    def __init__(self, message: str, status: int) -> None:
+        super().__init__(message)
+        self.status = status
+
+
 @dataclass
 class ApiSpec:
     """A parsed ``api:`` locator: the URL plus fetch options (see the module docstring)."""
@@ -170,7 +183,12 @@ def fetch_snapshot(spec: ApiSpec, dest_path: str) -> dict[str, Any]:
     try:
         with open(tmp_path, "w", encoding="utf-8") as fh:
             while next_url is not None:
-                payload, resp_headers = _get_json(next_url, headers)
+                try:
+                    payload, resp_headers = _get_json(next_url, headers)
+                except ApiHttpError as exc:
+                    if pages > 0 and exc.status == 404:
+                        break  # past-the-end page: some APIs 404 instead of returning []
+                    raise
                 last_payload = payload
                 records = _extract_records(payload, spec.records, next_url)
                 pages += 1
@@ -251,8 +269,9 @@ def _get_json(url: str, headers: dict[str, str]) -> tuple[Any, dict[str, str]]:
                     continue
             else:
                 detail = exc.read()[:200].decode("utf-8", errors="replace")
-                raise ValueError(
-                    f"API request failed: HTTP {exc.code} for {url}. {detail}".strip()
+                raise ApiHttpError(
+                    f"API request failed: HTTP {exc.code} for {url}. {detail}".strip(),
+                    exc.code,
                 ) from exc
         except _urlerror.URLError as exc:
             last_error = exc

@@ -53,6 +53,7 @@ spelunk/core/
                  #   full next-URL directly, PokeAPI-style), max_pages/max_rows caps, auth_env=<ENV>
                  #   (Bearer; env var NAME in the spec, never the token). Retries 429/5xx with
                  #   backoff + Retry-After; repeat-page guard stops APIs that ignore page params;
+                 #   a 404 mid-pagination = end-of-data (TVMaze-style), on page 1 = error;
                  #   fetch fingerprint (url/fetched_at/pages/row_count) returned as Source.info.
                  #   Live smoke-check: tests/live_api_check.py (manual; hits real public APIs).
   guard.py       # sqlglot AST safety: assert_read_only(), enforce_limit() — called dialect="duckdb"
