@@ -3,8 +3,8 @@
 Ideas surfaced during development that aren't worth building yet — with the context needed to
 pick them up later.
 
-> Larger feature designs live in their own docs: cross-source join-key discovery (`relate`) and
-> durable notebook mode are explored in `design_join_discovery_and_notebook.md`.
+> Larger feature designs live in their own docs: cross-source join-key discovery (`relate`),
+> durable notebook mode, and API sources are explored in `design_join_discovery_and_notebook.md`.
 
 ## Workspace GC: distinguish "locked" from "unopenable" in the sweep probe
 
