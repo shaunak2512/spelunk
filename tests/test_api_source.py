@@ -15,7 +15,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 from spelunk.core import apifetch, sources
-from spelunk.core.apifetch import ApiSpec, fetch_snapshot, parse_api_spec
+from spelunk.core.apifetch import ApiSpec, fetch_snapshot, parse_api_spec, sql_to_odata_filter
 from spelunk.core.duck import DuckSession
 
 
@@ -142,6 +142,28 @@ class TestParseApiSpec:
         assert spec.records == "d.results"
         assert spec.cursor_path == "d.__next"
 
+    def test_filter_select_require_odata(self):
+        with pytest.raises(ValueError, match="paginate=odata"):
+            parse_api_spec('https://x.test/a filter="a > 1"')
+        with pytest.raises(ValueError, match="paginate=odata"):
+            parse_api_spec("https://x.test/a select=Id")
+
+    def test_filter_and_select_injected_into_url(self):
+        spec = parse_api_spec(
+            'https://x.test/Orders paginate=odata select=OrderID,Freight '
+            'filter="Freight > 500 AND ShipCountry = \'Germany\'"'
+        )
+        from urllib.parse import parse_qs, urlsplit
+
+        assert "%20" in spec.url  # spaces are %20-encoded, never '+'
+        q = parse_qs(urlsplit(spec.url).query)
+        assert q["$filter"] == ["Freight gt 500 and ShipCountry eq 'Germany'"]
+        assert q["$select"] == ["OrderID,Freight"]
+
+    def test_select_rejects_garbage(self):
+        with pytest.raises(ValueError, match="comma-separated column list"):
+            parse_api_spec('https://x.test/a paginate=odata select="Id; DROP TABLE x"')
+
     def test_keyset_requires_field_and_param(self):
         with pytest.raises(ValueError, match="keyset_field"):
             parse_api_spec("https://x.test/a paginate=keyset cursor_param=after")
@@ -169,6 +191,51 @@ class TestParseApiSpec:
 
     def test_detect_kind(self):
         assert sources.detect_kind("api:https://x.test/a") == "api"
+
+
+# --------------------------------------------------------------------------- #
+# SQL -> OData $filter translation
+# --------------------------------------------------------------------------- #
+class TestSqlToODataFilter:
+    @pytest.mark.parametrize(
+        "sql,odata",
+        [
+            ("Freight > 500", "Freight gt 500"),
+            ("a >= 1 AND b < 2", "a ge 1 and b lt 2"),
+            ("a = 'x' OR b != 3", "a eq 'x' or b ne 3"),
+            ("(a = 1 OR b = 2) AND c = 3", "(a eq 1 or b eq 2) and c eq 3"),
+            ("NOT (a = 1)", "not (a eq 1)"),
+            ("name = 'O''Brien'", "name eq 'O''Brien'"),
+            ("city IN ('Berlin', 'Paris')", "(city eq 'Berlin' or city eq 'Paris')"),
+            ("name LIKE '%duck%'", "contains(name, 'duck')"),
+            ("name LIKE 'duck%'", "startswith(name, 'duck')"),
+            ("name LIKE '%duck'", "endswith(name, 'duck')"),
+            ("name LIKE 'duck'", "name eq 'duck'"),
+            ("name ILIKE '%Duck%'", "contains(tolower(name), 'duck')"),
+            ("a IS NULL", "a eq null"),
+            ("a IS NOT NULL", "not (a eq null)"),
+            ("active = true", "active eq true"),
+            ("delta > -5", "delta gt -5"),
+        ],
+    )
+    def test_translations(self, sql, odata):
+        assert sql_to_odata_filter(sql) == odata
+
+    @pytest.mark.parametrize(
+        "sql,reason",
+        [
+            ("name LIKE '%a%b%'", "mid-string wildcard"),
+            ("name LIKE 'a_b'", "'_' wildcards"),
+            ("LENGTH(name) > 3", "cannot translate"),
+            ("t.name = 'x'", "qualified column"),
+            ("a = (SELECT 1)", "cannot translate"),
+            ("a + 1 > 2", "cannot translate"),
+            ("SELECT 1", "cannot translate"),
+        ],
+    )
+    def test_rejections_are_loud(self, sql, reason):
+        with pytest.raises(ValueError, match=reason):
+            sql_to_odata_filter(sql)
 
 
 # --------------------------------------------------------------------------- #
@@ -334,6 +401,15 @@ class TestPagination:
         info = fetch_snapshot(spec, str(tmp_path / "s.ndjson"))
         assert info["row_count"] == 2
         assert api.calls[1]["query"]["skiptoken"] == "t1"
+
+    def test_odata_filter_reaches_server_decoded(self, api, tmp_path):
+        api.handlers["/Orders"] = lambda n, q: (200, {"value": _rows(2)}, {})
+        spec = parse_api_spec(
+            f'{api.base}/Orders paginate=odata select=id filter="id > 0 AND name != \'x\'"'
+        )
+        fetch_snapshot(spec, str(tmp_path / "s.ndjson"))
+        assert api.calls[0]["query"]["$filter"] == "id gt 0 and name ne 'x'"
+        assert api.calls[0]["query"]["$select"] == "id"
 
     def test_odata_v2_shape(self, api, tmp_path):
         # v2: {"d": {"results": [...], "__next": url}} — real nesting, explicit overrides.

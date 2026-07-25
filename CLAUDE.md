@@ -52,8 +52,11 @@ spelunk/core/
                  #   records=<dot.path>, paginate=none|page|offset|cursor|keyset|link|odata
                  #   (cursor follows a full or relative next-URL directly, PokeAPI-style; keyset =
                  #   Stripe-style starting_after from the LAST RECORD's keyset_field, exclusive
-                 #   semantics; odata = cursor pre-configured for @odata.nextLink + records=value —
-                 #   percent-encode $filter spaces),
+                 #   semantics; odata = cursor pre-configured for @odata.nextLink + records=value,
+                 #   plus filter="<SQL predicate>"/select=<cols> translated server-side to
+                 #   $filter/$select via sqlglot — untranslatable SQL errors loudly, never
+                 #   silently fetches everything; options tokenized shell-style so quoted
+                 #   values may contain spaces),
                  #   max_pages/max_rows caps. Auth: auth_env=<ENV> (Bearer), header=<Name>:<ENV>
                  #   (any header, e.g. X-Api-Key), param=<name>:<ENV> (query-param keys) — specs
                  #   carry env var NAMES, never values; injected values are scrubbed from error

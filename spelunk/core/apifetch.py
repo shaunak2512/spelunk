@@ -50,6 +50,11 @@ Options (whitespace-separated ``key=value`` after the URL; unknown keys are reje
 * ``max_pages=<n>`` — hard cap on requests (default 20). ``max_rows=<n>`` — optional row cap.
 * ``auth_env=<ENV_VAR>`` — send ``Authorization: Bearer $ENV_VAR``. The spec carries the env
   var *name*, never the token, so specs stay safe to log and echo.
+* ``filter="<SQL predicate>"`` / ``select=<col,col>`` — OData only (``paginate=odata``): the
+  SQL predicate is translated to ``$filter`` (comparisons, AND/OR/NOT, IN, edge-anchored
+  LIKE/ILIKE, IS [NOT] NULL — anything else errors, telling you to hand-write that part) and
+  the column list to ``$select``, so the agent writes SQL on both sides of the wire. Quote
+  values containing spaces — options are tokenized shell-style.
 * ``header=<Name>:<ENV_VAR>`` (repeatable) — send any extra header with its value from the
   environment: ``header=X-Api-Key:NASA_KEY``. Covers API-key headers and non-Bearer
   ``Authorization`` schemes (put the full value, e.g. ``token xxx``, in the env var).
@@ -69,13 +74,14 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import time
 from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timezone
 from typing import Any
 from urllib import error as _urlerror
 from urllib import request as _urlrequest
-from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlsplit, urlunsplit
 
 _PAGINATE_STYLES = frozenset({"none", "page", "offset", "cursor", "keyset", "link", "odata"})
 # Wrapper keys tried, in order, when the response is an object and no records= path was given.
@@ -125,6 +131,11 @@ class ApiSpec:
     max_pages: int = _DEFAULT_MAX_PAGES
     max_rows: int | None = None
     auth_env: str | None = None
+    # OData only (paginate=odata): a SQL predicate translated to $filter, and a column list
+    # for $select — so the agent writes SQL on both sides of the wire. Quoted values are
+    # supported: filter="Freight > 500 AND ShipCountry = 'Germany'".
+    filter: str | None = None
+    select: str | None = None
     # (header name, ENV var) / (query param, ENV var) pairs from repeatable header=/param=
     # options — values are resolved from the environment at fetch time, never stored.
     extra_headers: list[tuple[str, str]] = field(default_factory=list)
@@ -137,8 +148,16 @@ _VALID_OPTION_HELP = ", ".join(sorted(_OPTION_NAMES | {"header", "param"}))
 
 
 def parse_api_spec(text: str) -> ApiSpec:
-    """Parse the locator body of an ``api:`` spec — ``<url> [key=value ...]``."""
-    parts = text.split()
+    """Parse the locator body of an ``api:`` spec — ``<url> [key=value ...]``.
+
+    Tokenized shell-style so an option value may be quoted to contain spaces
+    (``filter="Freight > 500"``); a locator with an unbalanced quote character falls back to
+    plain whitespace splitting.
+    """
+    try:
+        parts = shlex.split(text)
+    except ValueError:
+        parts = text.split()
     if not parts:
         raise ValueError("api: source needs a URL, e.g. api:https://example.com/data")
     url = parts[0]
@@ -193,12 +212,24 @@ def parse_api_spec(text: str) -> ApiSpec:
             "paginate=keyset needs keyset_field=<dot.path into the last record> AND "
             "cursor_param=<query-param-name>, e.g. keyset_field=id cursor_param=starting_after."
         )
+    if (spec.filter or spec.select) and spec.paginate != "odata":
+        raise ValueError(
+            "filter=/select= are OData options and need paginate=odata (they translate to "
+            "$filter/$select). For a non-OData API, put the service's own query params in "
+            "the URL instead."
+        )
     if spec.paginate == "odata":
         # Sugar for the OData v4 conventions: records under "value", the next page as a full
         # (or relative) URL at the literal key "@odata.nextLink". Explicit records=/cursor_path=
         # win, so a v2 service works with records=d.results cursor_path=d.__next.
+        url = spec.url
+        if spec.filter:
+            url = _with_param(url, "$filter", sql_to_odata_filter(spec.filter))
+        if spec.select:
+            url = _with_param(url, "$select", _select_list(spec.select))
         spec = replace(
             spec,
+            url=url,
             paginate="cursor",
             cursor_path=spec.cursor_path or "@odata.nextLink",
             records=spec.records or "value",
@@ -206,6 +237,18 @@ def parse_api_spec(text: str) -> ApiSpec:
     if spec.max_pages < 1:
         raise ValueError("max_pages must be >= 1.")
     return spec
+
+
+def _select_list(select: str) -> str:
+    """Validate a ``select=`` column list (comma-separated identifiers) for $select."""
+    cols = [c.strip() for c in select.split(",") if c.strip()]
+    bad = [c for c in cols if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", c)]
+    if not cols or bad:
+        raise ValueError(
+            f"select= takes a comma-separated column list, e.g. select=OrderID,Freight; "
+            f"got {select!r}" + (f" (invalid: {', '.join(bad)})" if bad else "") + "."
+        )
+    return ",".join(cols)
 
 
 def fetch_snapshot(spec: ApiSpec, dest_path: str) -> dict[str, Any]:
@@ -377,6 +420,118 @@ def _backoff_delay(attempt: int, retry_after: str | None) -> float:
 
 
 # --------------------------------------------------------------------------- #
+# SQL -> OData $filter translation
+# --------------------------------------------------------------------------- #
+def sql_to_odata_filter(predicate: str) -> str:
+    """Translate a SQL predicate into an OData v4 ``$filter`` expression.
+
+    Supports the operator set both languages share: comparisons (=, !=, >, >=, <, <=),
+    AND/OR/NOT, parentheses, IN (expanded to an eq-or-chain for pre-4.01 servers),
+    LIKE/ILIKE with an edge-anchored pattern (-> contains/startswith/endswith, ILIKE via
+    tolower), IS [NOT] NULL, booleans, and negative numbers. Anything outside that set —
+    functions, arithmetic, subqueries, mid-string wildcards — raises a ``ValueError`` telling
+    the caller to hand-write that part of the ``$filter`` in the URL instead: a filter must
+    translate fully or fail loudly, never silently fetch everything.
+    """
+    import sqlglot
+    from sqlglot.errors import SqlglotError
+
+    try:
+        tree = sqlglot.parse_one(predicate, read="duckdb")
+    except SqlglotError as exc:
+        raise ValueError(f"filter= is not a parseable SQL predicate: {exc}") from exc
+    return _odata_expr(tree)
+
+
+def _odata_expr(node: Any) -> str:
+    from sqlglot import exp
+
+    comparisons = {
+        exp.EQ: "eq", exp.NEQ: "ne", exp.GT: "gt", exp.GTE: "ge", exp.LT: "lt", exp.LTE: "le",
+    }
+
+    def logical_operand(child: Any) -> str:
+        text = _odata_expr(child)
+        # Parenthesize nested logical operators so SQL grouping survives OData precedence.
+        return f"({text})" if isinstance(child, (exp.And, exp.Or)) else text
+
+    for cls, op in comparisons.items():
+        if isinstance(node, cls):
+            return f"{_odata_expr(node.this)} {op} {_odata_expr(node.expression)}"
+    if isinstance(node, (exp.And, exp.Or)):
+        op = "and" if isinstance(node, exp.And) else "or"
+        return f"{logical_operand(node.this)} {op} {logical_operand(node.expression)}"
+    if isinstance(node, exp.Not):
+        inner = node.this
+        while isinstance(inner, exp.Paren):  # not-with-parens would otherwise double up
+            inner = inner.this
+        return f"not ({_odata_expr(inner)})"
+    if isinstance(node, exp.Paren):
+        return f"({_odata_expr(node.this)})"
+    if isinstance(node, exp.Is):
+        # sqlglot parses IS NOT NULL as Not(Is(...)), handled by the Not branch above.
+        return f"{_odata_expr(node.this)} eq {_odata_expr(node.expression)}"
+    if isinstance(node, exp.In):
+        col = _odata_expr(node.this)
+        values = node.expressions
+        if not values:
+            raise ValueError("filter=: IN needs a literal list, e.g. col IN ('a', 'b').")
+        return "(" + " or ".join(f"{col} eq {_odata_expr(v)}" for v in values) + ")"
+    if isinstance(node, (exp.Like, exp.ILike)):
+        return _odata_like(node)
+    if isinstance(node, exp.Column):
+        if node.table or node.db:
+            raise ValueError(
+                f"filter=: qualified column {node.sql()!r} is not translatable — use the bare "
+                "OData property name."
+            )
+        return node.name
+    if isinstance(node, exp.Literal):
+        if node.is_string:
+            return "'" + node.this.replace("'", "''") + "'"
+        return node.this
+    if isinstance(node, exp.Boolean):
+        return "true" if node.this else "false"
+    if isinstance(node, exp.Null):
+        return "null"
+    if isinstance(node, exp.Neg):
+        return f"-{_odata_expr(node.this)}"
+    raise ValueError(
+        f"filter=: cannot translate {node.sql()!r} to OData. Supported: comparisons, "
+        "AND/OR/NOT, IN, LIKE with an edge-anchored pattern, IS [NOT] NULL. Hand-write the "
+        "$filter in the URL for anything else."
+    )
+
+
+def _odata_like(node: Any) -> str:
+    """LIKE/ILIKE with an edge-anchored pattern -> contains/startswith/endswith."""
+    from sqlglot import exp
+
+    pattern = node.expression
+    if not isinstance(pattern, exp.Literal) or not pattern.is_string:
+        raise ValueError("filter=: LIKE needs a literal string pattern.")
+    raw = pattern.this
+    if "_" in raw:
+        raise ValueError("filter=: LIKE '_' wildcards have no OData equivalent.")
+    inner = raw.strip("%")
+    if "%" in inner:
+        raise ValueError(
+            f"filter=: LIKE pattern {raw!r} has a mid-string wildcard — OData only has "
+            "contains/startswith/endswith."
+        )
+    fn = {
+        (True, True): "contains", (False, True): "startswith", (True, False): "endswith",
+    }.get((raw.startswith("%"), raw.endswith("%")), "eq")
+    col = _odata_expr(node.this)
+    lit = "'" + inner.replace("'", "''") + "'"
+    if isinstance(node, exp.ILike):
+        col, lit = f"tolower({col})", lit.lower()
+    if fn == "eq":
+        return f"{col} eq {lit}"
+    return f"{fn}({col}, {lit})"
+
+
+# --------------------------------------------------------------------------- #
 # Record extraction
 # --------------------------------------------------------------------------- #
 def _dig(obj: Any, path: str) -> Any:
@@ -436,11 +591,15 @@ def _page_signature(records: list[dict]) -> tuple[int, str]:
 # Pagination
 # --------------------------------------------------------------------------- #
 def _with_param(url: str, key: str, value: Any) -> str:
-    """Return *url* with query param *key* set to *value* (replacing any existing one)."""
+    """Return *url* with query param *key* set to *value* (replacing any existing one).
+
+    Encodes with %20 for spaces (``quote``, not ``quote_plus``) — OData services must see
+    ``$filter=Freight%20gt%20500``, and every server accepts %20 where + is ambiguous.
+    """
     parts = urlsplit(url)
     query = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k != key]
     query.append((key, str(value)))
-    return urlunsplit(parts._replace(query=urlencode(query)))
+    return urlunsplit(parts._replace(query=urlencode(query, quote_via=quote)))
 
 
 def _first_url(spec: ApiSpec) -> str:

@@ -119,6 +119,14 @@ CASES = [
         None,
     ),
     (
+        "SQL filter= translated to OData $filter server-side (Northwind)",
+        "nw_germany=api:https://services.odata.org/V4/Northwind/Northwind.svc/Orders "
+        "paginate=odata select=OrderID,Freight,ShipCountry "
+        "filter=\"Freight > 100 AND ShipCountry = 'Germany'\"",
+        10,
+        None,
+    ),
+    (
         "OData v4 server-driven paging via @odata.nextLink (Northwind)",
         "nw_orders=api:https://services.odata.org/V4/Northwind/Northwind.svc/Orders"
         "?$select=OrderID,CustomerID,Freight paginate=odata max_pages=3",
@@ -190,6 +198,13 @@ def _run_joins(session: DuckSession, attached: set[str]) -> int:
             "SELECT p.userId, COUNT(*) AS posts, MAX(w.word) AS a_word "
             "FROM posts p CROSS JOIN (SELECT word FROM words LIMIT 1) w "
             "GROUP BY p.userId ORDER BY p.userId LIMIT 5",
+        ))
+    if "nw_germany" in attached:
+        joins.append((
+            "translated $filter verified locally (every row satisfies the predicate)",
+            "SELECT CASE WHEN COUNT(*) = 0 THEN 'server applied the filter' "
+            "ELSE error('rows violating the translated filter: ' || COUNT(*)) END AS verdict "
+            "FROM nw_germany WHERE NOT (Freight > 100 AND ShipCountry = 'Germany')",
         ))
     if {"tmdb_movies", "tmdb_genres"} <= attached:
         joins.append((
