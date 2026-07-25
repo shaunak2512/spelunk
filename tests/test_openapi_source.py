@@ -195,6 +195,27 @@ class TestEndpointRows:
         row = _rows_by_key()[("/loop", "GET")]
         assert row["records_hint"] is None  # cycle bottoms out, no crash
 
+    def test_odata_style_params_hint_offset(self):
+        spec = {
+            "openapi": "3.0.0",
+            "servers": [{"url": "https://svc.test"}],
+            "paths": {
+                "/Orders": {
+                    "get": {
+                        "parameters": [
+                            {"name": "$skip", "in": "query", "schema": {"type": "integer"}},
+                            {"name": "$top", "in": "query", "schema": {"type": "integer"}},
+                        ],
+                        "responses": {},
+                    }
+                }
+            },
+        }
+        row = openapi.endpoint_rows(spec, "s.json")[0]
+        assert row["pagination_hint"] == "offset"
+        assert "offset_param=$skip" in row["suggested_spec"]
+        assert "size_param=$top" in row["suggested_spec"]
+
 
 class TestLoadSpec:
     def test_swagger2_rejected(self, tmp_path):

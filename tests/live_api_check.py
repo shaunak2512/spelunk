@@ -112,6 +112,20 @@ CASES = [
         None,
     ),
     (
+        "OData v4 with $filter/$select pushed to the service (Northwind)",
+        "big_freight=api:https://services.odata.org/V4/Northwind/Northwind.svc/Orders"
+        "?$filter=Freight%20gt%20500&$select=OrderID,Freight,ShipCountry paginate=odata",
+        5,
+        None,
+    ),
+    (
+        "OData v4 server-driven paging via @odata.nextLink (Northwind)",
+        "nw_orders=api:https://services.odata.org/V4/Northwind/Northwind.svc/Orders"
+        "?$select=OrderID,CustomerID,Freight paginate=odata max_pages=3",
+        41,
+        None,
+    ),
+    (
         "API key as env-injected query param, scrubbed from logs (NASA APOD)",
         "apod=api:https://api.nasa.gov/planetary/apod?count=5 param=api_key:NASA_KEY",
         5,

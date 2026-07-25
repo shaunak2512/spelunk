@@ -204,13 +204,16 @@ _CURSORISH = ("cursor", "starting_after", "since_id", "after", "page_token", "ne
 def _pagination_of(params: list[dict]) -> tuple[str | None, str | None]:
     """(pagination_hint, api:-spec fragment) from query-param names; fragment only when safe."""
     qnames = {p["name"].lower(): p["name"] for p in params if p.get("location") == "query"}
-    size = next((qnames[n] for n in ("limit", "per_page", "page_size", "count") if n in qnames), None)
+    size = next(
+        (qnames[n] for n in ("limit", "per_page", "page_size", "count", "$top") if n in qnames),
+        None,
+    )
     if "page" in qnames:
         frag = "paginate=page"
         if size:
             frag += f" size_param={size}"
         return "page", frag
-    offset = next((qnames[n] for n in ("offset", "skip") if n in qnames), None)
+    offset = next((qnames[n] for n in ("offset", "skip", "$skip") if n in qnames), None)
     if offset:
         frag = f"paginate=offset offset_param={offset}"
         if size:

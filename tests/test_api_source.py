@@ -128,6 +128,20 @@ class TestParseApiSpec:
         with pytest.raises(ValueError, match="cursor_path"):
             parse_api_spec("https://x.test/a paginate=cursor")
 
+    def test_odata_alias_normalizes_to_cursor(self):
+        spec = parse_api_spec("https://x.test/odata/Orders paginate=odata")
+        assert spec.paginate == "cursor"
+        assert spec.cursor_path == "@odata.nextLink"
+        assert spec.records == "value"
+
+    def test_odata_alias_explicit_overrides_win(self):
+        # An OData v2 service: d-wrapped results, __next link.
+        spec = parse_api_spec(
+            "https://x.test/svc paginate=odata records=d.results cursor_path=d.__next"
+        )
+        assert spec.records == "d.results"
+        assert spec.cursor_path == "d.__next"
+
     def test_keyset_requires_field_and_param(self):
         with pytest.raises(ValueError, match="keyset_field"):
             parse_api_spec("https://x.test/a paginate=keyset cursor_param=after")
@@ -180,6 +194,11 @@ class TestFetchBasics:
         api.handlers["/w"] = lambda n, q: (200, {"count": 2, "results": _rows(2)}, {})
         dest = str(tmp_path / "s.ndjson")
         assert fetch_snapshot(ApiSpec(url=f"{api.base}/w"), dest)["row_count"] == 2
+
+    def test_records_autodetect_odata_value_key(self, api, tmp_path):
+        api.handlers["/w"] = lambda n, q: (200, {"@odata.context": "x", "value": _rows(3)}, {})
+        dest = str(tmp_path / "s.ndjson")
+        assert fetch_snapshot(ApiSpec(url=f"{api.base}/w"), dest)["row_count"] == 3
 
     def test_records_autodetect_single_list_key(self, api, tmp_path):
         api.handlers["/w"] = lambda n, q: (200, {"total": 2, "things": _rows(2)}, {})
@@ -287,6 +306,56 @@ class TestPagination:
         spec = ApiSpec(url=f"{api.base}/c", paginate="cursor", cursor_path="next")
         info = fetch_snapshot(spec, str(tmp_path / "s.ndjson"))
         assert info["row_count"] == 3
+
+    def test_odata_v4_absolute_nextlink(self, api, tmp_path):
+        # The literal dotted key "@odata.nextLink" must resolve (literal-first _dig).
+        def handler(n, q):
+            if q.get("p2") is None:
+                return (200, {"value": _rows(2, 0), "@odata.nextLink": f"{api.base}/o?p2=1"}, {})
+            return (200, {"value": _rows(2, 2)}, {})
+
+        api.handlers["/o"] = handler
+        spec = parse_api_spec(f"{api.base}/o paginate=odata")
+        dest = str(tmp_path / "s.ndjson")
+        info = fetch_snapshot(spec, dest)
+        assert info["row_count"] == 4
+        assert info["pages"] == 2
+        assert [r["id"] for r in _read_snapshot(dest)] == [0, 1, 2, 3]
+
+    def test_odata_relative_nextlink_resolved(self, api, tmp_path):
+        # OData permits RELATIVE @odata.nextLink values — resolve against the request URL.
+        def handler(n, q):
+            if q.get("skiptoken") is None:
+                return (200, {"value": _rows(1, 0), "@odata.nextLink": "o?skiptoken=t1"}, {})
+            return (200, {"value": _rows(1, 1)}, {})
+
+        api.handlers["/o"] = handler
+        spec = parse_api_spec(f"{api.base}/o paginate=odata")
+        info = fetch_snapshot(spec, str(tmp_path / "s.ndjson"))
+        assert info["row_count"] == 2
+        assert api.calls[1]["query"]["skiptoken"] == "t1"
+
+    def test_odata_v2_shape(self, api, tmp_path):
+        # v2: {"d": {"results": [...], "__next": url}} — real nesting, explicit overrides.
+        def handler(n, q):
+            if q.get("page2") is None:
+                return (200, {"d": {"results": _rows(2, 0), "__next": f"{api.base}/v2?page2=1"}}, {})
+            return (200, {"d": {"results": _rows(1, 2)}}, {})
+
+        api.handlers["/v2"] = handler
+        spec = parse_api_spec(
+            f"{api.base}/v2 paginate=odata records=d.results cursor_path=d.__next"
+        )
+        info = fetch_snapshot(spec, str(tmp_path / "s.ndjson"))
+        assert info["row_count"] == 3
+
+    def test_dig_literal_key_beats_nesting(self, tmp_path, api):
+        # A record with BOTH a literal dotted key and equivalent nesting: literal wins.
+        payload = {"a.b": [{"x": 1}], "a": {"b": [{"x": 2}]}}
+        api.handlers["/d"] = lambda n, q: (200, payload, {})
+        dest = str(tmp_path / "s.ndjson")
+        fetch_snapshot(ApiSpec(url=f"{api.base}/d", records="a.b"), dest)
+        assert _read_snapshot(dest) == [{"x": 1}]
 
     def test_cursor_opaque_without_cursor_param_errors(self, api, tmp_path):
         api.handlers["/c"] = lambda n, q: (200, {"items": _rows(1), "next": "tok"}, {})

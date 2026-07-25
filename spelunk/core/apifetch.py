@@ -39,6 +39,12 @@ Options (whitespace-separated ``key=value`` after the URL; unknown keys are reje
                  (when ``size_param`` is set), or a last record missing the field.
   - ``link``   — follow the RFC-5988 ``Link: <...>; rel="next"`` response header (GitHub
                  style). Stops when no ``next`` link remains.
+  - ``odata``  — sugar for the OData v4 conventions: ``records=value`` and the next page at
+                 the literal key ``@odata.nextLink`` (absolute or relative URL), i.e. cursor
+                 style pre-configured. Explicit ``records=``/``cursor_path=`` override, so an
+                 OData v2 service works with ``records=d.results cursor_path=d.__next``.
+                 NB: ``$filter`` values contain spaces — percent-encode them in the URL
+                 (``$filter=Amount%20gt%20100``), since spec options split on whitespace.
 * ``page_param`` / ``start`` / ``size_param`` / ``page_size`` / ``offset_param`` /
   ``cursor_param`` / ``cursor_path`` / ``keyset_field`` — style knobs, above.
 * ``max_pages=<n>`` — hard cap on requests (default 20). ``max_rows=<n>`` — optional row cap.
@@ -69,11 +75,12 @@ from datetime import datetime, timezone
 from typing import Any
 from urllib import error as _urlerror
 from urllib import request as _urlrequest
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
-_PAGINATE_STYLES = frozenset({"none", "page", "offset", "cursor", "keyset", "link"})
+_PAGINATE_STYLES = frozenset({"none", "page", "offset", "cursor", "keyset", "link", "odata"})
 # Wrapper keys tried, in order, when the response is an object and no records= path was given.
-_COMMON_RECORD_KEYS = ("results", "data", "items", "records", "rows")
+# ("value" is the OData v4 convention.)
+_COMMON_RECORD_KEYS = ("results", "data", "items", "records", "rows", "value")
 
 _DEFAULT_MAX_PAGES = 20
 _DEFAULT_OFFSET_PAGE_SIZE = 100
@@ -185,6 +192,16 @@ def parse_api_spec(text: str) -> ApiSpec:
         raise ValueError(
             "paginate=keyset needs keyset_field=<dot.path into the last record> AND "
             "cursor_param=<query-param-name>, e.g. keyset_field=id cursor_param=starting_after."
+        )
+    if spec.paginate == "odata":
+        # Sugar for the OData v4 conventions: records under "value", the next page as a full
+        # (or relative) URL at the literal key "@odata.nextLink". Explicit records=/cursor_path=
+        # win, so a v2 service works with records=d.results cursor_path=d.__next.
+        spec = replace(
+            spec,
+            paginate="cursor",
+            cursor_path=spec.cursor_path or "@odata.nextLink",
+            records=spec.records or "value",
         )
     if spec.max_pages < 1:
         raise ValueError("max_pages must be >= 1.")
@@ -363,13 +380,20 @@ def _backoff_delay(attempt: int, retry_after: str | None) -> float:
 # Record extraction
 # --------------------------------------------------------------------------- #
 def _dig(obj: Any, path: str) -> Any:
-    """Follow a dot path into nested dicts; ``None`` when any segment is absent."""
-    for part in path.split("."):
-        if isinstance(obj, dict) and part in obj:
-            obj = obj[part]
-        else:
-            return None
-    return obj
+    """Follow a dot path into nested dicts; ``None`` when any segment is absent.
+
+    A LITERAL key match wins over dot-splitting at every level, so a dotted key like
+    OData's ``@odata.nextLink`` is reachable — ``cursor_path=@odata.nextLink`` finds the
+    literal key first and only then falls back to ``["@odata"]["nextLink"]`` nesting.
+    """
+    if not isinstance(obj, dict) or not path:
+        return None
+    if path in obj:
+        return obj[path]
+    head, sep, rest = path.partition(".")
+    if sep and head in obj:
+        return _dig(obj[head], rest)
+    return None
 
 
 def _extract_records(payload: Any, records_path: str | None, url: str) -> list[dict]:
@@ -462,12 +486,16 @@ def _next_url(
             return None
         if isinstance(cursor, str) and cursor.lower().startswith(("http://", "https://")):
             return cursor  # PokeAPI-style: the cursor IS the next-page URL
-        if not spec.cursor_param:
-            raise ValueError(
-                f"cursor_path {spec.cursor_path!r} yielded {cursor!r}, which is not a URL — "
-                "set cursor_param=<query-param-name> so the cursor can be sent back."
-            )
-        return _with_param(spec.url, spec.cursor_param, cursor)
+        if spec.cursor_param:
+            return _with_param(spec.url, spec.cursor_param, cursor)
+        if isinstance(cursor, str) and ("/" in cursor or "?" in cursor):
+            # A path-like cursor with no cursor_param is a RELATIVE next-page URL (OData
+            # permits relative @odata.nextLink values); resolve it against the request URL.
+            return urljoin(spec.url, cursor)
+        raise ValueError(
+            f"cursor_path {spec.cursor_path!r} yielded {cursor!r}, which is not a URL — "
+            "set cursor_param=<query-param-name> so the cursor can be sent back."
+        )
     if spec.paginate == "keyset":
         if spec.size_param and last_page_len < (spec.page_size or _DEFAULT_OFFSET_PAGE_SIZE):
             return None  # a short page means the API ran out
