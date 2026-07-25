@@ -49,9 +49,11 @@ spelunk/core/
                  #   SQL Server) is rejected, not bridged. DSNs are parsed with stdlib urllib (no
                  #   SQLAlchemy dep).
   apifetch.py    # The api: fetcher (stdlib urllib): spec grammar `api:<url> [key=value ...]` —
-                 #   records=<dot.path>, paginate=none|page|offset|cursor|keyset|link (cursor
-                 #   follows a full next-URL directly, PokeAPI-style; keyset = Stripe-style
-                 #   starting_after from the LAST RECORD's keyset_field, exclusive semantics),
+                 #   records=<dot.path>, paginate=none|page|offset|cursor|keyset|link|odata
+                 #   (cursor follows a full or relative next-URL directly, PokeAPI-style; keyset =
+                 #   Stripe-style starting_after from the LAST RECORD's keyset_field, exclusive
+                 #   semantics; odata = cursor pre-configured for @odata.nextLink + records=value —
+                 #   percent-encode $filter spaces),
                  #   max_pages/max_rows caps. Auth: auth_env=<ENV> (Bearer), header=<Name>:<ENV>
                  #   (any header, e.g. X-Api-Key), param=<name>:<ENV> (query-param keys) — specs
                  #   carry env var NAMES, never values; injected values are scrubbed from error
