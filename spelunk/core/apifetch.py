@@ -21,7 +21,8 @@ Options (whitespace-separated ``key=value`` after the URL; unknown keys are reje
   ``data.items``). Default: the response itself if it is an array; for an object, a common
   wrapper key (results/data/items/records/rows), else the single list-valued key, else the
   whole object as one record.
-* ``paginate=none|page|offset|cursor|link`` — pagination style (default ``none``, one request):
+* ``paginate=none|page|offset|cursor|keyset|link`` — pagination style (default ``none``, one
+  request):
   - ``page``   — a page-number query param (``page_param``, default ``page``; first page
                  ``start``, default 1). Stops on an empty page.
   - ``offset`` — offset/limit params (``offset_param`` default ``offset``, ``size_param``
@@ -31,10 +32,15 @@ Options (whitespace-separated ``key=value`` after the URL; unknown keys are reje
                  that is itself an absolute URL is followed directly (PokeAPI-style ``next``);
                  otherwise it is sent as the ``cursor_param`` query param. Stops when the
                  cursor is null/absent.
+  - ``keyset`` — seek pagination (Stripe's ``starting_after``, ``since_id`` feeds): the next
+                 request sends a field of the *last record* — ``keyset_field`` (dot path into
+                 the record) — as the ``cursor_param`` query param, verbatim (Stripe's
+                 exclusive-of-the-given-id convention). Stops on an empty page, a short page
+                 (when ``size_param`` is set), or a last record missing the field.
   - ``link``   — follow the RFC-5988 ``Link: <...>; rel="next"`` response header (GitHub
                  style). Stops when no ``next`` link remains.
 * ``page_param`` / ``start`` / ``size_param`` / ``page_size`` / ``offset_param`` /
-  ``cursor_param`` / ``cursor_path`` — style knobs, above.
+  ``cursor_param`` / ``cursor_path`` / ``keyset_field`` — style knobs, above.
 * ``max_pages=<n>`` — hard cap on requests (default 20). ``max_rows=<n>`` — optional row cap.
 * ``auth_env=<ENV_VAR>`` — send ``Authorization: Bearer $ENV_VAR``. The spec carries the env
   var *name*, never the token, so specs stay safe to log and echo.
@@ -57,7 +63,7 @@ from urllib import error as _urlerror
 from urllib import request as _urlrequest
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-_PAGINATE_STYLES = frozenset({"none", "page", "offset", "cursor", "link"})
+_PAGINATE_STYLES = frozenset({"none", "page", "offset", "cursor", "keyset", "link"})
 # Wrapper keys tried, in order, when the response is an object and no records= path was given.
 _COMMON_RECORD_KEYS = ("results", "data", "items", "records", "rows")
 
@@ -100,6 +106,7 @@ class ApiSpec:
     offset_param: str = "offset"
     cursor_param: str | None = None
     cursor_path: str | None = None
+    keyset_field: str | None = None
     max_pages: int = _DEFAULT_MAX_PAGES
     max_rows: int | None = None
     auth_env: str | None = None
@@ -147,6 +154,11 @@ def parse_api_spec(text: str) -> ApiSpec:
         raise ValueError(
             "paginate=cursor needs cursor_path=<dot.path> — where in each response the next "
             "cursor (or next-page URL) lives, e.g. cursor_path=next."
+        )
+    if spec.paginate == "keyset" and not (spec.keyset_field and spec.cursor_param):
+        raise ValueError(
+            "paginate=keyset needs keyset_field=<dot.path into the last record> AND "
+            "cursor_param=<query-param-name>, e.g. keyset_field=id cursor_param=starting_after."
         )
     if spec.max_pages < 1:
         raise ValueError("max_pages must be >= 1.")
@@ -209,11 +221,17 @@ def fetch_snapshot(spec: ApiSpec, dest_path: str) -> dict[str, Any]:
                         break
                 if truncated:
                     break
+                last_record = records[-1] if records else None
                 if pages >= spec.max_pages and spec.paginate != "none":
                     # Only report truncation if the API had more to give.
-                    truncated = _next_url(spec, payload, resp_headers, pages, rows, len(records)) is not None
+                    truncated = (
+                        _next_url(spec, payload, resp_headers, pages, rows, len(records), last_record)
+                        is not None
+                    )
                     break
-                next_url = _next_url(spec, payload, resp_headers, pages, rows, len(records))
+                next_url = _next_url(
+                    spec, payload, resp_headers, pages, rows, len(records), last_record
+                )
     except BaseException:
         _remove_quietly(tmp_path)
         raise
@@ -356,8 +374,9 @@ def _with_param(url: str, key: str, value: Any) -> str:
 
 def _first_url(spec: ApiSpec) -> str:
     url = spec.url
-    if spec.paginate == "page":
-        url = _with_param(url, spec.page_param, spec.start)
+    if spec.paginate in ("page", "keyset"):
+        if spec.paginate == "page":
+            url = _with_param(url, spec.page_param, spec.start)
         if spec.size_param:
             url = _with_param(url, spec.size_param, spec.page_size or _DEFAULT_OFFSET_PAGE_SIZE)
     elif spec.paginate == "offset":
@@ -374,6 +393,7 @@ def _next_url(
     pages_done: int,
     rows_done: int,
     last_page_len: int,
+    last_record: dict | None,
 ) -> str | None:
     """The URL of the next page, or ``None`` when this style says the fetch is complete."""
     if spec.paginate == "none":
@@ -401,6 +421,13 @@ def _next_url(
                 "set cursor_param=<query-param-name> so the cursor can be sent back."
             )
         return _with_param(spec.url, spec.cursor_param, cursor)
+    if spec.paginate == "keyset":
+        if spec.size_param and last_page_len < (spec.page_size or _DEFAULT_OFFSET_PAGE_SIZE):
+            return None  # a short page means the API ran out
+        key = _dig(last_record, spec.keyset_field or "")
+        if key in (None, "", False):
+            return None  # last record has no key to seek from
+        return _with_param(_first_url(spec), spec.cursor_param or "", key)
     if spec.paginate == "link":
         match = _LINK_NEXT_RE.search(resp_headers.get("link", ""))
         return match.group(1) if match else None

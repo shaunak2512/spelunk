@@ -128,6 +128,12 @@ class TestParseApiSpec:
         with pytest.raises(ValueError, match="cursor_path"):
             parse_api_spec("https://x.test/a paginate=cursor")
 
+    def test_keyset_requires_field_and_param(self):
+        with pytest.raises(ValueError, match="keyset_field"):
+            parse_api_spec("https://x.test/a paginate=keyset cursor_param=after")
+        with pytest.raises(ValueError, match="cursor_param"):
+            parse_api_spec("https://x.test/a paginate=keyset keyset_field=id")
+
     def test_detect_kind(self):
         assert sources.detect_kind("api:https://x.test/a") == "api"
 
@@ -268,6 +274,59 @@ class TestPagination:
         spec = ApiSpec(url=f"{api.base}/c", paginate="cursor", cursor_path="next")
         with pytest.raises(ValueError, match="cursor_param"):
             fetch_snapshot(spec, str(tmp_path / "s.ndjson"))
+
+    def test_keyset_stripe_style(self, api, tmp_path):
+        # Stripe convention: starting_after=<last id>, EXCLUSIVE of that id.
+        total = _rows(5)
+
+        def handler(n, q):
+            after = int(q["starting_after"]) if "starting_after" in q else -1
+            nxt = [r for r in total if r["id"] > after][:2]
+            return (200, {"data": nxt, "has_more": bool(nxt)}, {})
+
+        api.handlers["/k"] = handler
+        spec = ApiSpec(
+            url=f"{api.base}/k",
+            records="data",
+            paginate="keyset",
+            keyset_field="id",
+            cursor_param="starting_after",
+        )
+        dest = str(tmp_path / "s.ndjson")
+        info = fetch_snapshot(spec, dest)
+        assert [r["id"] for r in _read_snapshot(dest)] == [0, 1, 2, 3, 4]
+        assert info["pages"] == 4  # 2+2+1, then the empty page that ends it
+        assert [c["query"].get("starting_after") for c in api.calls] == [None, "1", "3", "4"]
+
+    def test_keyset_nested_field_and_short_page_stop(self, api, tmp_path):
+        # size_param set -> a short page ends the fetch without the extra empty-page request.
+        def handler(n, q):
+            batch = _rows(3, 0) if "after" not in q else _rows(2, 3)
+            return (200, [{"meta": {"seq": r["id"]}, **r} for r in batch], {})
+
+        api.handlers["/k"] = handler
+        spec = ApiSpec(
+            url=f"{api.base}/k",
+            paginate="keyset",
+            keyset_field="meta.seq",
+            cursor_param="after",
+            size_param="limit",
+            page_size=3,
+        )
+        info = fetch_snapshot(spec, str(tmp_path / "s.ndjson"))
+        assert info["row_count"] == 5
+        assert info["pages"] == 2
+        assert api.calls[1]["query"]["after"] == "2"
+        assert api.calls[0]["query"]["limit"] == "3"
+
+    def test_keyset_stops_when_field_missing(self, api, tmp_path):
+        api.handlers["/k"] = lambda n, q: (200, [{"name": "no-id-here"}], {})
+        spec = ApiSpec(
+            url=f"{api.base}/k", paginate="keyset", keyset_field="id", cursor_param="after"
+        )
+        info = fetch_snapshot(spec, str(tmp_path / "s.ndjson"))
+        assert info["row_count"] == 1
+        assert len(api.calls) == 1  # no way to seek onward -> single page
 
     def test_link_header(self, api, tmp_path):
         def handler(n, q):

@@ -291,9 +291,11 @@ rebuilds from a stale snapshot with no way to refresh or even notice staleness.
 ### 3.3 Layer 2 — an `api:` source kind: snapshot-on-attach (the one to build)
 
 > **Status: implemented** (feat/api-source-snapshot) — `spelunk/core/apifetch.py` + the `api`
-> kind in `sources.py`. All four pagination styles live-verified against public APIs
-> (`tests/live_api_check.py`). Refresh is re-attach (remove_source + add_source); a dedicated
-> `refresh_source` tool remains future work.
+> kind in `sources.py`. Five pagination styles (page/offset/cursor/keyset/link); all but
+> keyset live-verified against public APIs incl. authenticated TMDB (`tests/live_api_check.py`);
+> keyset (Stripe-style seek) is mock-tested — no public no-auth keyset API to verify against.
+> Refresh is re-attach (remove_source + add_source); a dedicated `refresh_source` tool remains
+> future work.
 
 Materialize-by-default, applied to the network boundary: an API source is **fetched into a
 local snapshot at attach time, then registered as a view over the snapshot**.
