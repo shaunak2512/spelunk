@@ -44,6 +44,14 @@ Options (whitespace-separated ``key=value`` after the URL; unknown keys are reje
 * ``max_pages=<n>`` — hard cap on requests (default 20). ``max_rows=<n>`` — optional row cap.
 * ``auth_env=<ENV_VAR>`` — send ``Authorization: Bearer $ENV_VAR``. The spec carries the env
   var *name*, never the token, so specs stay safe to log and echo.
+* ``header=<Name>:<ENV_VAR>`` (repeatable) — send any extra header with its value from the
+  environment: ``header=X-Api-Key:NASA_KEY``. Covers API-key headers and non-Bearer
+  ``Authorization`` schemes (put the full value, e.g. ``token xxx``, in the env var).
+* ``param=<name>:<ENV_VAR>`` (repeatable) — append a query param with its value from the
+  environment: ``param=api_key:NASA_KEY``. This is how ``?api_key=...`` APIs are used
+  WITHOUT putting the key in the spec (specs are logged and recorded as the source locator).
+  Injected values are scrubbed from error messages (replaced by ``$ENV_VAR``) so a failing
+  URL can't leak them either.
 
 Safety rails: every page is retried on 429/5xx/network errors with exponential backoff
 (honouring ``Retry-After``); a paginating fetch that receives the *same page twice* stops (an
@@ -56,7 +64,7 @@ import json
 import os
 import re
 import time
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timezone
 from typing import Any
 from urllib import error as _urlerror
@@ -110,9 +118,15 @@ class ApiSpec:
     max_pages: int = _DEFAULT_MAX_PAGES
     max_rows: int | None = None
     auth_env: str | None = None
+    # (header name, ENV var) / (query param, ENV var) pairs from repeatable header=/param=
+    # options — values are resolved from the environment at fetch time, never stored.
+    extra_headers: list[tuple[str, str]] = field(default_factory=list)
+    url_params: list[tuple[str, str]] = field(default_factory=list)
 
 
-_OPTION_NAMES = frozenset(f.name for f in fields(ApiSpec)) - {"url"}
+_OPTION_NAMES = frozenset(f.name for f in fields(ApiSpec)) - {"url", "extra_headers", "url_params"}
+# header=/param= are special-cased (repeatable, <name>:<ENV> form) but still valid option keys.
+_VALID_OPTION_HELP = ", ".join(sorted(_OPTION_NAMES | {"header", "param"}))
 
 
 def parse_api_spec(text: str) -> ApiSpec:
@@ -127,15 +141,27 @@ def parse_api_spec(text: str) -> ApiSpec:
             "Write the spec as api:<url> [key=value ...]."
         )
     options: dict[str, Any] = {}
+    extra_headers: list[tuple[str, str]] = []
+    url_params: list[tuple[str, str]] = []
     for tok in parts[1:]:
         key, sep, value = tok.partition("=")
         if not sep or not key or not value:
             raise ValueError(
                 f"Malformed api: option {tok!r} — options are key=value tokens after the URL."
             )
+        if key in ("header", "param"):
+            name, csep, env = value.partition(":")
+            if not csep or not name or not env:
+                example = "header=X-Api-Key:MY_KEY" if key == "header" else "param=api_key:MY_KEY"
+                raise ValueError(
+                    f"api: option {key}= takes <name>:<ENV_VAR> (value read from the environment "
+                    f"at fetch time, never stored), e.g. {example}; got {value!r}."
+                )
+            (extra_headers if key == "header" else url_params).append((name, env))
+            continue
         if key not in _OPTION_NAMES:
             raise ValueError(
-                f"Unknown api: option {key!r}. Valid options: {', '.join(sorted(_OPTION_NAMES))}."
+                f"Unknown api: option {key!r}. Valid options: {_VALID_OPTION_HELP}."
             )
         if key in _INT_OPTIONS:
             try:
@@ -144,7 +170,7 @@ def parse_api_spec(text: str) -> ApiSpec:
                 raise ValueError(f"api: option {key} must be an integer, got {value!r}.") from None
         else:
             options[key] = value
-    spec = ApiSpec(url=url, **options)
+    spec = ApiSpec(url=url, extra_headers=extra_headers, url_params=url_params, **options)
     if spec.paginate not in _PAGINATE_STYLES:
         raise ValueError(
             f"Unknown paginate style {spec.paginate!r}. "
@@ -174,15 +200,32 @@ def fetch_snapshot(spec: ApiSpec, dest_path: str) -> dict[str, Any]:
     responses, a bad ``records`` path, or an API that yields zero records (almost always a
     wrong/missing ``records=`` path — the error lists the response's top-level keys).
     """
-    headers = {"User-Agent": _USER_AGENT, "Accept": "application/json"}
-    if spec.auth_env:
-        token = os.environ.get(spec.auth_env)
-        if not token:
+    secrets: list[tuple[str, str]] = []  # (ENV var name, value) — for error-message scrubbing
+
+    def env_value(env_name: str) -> str:
+        value = os.environ.get(env_name)
+        if not value:
             raise ValueError(
-                f"api: source wants auth from environment variable {spec.auth_env!r}, "
+                f"api: source wants auth from environment variable {env_name!r}, "
                 "but it is not set (or empty) in the server's environment."
             )
-        headers["Authorization"] = f"Bearer {token}"
+        secrets.append((env_name, value))
+        return value
+
+    headers = {"User-Agent": _USER_AGENT, "Accept": "application/json"}
+    if spec.auth_env:
+        headers["Authorization"] = f"Bearer {env_value(spec.auth_env)}"
+    for header_name, env_name in spec.extra_headers:
+        headers[header_name] = env_value(env_name)
+
+    # Inject param=<name>:<ENV> query params into the base URL so every pagination style
+    # inherits them. The original URL is what gets reported/recorded — never the injected one.
+    original_url = spec.url
+    if spec.url_params:
+        url = spec.url
+        for param_name, env_name in spec.url_params:
+            url = _with_param(url, param_name, env_value(env_name))
+        spec = replace(spec, url=url)
 
     rows = 0
     pages = 0
@@ -232,8 +275,12 @@ def fetch_snapshot(spec: ApiSpec, dest_path: str) -> dict[str, Any]:
                 next_url = _next_url(
                     spec, payload, resp_headers, pages, rows, len(records), last_record
                 )
-    except BaseException:
+    except BaseException as exc:
         _remove_quietly(tmp_path)
+        if secrets and isinstance(exc, ValueError):
+            # A failing URL or echoed request can carry an injected secret — never let it
+            # into an error message (they are logged and shown to the agent).
+            raise ValueError(_scrub_secrets(str(exc), secrets)) from exc
         raise
 
     if rows == 0:
@@ -244,11 +291,11 @@ def fetch_snapshot(spec: ApiSpec, dest_path: str) -> dict[str, Any]:
             if keys
             else " The response contained an empty array."
         )
-        raise ValueError(f"API {spec.url} returned no records.{hint}")
+        raise ValueError(f"API {original_url} returned no records.{hint}")
 
     os.replace(tmp_path, dest_path)
     info: dict[str, Any] = {
-        "url": spec.url,
+        "url": original_url,
         "fetched_at": datetime.now(timezone.utc).isoformat(),
         "pages": pages,
         "row_count": rows,
@@ -432,6 +479,13 @@ def _next_url(
         match = _LINK_NEXT_RE.search(resp_headers.get("link", ""))
         return match.group(1) if match else None
     return None
+
+
+def _scrub_secrets(text: str, secrets: list[tuple[str, str]]) -> str:
+    """Replace every secret value in *text* with a ``$ENV_NAME`` placeholder."""
+    for env_name, value in secrets:
+        text = text.replace(value, f"${env_name}")
+    return text
 
 
 def _remove_quietly(path: str) -> None:

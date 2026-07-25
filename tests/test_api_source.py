@@ -134,6 +134,25 @@ class TestParseApiSpec:
         with pytest.raises(ValueError, match="cursor_param"):
             parse_api_spec("https://x.test/a paginate=keyset keyset_field=id")
 
+    def test_header_and_param_options(self):
+        spec = parse_api_spec(
+            "https://x.test/a header=X-Api-Key:KEY1 header=X-Trace:KEY2 param=api_key:KEY3"
+        )
+        assert spec.extra_headers == [("X-Api-Key", "KEY1"), ("X-Trace", "KEY2")]
+        assert spec.url_params == [("api_key", "KEY3")]
+
+    def test_header_malformed(self):
+        with pytest.raises(ValueError, match=r"header= takes <name>:<ENV_VAR>"):
+            parse_api_spec("https://x.test/a header=X-Api-Key")
+
+    def test_param_malformed(self):
+        with pytest.raises(ValueError, match=r"param= takes <name>:<ENV_VAR>"):
+            parse_api_spec("https://x.test/a param=:KEY")
+
+    def test_unknown_option_lists_header_and_param(self):
+        with pytest.raises(ValueError, match=r"Valid options: .*header.*param"):
+            parse_api_spec("https://x.test/a nope=1")
+
     def test_detect_kind(self):
         assert sources.detect_kind("api:https://x.test/a") == "api"
 
@@ -387,6 +406,40 @@ class TestAuthAndRetry:
         with pytest.raises(ValueError, match="SPELUNK_NO_SUCH_TOKEN"):
             fetch_snapshot(spec, str(tmp_path / "s.ndjson"))
         assert api.calls == []  # failed before any request
+
+    def test_extra_header_from_env(self, api, tmp_path, monkeypatch):
+        monkeypatch.setenv("SPELUNK_TEST_APIKEY", "k-123")
+        api.handlers["/a"] = lambda n, q: (200, _rows(1), {})
+        spec = ApiSpec(url=f"{api.base}/a", extra_headers=[("X-Api-Key", "SPELUNK_TEST_APIKEY")])
+        fetch_snapshot(spec, str(tmp_path / "s.ndjson"))
+        assert api.calls[0]["headers"]["x-api-key"] == "k-123"
+
+    def test_query_param_from_env_persists_across_pages(self, api, tmp_path, monkeypatch):
+        monkeypatch.setenv("SPELUNK_TEST_APIKEY", "k-456")
+        api.handlers["/p"] = lambda n, q: (200, _rows(1) if n == 1 else [], {})
+        spec = ApiSpec(
+            url=f"{api.base}/p", paginate="page", url_params=[("api_key", "SPELUNK_TEST_APIKEY")]
+        )
+        info = fetch_snapshot(spec, str(tmp_path / "s.ndjson"))
+        assert [c["query"]["api_key"] for c in api.calls] == ["k-456", "k-456"]
+        assert info["url"] == f"{api.base}/p"  # fingerprint reports the ORIGINAL url, no secret
+
+    def test_missing_env_for_header(self, api, tmp_path, monkeypatch):
+        monkeypatch.delenv("SPELUNK_NO_SUCH_KEY", raising=False)
+        spec = ApiSpec(url=f"{api.base}/a", extra_headers=[("X-Api-Key", "SPELUNK_NO_SUCH_KEY")])
+        with pytest.raises(ValueError, match="SPELUNK_NO_SUCH_KEY"):
+            fetch_snapshot(spec, str(tmp_path / "s.ndjson"))
+        assert api.calls == []
+
+    def test_secret_param_scrubbed_from_errors(self, api, tmp_path, monkeypatch):
+        # A failing request's error text (which carries the URL) must show $ENV, not the value.
+        monkeypatch.setenv("SPELUNK_TEST_APIKEY", "sup3r-sekret")
+        api.handlers["/a"] = lambda n, q: (404, {"error": f"bad key {q['api_key']}"}, {})
+        spec = ApiSpec(url=f"{api.base}/a", url_params=[("api_key", "SPELUNK_TEST_APIKEY")])
+        with pytest.raises(ValueError) as excinfo:
+            fetch_snapshot(spec, str(tmp_path / "s.ndjson"))
+        assert "sup3r-sekret" not in str(excinfo.value)
+        assert "$SPELUNK_TEST_APIKEY" in str(excinfo.value)
 
     def test_user_agent_always_sent(self, api, tmp_path):
         api.handlers["/a"] = lambda n, q: (200, _rows(1), {})

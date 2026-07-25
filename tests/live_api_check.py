@@ -112,6 +112,18 @@ CASES = [
         None,
     ),
     (
+        "API key as env-injected query param, scrubbed from logs (NASA APOD)",
+        "apod=api:https://api.nasa.gov/planetary/apod?count=5 param=api_key:NASA_KEY",
+        5,
+        "NASA_KEY",
+    ),
+    (
+        "API key as env-injected custom header (NASA APOD, X-Api-Key)",
+        "apod_hdr=api:https://api.nasa.gov/planetary/apod?count=3 header=X-Api-Key:NASA_KEY",
+        3,
+        "NASA_KEY",
+    ),
+    (
         "Bearer auth + page pagination (TMDB popular movies)",
         "tmdb_movies=api:https://api.themoviedb.org/3/movie/popular "
         "records=results paginate=page max_pages=3 auth_env=TMDB_API_READ_ACCESS_TOKEN",
@@ -216,6 +228,9 @@ def _run_auth_failures(session: DuckSession) -> int:
 
 def main() -> int:
     _load_dotenv()
+    # NASA's published public demo key — fine to default (30 req/hr/IP); a real key in the
+    # environment or .env wins.
+    os.environ.setdefault("NASA_KEY", "DEMO_KEY")
     failures = 0
     with tempfile.TemporaryDirectory(prefix="spelunk_live_") as tmp:
         session = DuckSession.open([], session_dir=tmp)

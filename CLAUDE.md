@@ -52,8 +52,10 @@ spelunk/core/
                  #   records=<dot.path>, paginate=none|page|offset|cursor|keyset|link (cursor
                  #   follows a full next-URL directly, PokeAPI-style; keyset = Stripe-style
                  #   starting_after from the LAST RECORD's keyset_field, exclusive semantics),
-                 #   max_pages/max_rows caps, auth_env=<ENV>
-                 #   (Bearer; env var NAME in the spec, never the token). Retries 429/5xx with
+                 #   max_pages/max_rows caps. Auth: auth_env=<ENV> (Bearer), header=<Name>:<ENV>
+                 #   (any header, e.g. X-Api-Key), param=<name>:<ENV> (query-param keys) — specs
+                 #   carry env var NAMES, never values; injected values are scrubbed from error
+                 #   messages ($ENV placeholder). Retries 429/5xx with
                  #   backoff + Retry-After; repeat-page guard stops APIs that ignore page params;
                  #   a 404 mid-pagination = end-of-data (TVMaze-style), on page 1 = error;
                  #   fetch fingerprint (url/fetched_at/pages/row_count) returned as Source.info.
