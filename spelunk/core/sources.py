@@ -14,7 +14,12 @@ The unified engine is a single DuckDB connection. Every source is reached throug
     pagination, retries, and rate-limit backoff — into an NDJSON snapshot under the workspace,
     and registered as a VIEW over that local file. Queries run against the pinned snapshot
     (deterministic, no re-fetch per query); refresh by re-attaching. See ``apifetch.py`` for
-    the option grammar (paginate=page/offset/cursor/link, records=<dot.path>, auth_env=...).
+    the option grammar (paginate=page/offset/cursor/keyset/link, records=<dot.path>,
+    auth_env=/header=/param=);
+  * **OpenAPI specs** (``openapi:<url-or-path>``) become a queryable *endpoint catalog* — one
+    row per (path, method) with params, auth shape, pagination/records hints, and a
+    paste-ready ``suggested_spec`` (an ``api:`` spec string) for GET endpoints. See
+    ``openapi.py``.
 
 Everything reachable is reached through the one DuckDB connection — there is no out-of-engine
 fallback. A source DuckDB can't attach (e.g. SQL Server) is not supported; export it to a file
@@ -30,6 +35,7 @@ A spec is a string, optionally prefixed ``name=``::
     catalog=iceberg:./warehouse/catalog/table  # an Iceberg table
     lake=ducklake:./catalog.ducklake           # a DuckLake catalog
     gh=api:https://api.github.com/repos/o/r/issues paginate=link   # REST API -> snapshot
+    tmdb_api=openapi:./tmdb-api.json           # OpenAPI spec -> queryable endpoint catalog
     sqlite:///C:/data/app.db
     postgresql://user:pw@host/dbname
     ./reports/q1.csv               # name derived from the filename -> q1
@@ -43,6 +49,7 @@ lakehouse-scan sources by their bare view name.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 from dataclasses import dataclass, field
@@ -52,7 +59,9 @@ from urllib.parse import parse_qsl, unquote, urlsplit
 if TYPE_CHECKING:
     import duckdb
 
-SourceKind = Literal["file", "sqlite", "postgres", "mysql", "delta", "iceberg", "ducklake", "api"]
+SourceKind = Literal[
+    "file", "sqlite", "postgres", "mysql", "delta", "iceberg", "ducklake", "api", "openapi"
+]
 
 # File extension -> DuckDB table function used to scan it (readers in the core/statically-linked
 # build, no extension load needed).
@@ -195,6 +204,8 @@ def detect_kind(locator: str, forced_ext: str | None = None) -> SourceKind:
         return "iceberg"
     if low.startswith("api:"):
         return "api"
+    if low.startswith("openapi:"):
+        return "openapi"
     if low.startswith("sqlite://"):
         return "sqlite"
     ext = _path_ext(locator)
@@ -238,6 +249,8 @@ def build_source(spec: str, *, snapshot_dir: str | None = None) -> Source:
         return _build_ducklake_source(name, locator)
     if kind == "api":
         return _build_api_source(name, locator, snapshot_dir)
+    if kind == "openapi":
+        return _build_openapi_source(name, locator, snapshot_dir)
     return _build_attach_source(name, kind, locator)
 
 
@@ -249,7 +262,7 @@ def teardown_sql(src: Source) -> list[str]:
     ``DuckSession.remove_source``. An ``api`` source's snapshot file is left on disk — it lives
     under the workspace dir, so workspace cleanup reclaims it.
     """
-    if src.kind in ("file", "api") or src.kind in _SCAN_KINDS:
+    if src.kind in ("file", "api", "openapi") or src.kind in _SCAN_KINDS:
         return [f'DROP VIEW IF EXISTS main."{src.name}"']
     if src.kind in _ATTACH_EXT or src.kind == "ducklake":
         return [f'DETACH "{src.name}"']
@@ -351,6 +364,46 @@ def _build_api_source(name: str, locator: str, snapshot_dir: str | None) -> Sour
     return Source(name=name, kind="api", locator=locator, setup_sql=setup, info=info)
 
 
+def _build_openapi_source(name: str, locator: str, snapshot_dir: str | None) -> Source:
+    """An ``openapi:`` source: snapshot the spec's endpoint catalog, view over the snapshot.
+
+    One row per (path, method) with params, auth shape, pagination/records hints, and a
+    paste-ready ``suggested_spec`` for GET endpoints — see ``openapi.py``. The catalog is
+    guidance-as-data: the agent queries it with SQL to find endpoints, then feeds a
+    ``suggested_spec`` (env var name filled in for ``<SET_ME>``) to ``add_source``.
+    """
+    from . import openapi as openapi_mod
+
+    if snapshot_dir is None:
+        raise ValueError(
+            "openapi: sources need a workspace to store their catalog — open the session with "
+            "a workspace (DuckSession.open) rather than calling build_source directly."
+        )
+    inner = _strip_scheme(locator, "openapi")
+    spec = openapi_mod.load_spec(inner)
+    rows = openapi_mod.endpoint_rows(spec, inner)
+    if not rows:
+        raise ValueError(f"OpenAPI spec {inner!r} declares no operations under 'paths'.")
+    os.makedirs(snapshot_dir, exist_ok=True)
+    dest = os.path.join(snapshot_dir, f"{name}.ndjson")
+    tmp = dest + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        for row in rows:
+            fh.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+    os.replace(tmp, dest)
+    setup = [
+        f'CREATE OR REPLACE VIEW main."{name}" AS SELECT * FROM '
+        f"read_json_auto('{_duck_path(dest)}', format='newline_delimited')"
+    ]
+    return Source(
+        name=name,
+        kind="openapi",
+        locator=locator,
+        setup_sql=setup,
+        info=openapi_mod.catalog_info(inner, rows),
+    )
+
+
 def _build_ducklake_source(name: str, locator: str) -> Source:
     """A DuckLake catalog is ``ATTACH``ed read-only; its TYPE is inferred from the ``ducklake:``
     locator prefix, which is kept intact and passed straight to ATTACH."""
@@ -428,6 +481,8 @@ def _derive_name(locator: str, kind: SourceKind) -> str:
     elif kind == "api":
         # Name from the URL's last path segment; drop the whitespace-separated options first.
         locator = _strip_scheme(locator, "api").split()[0]
+    elif kind == "openapi":
+        locator = _strip_scheme(locator, "openapi")
     if "://" in locator:
         try:
             url = urlsplit(locator)

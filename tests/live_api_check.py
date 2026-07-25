@@ -196,6 +196,42 @@ def _run_joins(session: DuckSession, attached: set[str]) -> int:
     return failures
 
 
+_TMDB_SPEC = r"C:\Users\shaun\repo\movie-tracker\tmdb-api.json"
+
+
+def _run_openapi_loop(session: DuckSession) -> int:
+    """The full agent loop on a real 148-path spec: catalog -> suggested_spec -> attach -> SQL.
+
+    Runs only when the local TMDB spec file and the TMDB token are both available."""
+    if not os.path.isfile(_TMDB_SPEC) or not os.environ.get("TMDB_API_READ_ACCESS_TOKEN"):
+        print("[SKIP] openapi catalog loop: TMDB spec file or token not available")
+        return 0
+    try:
+        out = session.add_source(f"openapi:{_TMDB_SPEC}")
+        n = out["info"]["endpoints"]
+        ok = n >= 100
+        print(f"[{'OK ' if ok else 'ERR'}] openapi: catalog attached: {n} endpoints")
+        # Agent move: find an endpoint by SQL, take its ready-made spec, fill in the env var.
+        row = session.query(
+            "SELECT suggested_spec FROM tmdb_api WHERE method = 'GET' "
+            "AND path = '/3/movie/top_rated'",
+            name="pick",
+        )["sample"]
+        spec = "top_rated=" + row[0][0].replace("<SET_ME>", "TMDB_API_READ_ACCESS_TOKEN")
+        spec += " max_pages=2"
+        attached = session.add_source(spec)
+        rows = attached["info"]["row_count"]
+        got = session.query(
+            "SELECT title FROM top_rated ORDER BY vote_average DESC LIMIT 1", name="best"
+        )["sample"]
+        print(f"[OK ] openapi->api loop: {rows} rows fetched via suggested_spec, top: {got[0][0]}")
+        return 0 if ok else 1
+    except Exception as exc:
+        print(f"[ERR] openapi catalog loop: {exc}")
+        traceback.print_exc()
+        return 1
+
+
 def _run_auth_failures(session: DuckSession) -> int:
     """The auth failure modes must fail fast with actionable errors, not hang or mangle."""
     failures = 0
@@ -238,6 +274,7 @@ def main() -> int:
             case_failures, attached = _run_cases(session)
             failures += case_failures
             failures += _run_joins(session, attached)
+            failures += _run_openapi_loop(session)
             failures += _run_auth_failures(session)
         finally:
             session.close()

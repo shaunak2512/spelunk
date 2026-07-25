@@ -1393,7 +1393,7 @@ class DuckSession:
         source often keeps its tables in a non-default schema). The attached DB's own system
         schemas (information_schema, pg_catalog) are metadata, not data, and are hidden.
         """
-        if src.kind in ("file", "delta", "iceberg", "api"):
+        if src.kind in ("file", "delta", "iceberg", "api", "openapi"):
             # No eager COUNT(*): a file/lakehouse source can be remote (https/s3/...), so counting
             # here would trigger a full scan while holding the session lock and stall every other
             # tool call. describe() (db://{table}) fills the count lazily, on demand. (An api

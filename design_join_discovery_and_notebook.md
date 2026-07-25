@@ -323,7 +323,19 @@ Considered and rejected middle path: the community `http_client` extension (`htt
 fetching *inside* queries — exactly the re-fetch-per-query behaviour the snapshot design
 avoids.
 
-### 3.4 Layer 3 — generic connectors: don't build
+### 3.4 OpenAPI endpoint catalogs (implemented)
+
+> **Status: implemented** — `spelunk/core/openapi.py`. `openapi:<url-or-path>` materializes an
+> OpenAPI 3.x JSON spec as a queryable catalog: one row per (path, method) with params, auth
+> shape (securitySchemes mapped onto `auth_env=`/`header=`/`param=`, incl. the
+> apiKey-named-Authorization bearer quirk), heuristic pagination/records hints, and a
+> paste-ready `suggested_spec` `api:` string for GETs (`<SET_ME>` marks the credential env
+> var). Guidance-as-data: the agent finds endpoints with SQL and feeds `suggested_spec` to
+> `add_source`. Verified end-to-end against TMDB's 148-path spec (catalog → suggested_spec →
+> live fetch). YAML and Swagger 2.0 are rejected with conversion pointers; spec discovery
+> (probing /openapi.json) remains future work.
+
+### 3.5 Layer 3 — generic connectors: don't build
 
 Manifest-driven API configs (auth flows, incremental sync, schema evolution) is the
 Airbyte/Singer/dlt product — a swamp. The right move is a documented recipe: **dlt** already
