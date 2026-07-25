@@ -1,7 +1,7 @@
-# Design: cross-source join-key discovery & durable notebook mode
+# Design: join-key discovery, durable notebook mode, API sources
 
 Status: **brainstorm / not scheduled** (2026-07-25). Nothing here is implemented. This doc
-captures the design space in enough detail to pick either feature up cold.
+captures the design space in enough detail to pick any feature up cold.
 
 Motivating observation (see also the 3-round agent experiment notes): spelunk's differentiation
 today is the provenance layer (lineage/replay/isolation), not insight quality. Both features
@@ -250,7 +250,82 @@ a returning agent can learn. Natural v2: `relate` consults the notebook first an
 
 ---
 
-## 3. References
+## 3. API sources — four layers
+
+How spelunk could read data from HTTP APIs, ordered by machinery required. The recommendation:
+ship Layer 0 now (docs + secret plumbing), design Layer 2 as the real feature (it compounds
+with lineage/replay/notebook), document Layer 3 as a recipe, and skip the middle path.
+
+### 3.1 Layer 0 — simple JSON APIs already work (zero code)
+
+`sources.py` was built for this without saying so: the format-override prefix exists for "an
+extensionless API URL", and `https://` locators route through httpfs. Today:
+
+```
+--source events=json:https://api.example.com/v1/events
+```
+
+creates a view over `read_json_auto('https://...')` — DuckDB fetches the endpoint and parses
+the JSON response into a table; nested structs/lists unnest fine in SQL.
+
+**Auth works with no new source machinery** because DuckDB has HTTP secrets:
+`CREATE SECRET (TYPE http, BEARER_TOKEN '...')` or
+`EXTRA_HTTP_HEADERS MAP {'Authorization': ...}` applies to subsequent httpfs requests. The gap
+is that spelunk offers no way to *run* that `CREATE SECRET` — the sqlglot guard blocks it from
+`query`, correctly. So the cheapest real change is **config plumbing, not a new source kind**:
+a `--http-secret` flag (or env-var-driven setup in `_remote_setup`) issuing the `CREATE SECRET`
+at open, keeping tokens out of the spec string (specs get logged and echoed; secrets must not).
+
+Layer 0 limits: no pagination (one URL = one fetch; `read_json_auto(['u1','u2'])` needs pages
+known up front), GET-only (no POST/GraphQL bodies), no retries/rate-limit handling, and a view
+**re-fetches the endpoint on every query** — slow, and rude to rate-limited APIs.
+
+### 3.2 Layer 1 — the agent is the ETL (zero code, already true)
+
+The agent driving spelunk usually has its own HTTP access: fetch the API, write JSON/CSV to
+disk, `add_source` it (needs `--allow-add-source`). For one-off enrichment this is the right
+division of labor — spelunk is the SQL engine, not a connector library. Weakness: provenance.
+Lineage records the *file* as the source leaf and knows nothing about the fetch, so `replay`
+rebuilds from a stale snapshot with no way to refresh or even notice staleness.
+
+### 3.3 Layer 2 — an `api:` source kind: snapshot-on-attach (the one to build)
+
+Materialize-by-default, applied to the network boundary: an API source is **fetched into a
+local snapshot at attach time, then registered as a view over the snapshot**.
+
+- **Spec grammar stays consistent:** `gh=api:https://api.github.com/repos/x/y/issues`, with
+  optional params covering the three pagination styles that handle ~90% of REST APIs
+  (page-number, offset/limit, cursor-follow), a JSON-path to the records array, and an auth
+  env-var *name* (never the token itself). Fetching is stdlib `urllib` (consistent with the
+  no-SQLAlchemy ethos) with retries + rate-limit backoff, writing NDJSON/Parquet under the
+  workspace dir.
+- **Fixes the provenance gap of Layers 0/1:** the source fingerprint becomes
+  `{url, params, fetched_at, row_count}`, recorded like any source leaf — lineage shows *when*
+  data was pulled, and the notebook's freshness verdicts (§2.5) extend naturally to
+  "snapshot is 6 days old".
+- **Refresh is explicit** — `refresh_source(name)` or re-attach, never implicit. This resolves
+  the reproducibility tension cleanly: `query` and `replay` run against a *pinned* snapshot
+  (deterministic, no rate-limit surprises mid-pipeline); going stale is a visible, deliberate
+  choice. Same "recipes vs data" split as §2.1.
+- **Security:** an `api:` kind under `--allow-add-source` means the agent can make the server
+  issue GET requests anywhere it can reach — the same SSRF-shaped trust boundary that flag
+  already documents, but restate it there when this ships.
+
+Considered and rejected middle path: the community `http_client` extension (`http_get`/
+`http_post` as SQL functions). It drags in community-extension trust questions and puts
+fetching *inside* queries — exactly the re-fetch-per-query behaviour the snapshot design
+avoids.
+
+### 3.4 Layer 3 — generic connectors: don't build
+
+Manifest-driven API configs (auth flows, incremental sync, schema evolution) is the
+Airbyte/Singer/dlt product — a swamp. The right move is a documented recipe: **dlt** already
+loads REST APIs into DuckDB natively, and spelunk attaches the resulting `.duckdb` (or Parquet)
+as a source. One paragraph of docs buys the whole connector ecosystem.
+
+---
+
+## 4. References
 
 - JOSIE: overlap set similarity search for joinable tables —
   <https://www.cs.toronto.edu/~fnargesian/JOSIE_Overlap_Set_Similarity_Search_for_Finding_Joinable_Tables_in_Data_Lakes.pdf>
@@ -261,3 +336,10 @@ a returning agent can learn. Natural v2: `relate` consults the notebook first an
 - VSS status ("what's new") — <https://duckdb.org/2024/10/23/whats-new-in-the-vss-extension>
 - MotherDuck on combined FTS + embedding search in DuckDB —
   <https://motherduck.com/blog/search-using-duckdb-part-3/>
+- DuckDB httpfs HTTP(S) support (HTTP secrets, headers) —
+  <https://duckdb.org/docs/lts/core_extensions/httpfs/https>
+- EXTRA_HTTP_HEADERS / bearer-auth how-to discussion —
+  <https://github.com/duckdb/duckdb/discussions/14165>
+- MotherDuck "DuckDB 1.1 hidden gems" (HTTP secrets + read_json over APIs) —
+  <https://motherduck.com/blog/duckdb-110-hidden-gems/>
+- dlt REST API → DuckDB loading — <https://dlthub.com/docs/dlt-ecosystem/destinations/duckdb>
