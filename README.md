@@ -1,7 +1,8 @@
 # Spelunk
 
 A **multi-source DuckDB query + transformation-pipeline MCP server.** Point it at files
-(CSV/Parquet/JSON/Excel) and databases (SQLite/PostgreSQL/MySQL), and an agent like Claude Code
+(CSV/Parquet/JSON/Excel), databases (SQLite/PostgreSQL/MySQL), and REST/JSON APIs
+(`api:<url>`, snapshotted at attach with pagination + auth), and an agent like Claude Code
 can query across all of them — and build step-by-step pipelines — through one DuckDB engine.
 
 ## Architecture in one line

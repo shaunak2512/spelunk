@@ -43,8 +43,18 @@ spelunk/core/
                  #   VIEWs, DBs/DuckLake ATTACHed READ_ONLY). Kinds: file (local OR remote
                  #   https://,s3://,gs://,az:// via httpfs/azure ext; ext-backed readers excel/avro),
                  #   sqlite/postgres/mysql, delta:/iceberg: (delta_scan/iceberg_scan VIEWs),
-                 #   ducklake:. DuckDB-only — a source it can't attach (e.g. SQL Server) is
-                 #   rejected, not bridged. DSNs are parsed with stdlib urllib (no SQLAlchemy dep).
+                 #   ducklake:, api: (REST/JSON endpoint fetched ONCE at attach into an NDJSON
+                 #   snapshot under <workspace>/snapshots/, view over the snapshot — queries never
+                 #   re-fetch; refresh = re-attach). DuckDB-only — a source it can't attach (e.g.
+                 #   SQL Server) is rejected, not bridged. DSNs are parsed with stdlib urllib (no
+                 #   SQLAlchemy dep).
+  apifetch.py    # The api: fetcher (stdlib urllib): spec grammar `api:<url> [key=value ...]` —
+                 #   records=<dot.path>, paginate=none|page|offset|cursor|link (cursor follows a
+                 #   full next-URL directly, PokeAPI-style), max_pages/max_rows caps, auth_env=<ENV>
+                 #   (Bearer; env var NAME in the spec, never the token). Retries 429/5xx with
+                 #   backoff + Retry-After; repeat-page guard stops APIs that ignore page params;
+                 #   fetch fingerprint (url/fetched_at/pages/row_count) returned as Source.info.
+                 #   Live smoke-check: tests/live_api_check.py (manual; hits real public APIs).
   guard.py       # sqlglot AST safety: assert_read_only(), enforce_limit() — called dialect="duckdb"
   types.py       # FROZEN contracts: TableInfo, TableDescription, ColumnInfo, errors
 

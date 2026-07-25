@@ -163,9 +163,13 @@ _DEFAULT_KEEP_WORKSPACES = 3
 _SWEEP_GRACE_SECONDS = 60
 
 
-# Entries a workspace dir contains before any work happens: the DB file itself, its WAL, and
-# the default spill scratch dir (transient — safe to disregard even if a crash left files in it).
-_WORKSPACE_SCAFFOLD_ENTRIES = frozenset({"workspace.duckdb", "workspace.duckdb.wal", "spill"})
+# Entries a workspace dir contains before any work happens: the DB file itself, its WAL, the
+# default spill scratch dir (transient — safe to disregard even if a crash left files in it),
+# and the api-source snapshot dir (re-fetchable derived data, not user work — a reconnect-churn
+# server that attached an api source but never ran a query must still count as empty).
+_WORKSPACE_SCAFFOLD_ENTRIES = frozenset(
+    {"workspace.duckdb", "workspace.duckdb.wal", "spill", "snapshots"}
+)
 
 
 def _dir_has_user_artifacts(dir_path: str) -> bool:
@@ -395,7 +399,9 @@ class DuckSession:
 
         attached: list[Source] = []
         if specs:
-            attached = sources_mod.attach_all(con, specs)
+            attached = sources_mod.attach_all(
+                con, specs, snapshot_dir=os.path.join(base, "snapshots")
+            )
 
         if pp_parent is not None and keep_workspaces > 0:
             _reclaim_old_workspaces(pp_parent, keep_workspaces, exclude=base)
@@ -439,9 +445,13 @@ class DuckSession:
         Builds the source, rejects a name that collides with an existing source or the workspace
         catalog, then runs its setup SQL and registers it. The source becomes queryable in *every*
         flow of this session — sources are connection-global, not flow-scoped. Returns the source's
-        name, kind, and the objects it made queryable.
+        name, kind, and the objects it made queryable (plus, for an ``api:`` source, the fetch
+        fingerprint under ``info``). Building an ``api:`` source performs its fetch here, before
+        the lock, so slow network I/O never stalls other tool calls.
         """
-        src = sources_mod.build_source(spec)
+        src = sources_mod.build_source(
+            spec, snapshot_dir=os.path.join(self.workspace_dir, "snapshots")
+        )
         with self._lock:
             # Check-and-register under one lock: two concurrent add_source calls with the same
             # name must not both pass the uniqueness test (worker threads run tools concurrently).
@@ -456,7 +466,10 @@ class DuckSession:
                 self._con.execute(stmt)
             self.sources.append(src)
             objects = [obj.model_dump() for obj in self._objects_for_source(src)]
-        return {"name": src.name, "kind": src.kind, "objects": objects}
+        out = {"name": src.name, "kind": src.kind, "objects": objects}
+        if src.info is not None:
+            out["info"] = src.info
+        return out
 
     def remove_source(self, name: str) -> dict:
         """Detach a source added at runtime or configured at startup; idempotent on the SQL.
@@ -1380,10 +1393,11 @@ class DuckSession:
         source often keeps its tables in a non-default schema). The attached DB's own system
         schemas (information_schema, pg_catalog) are metadata, not data, and are hidden.
         """
-        if src.kind in ("file", "delta", "iceberg"):
+        if src.kind in ("file", "delta", "iceberg", "api"):
             # No eager COUNT(*): a file/lakehouse source can be remote (https/s3/...), so counting
             # here would trigger a full scan while holding the session lock and stall every other
-            # tool call. describe() (db://{table}) fills the count lazily, on demand.
+            # tool call. describe() (db://{table}) fills the count lazily, on demand. (An api
+            # snapshot is local and cheap, but keeping one code path keeps the contract uniform.)
             return [TableInfo(name=src.name, kind="view", row_count=None)]
         if src.kind in ("sqlite", "postgres", "mysql", "ducklake"):
             rows = self._con.execute(

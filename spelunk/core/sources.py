@@ -9,7 +9,12 @@ The unified engine is a single DuckDB connection. Every source is reached throug
     matching filesystem extension (``httpfs`` / ``azure``) is loaded automatically;
   * **lakehouse tables** (Delta / Iceberg) are scanned via ``delta_scan`` / ``iceberg_scan`` and
     likewise registered as VIEWs — write ``delta:<path>`` / ``iceberg:<path>``;
-  * **SQLite / PostgreSQL / MySQL / DuckLake** are ``ATTACH``ed read-only, each as its own catalog.
+  * **SQLite / PostgreSQL / MySQL / DuckLake** are ``ATTACH``ed read-only, each as its own catalog;
+  * **REST/JSON APIs** (``api:<url> [key=value ...]``) are fetched ONCE at attach time — with
+    pagination, retries, and rate-limit backoff — into an NDJSON snapshot under the workspace,
+    and registered as a VIEW over that local file. Queries run against the pinned snapshot
+    (deterministic, no re-fetch per query); refresh by re-attaching. See ``apifetch.py`` for
+    the option grammar (paginate=page/offset/cursor/link, records=<dot.path>, auth_env=...).
 
 Everything reachable is reached through the one DuckDB connection — there is no out-of-engine
 fallback. A source DuckDB can't attach (e.g. SQL Server) is not supported; export it to a file
@@ -24,6 +29,7 @@ A spec is a string, optionally prefixed ``name=``::
     events=delta:./warehouse/events            # a Delta Lake table directory
     catalog=iceberg:./warehouse/catalog/table  # an Iceberg table
     lake=ducklake:./catalog.ducklake           # a DuckLake catalog
+    gh=api:https://api.github.com/repos/o/r/issues paginate=link   # REST API -> snapshot
     sqlite:///C:/data/app.db
     postgresql://user:pw@host/dbname
     ./reports/q1.csv               # name derived from the filename -> q1
@@ -46,7 +52,7 @@ from urllib.parse import parse_qsl, unquote, urlsplit
 if TYPE_CHECKING:
     import duckdb
 
-SourceKind = Literal["file", "sqlite", "postgres", "mysql", "delta", "iceberg", "ducklake"]
+SourceKind = Literal["file", "sqlite", "postgres", "mysql", "delta", "iceberg", "ducklake", "api"]
 
 # File extension -> DuckDB table function used to scan it (readers in the core/statically-linked
 # build, no extension load needed).
@@ -124,13 +130,16 @@ class Source:
     """One registered data source.
 
     ``setup_sql`` are the statements to run on the DuckDB connection to make the source
-    queryable (extension loads + ATTACH/CREATE VIEW).
+    queryable (extension loads + ATTACH/CREATE VIEW). ``info`` carries kind-specific
+    provenance — for an ``api`` source, the fetch fingerprint (url, fetched_at, pages,
+    row_count, snapshot path) — and is ``None`` for kinds that have none.
     """
 
     name: str
     kind: SourceKind
     locator: str
     setup_sql: list[str] = field(default_factory=list)
+    info: dict | None = None
 
 
 def parse_spec(spec: str) -> tuple[str | None, str]:
@@ -184,6 +193,8 @@ def detect_kind(locator: str, forced_ext: str | None = None) -> SourceKind:
         return "delta"
     if low.startswith("iceberg:"):
         return "iceberg"
+    if low.startswith("api:"):
+        return "api"
     if low.startswith("sqlite://"):
         return "sqlite"
     ext = _path_ext(locator)
@@ -202,8 +213,13 @@ def detect_kind(locator: str, forced_ext: str | None = None) -> SourceKind:
     )
 
 
-def build_source(spec: str) -> Source:
-    """Parse a single spec into a :class:`Source` (no DuckDB connection touched yet)."""
+def build_source(spec: str, *, snapshot_dir: str | None = None) -> Source:
+    """Parse a single spec into a :class:`Source` (no DuckDB connection touched yet).
+
+    ``snapshot_dir`` is where an ``api:`` source writes its NDJSON snapshot (the session's
+    workspace snapshot dir); building an ``api:`` source performs the fetch here — network
+    I/O, deliberately *before* any connection lock is taken. Other kinds ignore it.
+    """
     explicit, locator = parse_spec(spec)
     forced_ext, locator = _split_format_prefix(locator)
     kind = detect_kind(locator, forced_ext=forced_ext)
@@ -220,31 +236,41 @@ def build_source(spec: str) -> Source:
         return _build_scan_source(name, kind, locator)
     if kind == "ducklake":
         return _build_ducklake_source(name, locator)
+    if kind == "api":
+        return _build_api_source(name, locator, snapshot_dir)
     return _build_attach_source(name, kind, locator)
 
 
 def teardown_sql(src: Source) -> list[str]:
     """Statements that undo a source's :attr:`Source.setup_sql` — the inverse of attaching.
 
-    A view-backed source (``file`` / ``delta`` / ``iceberg``) drops its ``main`` view; an attached
-    database (SQLite/Postgres/MySQL/DuckLake) is ``DETACH``ed. Used by ``DuckSession.remove_source``.
+    A view-backed source (``file`` / ``delta`` / ``iceberg`` / ``api``) drops its ``main`` view; an
+    attached database (SQLite/Postgres/MySQL/DuckLake) is ``DETACH``ed. Used by
+    ``DuckSession.remove_source``. An ``api`` source's snapshot file is left on disk — it lives
+    under the workspace dir, so workspace cleanup reclaims it.
     """
-    if src.kind == "file" or src.kind in _SCAN_KINDS:
+    if src.kind in ("file", "api") or src.kind in _SCAN_KINDS:
         return [f'DROP VIEW IF EXISTS main."{src.name}"']
     if src.kind in _ATTACH_EXT or src.kind == "ducklake":
         return [f'DETACH "{src.name}"']
     return []
 
 
-def attach_all(con: "duckdb.DuckDBPyConnection", specs: Iterable[str]) -> list[Source]:
+def attach_all(
+    con: "duckdb.DuckDBPyConnection",
+    specs: Iterable[str],
+    *,
+    snapshot_dir: str | None = None,
+) -> list[Source]:
     """Build every source and run its ``setup_sql`` on *con*; return the registered sources.
 
     Raises on duplicate source names so two sources never collide on one catalog/view name.
+    ``snapshot_dir`` is forwarded to :func:`build_source` for ``api:`` sources.
     """
     sources: list[Source] = []
     seen: set[str] = set()
     for spec in specs:
-        src = build_source(spec)
+        src = build_source(spec, snapshot_dir=snapshot_dir)
         if src.name in seen:
             raise ValueError(
                 f"Duplicate source name {src.name!r}. Give one an explicit prefix, "
@@ -297,6 +323,32 @@ def _build_scan_source(name: str, kind: SourceKind, locator: str) -> Source:
         f'CREATE OR REPLACE VIEW main."{name}" AS SELECT * FROM {scan_fn}(\'{path}\'{extra_args})'
     )
     return Source(name=name, kind=kind, locator=locator, setup_sql=setup)
+
+
+def _build_api_source(name: str, locator: str, snapshot_dir: str | None) -> Source:
+    """An ``api:`` source: fetch the endpoint into an NDJSON snapshot, view over the snapshot.
+
+    The fetch (pagination, retries, auth — see ``apifetch``) happens here, at build time, so
+    the network I/O is done before the session lock is ever taken. The view reads the local
+    snapshot file — queries never re-fetch the API. ``Source.info`` carries the fetch
+    fingerprint (url, fetched_at, pages, row_count, snapshot path).
+    """
+    from . import apifetch
+
+    if snapshot_dir is None:
+        raise ValueError(
+            "api: sources need a workspace to store their snapshot — open the session with a "
+            "workspace (DuckSession.open) rather than calling build_source directly."
+        )
+    spec = apifetch.parse_api_spec(_strip_scheme(locator, "api"))
+    os.makedirs(snapshot_dir, exist_ok=True)
+    dest = os.path.join(snapshot_dir, f"{name}.ndjson")
+    info = apifetch.fetch_snapshot(spec, dest)
+    setup = [
+        f'CREATE OR REPLACE VIEW main."{name}" AS SELECT * FROM '
+        f"read_json_auto('{_duck_path(dest)}', format='newline_delimited')"
+    ]
+    return Source(name=name, kind="api", locator=locator, setup_sql=setup, info=info)
 
 
 def _build_ducklake_source(name: str, locator: str) -> Source:
@@ -373,6 +425,9 @@ def _derive_name(locator: str, kind: SourceKind) -> str:
         locator = _strip_scheme(locator, kind)
     elif kind == "ducklake":
         locator = _strip_scheme(locator, "ducklake")
+    elif kind == "api":
+        # Name from the URL's last path segment; drop the whitespace-separated options first.
+        locator = _strip_scheme(locator, "api").split()[0]
     if "://" in locator:
         try:
             url = urlsplit(locator)

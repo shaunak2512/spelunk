@@ -476,10 +476,13 @@ def build_server(
             name="add_source",
             description=(
                 "Attach a new data source at runtime, then query it like any configured source. "
-                "`spec` is a file path (.csv/.parquet/.json/.xlsx), a SQLite file, or a sqlite:// / "
-                "postgresql:// / mysql:// DSN; prefix with `name=` to set the source name "
-                "(e.g. `sales=./sales.parquet`). Returns the source name, kind, and the objects it "
-                "made queryable. The source is visible in every flow of this session."
+                "`spec` is a file path (.csv/.parquet/.json/.xlsx), a SQLite file, a sqlite:// / "
+                "postgresql:// / mysql:// DSN, or a REST/JSON API — `api:<url> [key=value ...]` "
+                "fetches the endpoint ONCE into a local snapshot (options: records=<dot.path>, "
+                "paginate=page|offset|cursor|link, max_pages, auth_env=<ENV>; re-add to refresh). "
+                "Prefix with `name=` to set the source name (e.g. `sales=./sales.parquet`). "
+                "Returns the source name, kind, and the objects it made queryable. The source is "
+                "visible in every flow of this session."
             ),
         )
         @_logged
@@ -514,9 +517,11 @@ def main() -> None:
         help=(
             "A data source, repeatable. A file path (.csv/.parquet/.json/.xlsx/.avro) — local or a "
             "remote https:// / s3:// / gs:// / az:// URL — a SQLite file, a delta:<path> / "
-            "iceberg:<path> lakehouse table, or a sqlite:// / postgresql:// / mysql:// / ducklake: "
-            "DSN. Prefix with name= to set the source name, e.g. sales=./sales.parquet. For a file "
-            "with an odd/absent extension, force the reader with a format prefix "
+            "iceberg:<path> lakehouse table, a sqlite:// / postgresql:// / mysql:// / ducklake: "
+            "DSN, or a REST/JSON API: 'api:<url> [key=value ...]' is fetched once at startup into "
+            "a local snapshot (options incl. records=<dot.path>, paginate=page|offset|cursor|link, "
+            "auth_env=<ENV>). Prefix with name= to set the source name, e.g. sales=./sales.parquet. "
+            "For a file with an odd/absent extension, force the reader with a format prefix "
             "(csv:/tsv:/json:/parquet:/excel:/avro:), e.g. routes=csv:https://host/routes.dat."
         ),
     )
