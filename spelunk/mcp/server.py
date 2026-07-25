@@ -16,7 +16,9 @@ import functools
 import inspect
 import json
 import logging
+import os
 import re
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -511,6 +513,29 @@ def build_server(
     return mcp
 
 
+def _load_env_file(path: str) -> None:
+    """Export KEY=VALUE lines from *path* into ``os.environ`` (existing variables win).
+
+    Quotes around values are stripped; blank lines and ``#`` comments are ignored. A missing
+    or unreadable file warns on stderr rather than failing startup — the server is still
+    useful without the credentials, and api: sources name the missing variable on use.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except OSError as exc:
+        print(f"[spelunk] --env-file {path!r} not loaded: {exc}", file=sys.stderr)
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip().strip("'\"")
+        if key:
+            os.environ.setdefault(key, value)
+
+
 def main() -> None:
     """CLI entry point: build a DuckSession from --source specs, serve over stdio."""
     parser = argparse.ArgumentParser(
@@ -600,7 +625,21 @@ def main() -> None:
             "when --session-dir is set, otherwise stderr."
         ),
     )
+    parser.add_argument(
+        "--env-file",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Load KEY=VALUE lines from this file into the server's environment before opening "
+            "sources (already-set variables win; missing file is a warning, not an error). This "
+            "is how api: source credentials (auth_env=/header=/param=) reach the server without "
+            "putting secrets in a checked-in MCP config — point it at a gitignored .env."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.env_file:
+        _load_env_file(args.env_file)
 
     specs = list(args.source)
     if args.dsn:

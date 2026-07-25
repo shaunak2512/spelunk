@@ -322,3 +322,27 @@ class TestAddSourceGating:
             assert removed["removed"] is True
         finally:
             session.close()
+
+
+class TestEnvFile:
+    def test_load_env_file(self, tmp_path, monkeypatch):
+        from spelunk.mcp.server import _load_env_file
+
+        monkeypatch.delenv("SPELUNK_EF_NEW", raising=False)
+        monkeypatch.setenv("SPELUNK_EF_KEPT", "original")
+        p = tmp_path / ".env"
+        p.write_text(
+            "# comment\n\nSPELUNK_EF_NEW='v-1'\nSPELUNK_EF_KEPT=overridden\nBAD LINE\n",
+            encoding="utf-8",
+        )
+        _load_env_file(str(p))
+        import os
+
+        assert os.environ["SPELUNK_EF_NEW"] == "v-1"  # quotes stripped
+        assert os.environ["SPELUNK_EF_KEPT"] == "original"  # existing env wins
+
+    def test_missing_file_warns_not_raises(self, tmp_path, capsys):
+        from spelunk.mcp.server import _load_env_file
+
+        _load_env_file(str(tmp_path / "absent.env"))
+        assert "--env-file" in capsys.readouterr().err
