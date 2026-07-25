@@ -84,6 +84,11 @@ views named bare) and `db://{table}` (columns, PK, sample, row count).
 - **Materialize-by-default:** `query` does `CREATE OR REPLACE TABLE` — computed once, cheap to
   reuse, correct for pipelines (a DuckDB *view* re-executes its whole upstream on every reference).
   A nudge fires on an unfiltered `SELECT *` that copies a large source table wholesale.
+  `_materialize_query` ends with `_checkpoint()` (a `CHECKPOINT "<workspace>"`), so every `query`
+  — and every successful step of a `query(steps=[...])` batch — folds the WAL into
+  `workspace.duckdb` immediately instead of letting it linger until DuckDB's size threshold. It's
+  best-effort (a checkpoint that no-ops/aborts is swallowed — the data is already durable in the
+  WAL) and targets the workspace catalog by name so the read-only attached sources are untouched.
 - **Lineage & replay:** every `query` result upserts a row into the internal
   `_spelunk_meta.lineage` table (a reserved schema, hidden from `catalog`/`drop`): its SQL, `kind`,
   and dependency edges. Deps are found by parsing the SQL (sqlglot) and intersecting table refs with
