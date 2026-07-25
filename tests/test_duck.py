@@ -334,12 +334,24 @@ class TestPersistence:
         d = str(tmp_path / "sess")
         s = DuckSession.open([f"shop={sqlite_file}"], session_dir=d, per_process=False)
         wal = os.path.join(s.workspace_dir, "workspace.duckdb.wal")
+
+        # Spy on _checkpoint so we can prove a batch commits after EACH step, not once at the end.
+        real_checkpoint = s._checkpoint
+        calls = {"n": 0}
+
+        def counting_checkpoint():
+            calls["n"] += 1
+            real_checkpoint()
+
+        s._checkpoint = counting_checkpoint
         try:
-            # A single query materializes a table and must leave nothing pending in the WAL.
+            # A single query materializes a table, checkpoints once, and leaves the WAL clean.
             s.query("SELECT * FROM range(50000) t(x)", "big", flow="work")
+            assert calls["n"] == 1
             assert not os.path.exists(wal) or os.path.getsize(wal) == 0
 
-            # A batch checkpoints after every successful step — same clean state at the end.
+            # A batch checkpoints after every successful step — one call per step, clean WAL after.
+            calls["n"] = 0
             s.query_steps(
                 [
                     {"sql": "SELECT * FROM range(50000) t(x)", "name": "a"},
@@ -347,6 +359,7 @@ class TestPersistence:
                 ],
                 flow="work",
             )
+            assert calls["n"] == 2
             assert not os.path.exists(wal) or os.path.getsize(wal) == 0
         finally:
             s.close()

@@ -811,7 +811,7 @@ class DuckSession:
 
         DuckDB defers merging committed changes from the write-ahead log into the main database
         file until the WAL crosses a size threshold, so freshly materialized results can linger
-        in ``workspace.wal`` well after the ``query`` returns. We ``CHECKPOINT`` the workspace
+        in ``workspace.duckdb.wal`` well after the ``query`` returns. We ``CHECKPOINT`` the workspace
         catalog explicitly at the end of each materialization — so ``query`` commits after every
         call, and ``query(steps=[...])`` after every step that succeeds. The catalog is named so
         we only touch the workspace, never the read-only attached sources. Must be called while
