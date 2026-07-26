@@ -34,7 +34,7 @@ from uuid import uuid4
 
 import duckdb
 
-from . import guard, sources as sources_mod
+from . import apifetch, guard, sources as sources_mod
 from .types import ColumnInfo, TableDescription, TableInfo
 
 if TYPE_CHECKING:
@@ -88,6 +88,11 @@ _LARGE_MATERIALIZE = 100_000
 # After this many consecutive single-statement query() calls, nudge once toward query_steps —
 # dependent steps batched into one call cost one round trip instead of N.
 _BATCH_NUDGE_AT = 3
+
+# A fetch result has no SQL, so its lineage row records the request that produced it instead:
+# this prefix plus a compact JSON object (source, path, params, rows_from). Readable in a
+# lineage graph, greppable in the tool log, and unambiguous — nothing else starts this way.
+_FETCH_PREFIX = "FETCH "
 
 
 def _full_sample_fits(row_count: int, col_count: int) -> bool:
@@ -609,16 +614,26 @@ class DuckSession:
         return refs
 
     def _record_lineage(
-        self, flow: str, name: str, sql: str, kind: str, description: str | None = None
+        self,
+        flow: str,
+        name: str,
+        sql: str,
+        kind: str,
+        description: str | None = None,
+        deps: list[dict[str, str]] | None = None,
+        sources: list[str] | None = None,
     ) -> None:
         """Upsert the lineage row for a just-materialized result (caller holds ``_lock``).
 
         Called from ``query`` right after the CREATE, so the result set is already current.
         Dependencies are computed against every *other* live result. ``description`` is an
-        optional one-line label; blank/whitespace-only is normalised to NULL.
+        optional one-line label; blank/whitespace-only is normalised to NULL. ``deps`` and
+        ``sources`` may be passed explicitly by a non-SQL producer — ``fetch`` knows its own
+        edges (the ``rows_from`` result, the API source) and has no SQL to parse them out of.
         """
         results = self._existing_results()
-        deps, sources = self._classify_refs(sql, flow, results, (flow, name))
+        if deps is None or sources is None:
+            deps, sources = self._classify_refs(sql, flow, results, (flow, name))
         description = (description or "").strip() or None
         seq = self._con.execute(
             f'SELECT COALESCE(MAX(seq), 0) + 1 FROM "{_META_SCHEMA}".lineage'
@@ -786,6 +801,324 @@ class DuckSession:
         }
         if failed_step is not None:
             out["failed_step"] = failed_step
+        return out
+
+    # ------------------------------------------------------------------ fetch --------- #
+    def fetch(
+        self,
+        source: str,
+        path: str,
+        name: str,
+        params: dict[str, Any] | None = None,
+        flow: str | None = None,
+        description: str | None = None,
+        rows_from: str | None = None,
+        records: str | None = None,
+        paginate: str | None = None,
+        max_pages: int | None = None,
+        max_rows: int | None = None,
+        max_urls: int | None = None,
+        concurrency: int | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> dict:
+        """Call one endpoint of an attached API source and materialize the response as a result.
+
+        The counterpart to :meth:`query` for data that lives behind HTTP rather than in a
+        source: ``source`` names an attached ``openapi:`` connection (base URL + credentials),
+        ``path`` is an endpoint under it, and the rows land as table ``"<flow>"."<name>"`` with
+        the same return shape ``query`` uses. An endpoint response is a *result*, not a source —
+        droppable, lineage-tracked, and flow-scoped — so chasing five endpoints costs five
+        results instead of five permanent connection-global sources.
+
+        ``params`` are query params (a ``{placeholder}`` in ``path`` consumes the param of that
+        name as a path segment instead). ``rows_from`` names an existing result whose columns
+        bind the remaining placeholders — one request per distinct row, the list→detail
+        fan-out. Pagination and credential params are reserved; passing one is an error.
+
+        Network I/O happens before the session lock is taken, so a slow endpoint never stalls
+        another flow's call.
+        """
+        flow = self._resolve_flow(flow)
+        _validate_name(name)
+        conn, source_name, styles, hints = self._connection_for(source, path)
+        req = apifetch.ApiRequest(
+            path=path,
+            params=dict(params or {}),
+            options={
+                "records": records,
+                "paginate": paginate,
+                "max_pages": max_pages,
+                "max_rows": max_rows,
+                **dict(options or {}),
+            },
+            param_styles=styles,
+            hints=hints,
+        )
+        dest = os.path.join(self.workspace_dir, "snapshots", f"{flow}.{name}.ndjson")
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+
+        provenance: dict[str, Any] = {"source": source_name, "path": path}
+        if params:
+            provenance["params"] = params
+        deps: list[dict[str, str]] = []
+        if rows_from:
+            provenance["rows_from"] = rows_from
+            bindings, dep_flow, dep_name = self._fanout_bindings(flow, rows_from, path, max_urls)
+            deps = [{"flow": dep_flow, "name": dep_name}]
+            info = apifetch.fetch_fanout(
+                conn,
+                req,
+                bindings,
+                dest,
+                concurrency=concurrency or apifetch.DEFAULT_CONCURRENCY,
+            )
+        else:
+            spec, _values = apifetch.resolve_request(conn, req)
+            info = apifetch.fetch_snapshot(spec, dest, apifetch.HostLimiter())
+        return self._materialize_fetch(
+            flow, name, dest, info, description, provenance, deps, source_name
+        )
+
+    def fetch_steps(self, steps: list[dict], flow: str | None = None) -> dict:
+        """Run an ordered batch of fetches in one call — each materialized like :meth:`fetch`.
+
+        The point of the batch is round trips: an agent chasing several endpoints of one API
+        (movies, genres, credits) issues one call instead of one per endpoint. Semantics match
+        N sequential :meth:`fetch` calls — same lineage rows, same snapshots. Fail-fast: earlier
+        fetches stay materialized, the failing step reports its error, later steps are skipped.
+        A later step may name an earlier one in ``rows_from``.
+        """
+        flow = self._resolve_flow(flow)
+        if not steps:
+            raise ValueError("steps must be a non-empty list of {source, path, name} items.")
+        for i, step in enumerate(steps):
+            if not isinstance(step, dict) or not step.get("path") or not step.get("name"):
+                raise ValueError(f"steps[{i}] must have both 'path' and 'name'.")
+            _validate_name(step["name"], f"steps[{i}] name")
+
+        results: list[dict] = []
+        completed = 0
+        failed_step: int | None = None
+        t0 = time.perf_counter()
+        for i, step in enumerate(steps):
+            if failed_step is not None:
+                results.append({"name": step["name"], "status": "skipped"})
+                continue
+            try:
+                full = self.fetch(flow=flow, **step)
+            except Exception as exc:
+                failed_step = i
+                results.append({"name": step["name"], "status": "failed", "error": str(exc)})
+                continue
+            completed += 1
+            results.append({
+                "name": full["name"],
+                "status": "ok",
+                "row_count": full["row_count"],
+                "columns": full["columns"],
+                "info": full["info"],
+                "sample": full["sample"],
+                "complete": full["complete"],
+            })
+        out = {
+            "flow": flow,
+            "step_count": len(steps),
+            "completed": completed,
+            "steps": results,
+            "elapsed_s": round(time.perf_counter() - t0, 3),
+        }
+        if failed_step is not None:
+            out["failed_step"] = failed_step
+        return out
+
+    def _connection_for(
+        self, source: str, path: str
+    ) -> tuple[Any, str, dict[str, tuple[str, bool]], dict[str, Any]]:
+        """Resolve a source name to its API connection, param styles, and endpoint hints.
+
+        Both of the latter come from the source's own endpoint catalog: the spec already
+        declares whether a list param goes over the wire as ``a,b`` or ``k=a&k=b``, and whether
+        this endpoint paginates and where its records live — so nobody has to restate the
+        obvious per call. An uncatalogued path is not an error: specs are routinely incomplete,
+        and the spec establishes the connection, not the reachable surface.
+        """
+        with self._lock:
+            src = next((s for s in self.sources if s.name == source), None)
+            if src is None or src.connection is None:
+                connections = sorted(s.name for s in self.sources if s.connection is not None)
+                raise ValueError(
+                    f"No API connection named {source!r}. Connections: "
+                    f"{connections or ['(none)']}. Attach one with "
+                    "add_source('name=openapi:<spec-url-or-path> auth_env=<ENV>')."
+                )
+            styles, hints = self._endpoint_meta(src.name, path)
+        return src.connection, src.name, styles, hints
+
+    def _endpoint_meta(
+        self, source: str, path: str
+    ) -> tuple[dict[str, tuple[str, bool]], dict[str, Any]]:
+        """``({param: (style, explode)}, fetch-option hints)`` for one catalogued GET endpoint.
+
+        Returns empty dicts for an endpoint the spec doesn't describe — the caller then supplies
+        whatever it knows. A cursor-style hint is deliberately NOT emitted: ``cursor_path`` lives
+        in the response body, which OpenAPI does not declare reliably, so guessing it would send
+        a fetch off to a page that doesn't exist. Caller holds ``_lock``.
+        """
+        try:
+            row = self._con.execute(
+                f'SELECT params, pagination_hint, records_hint FROM main."{source}" '
+                "WHERE path = ? AND method = 'get'",
+                [path],
+            ).fetchone()
+        except duckdb.Error:
+            return {}, {}
+        if row is None:
+            return {}, {}
+        params, pagination_hint, records_hint = row
+
+        styles: dict[str, tuple[str, bool]] = {}
+        query_names: dict[str, str] = {}
+        for param in params or []:
+            if isinstance(param, dict) and param.get("name"):
+                styles[param["name"]] = (param.get("style") or "form", bool(param.get("explode")))
+                if param.get("location") == "query":
+                    query_names[param["name"].lower()] = param["name"]
+
+        # Always stated for a catalogued endpoint, None included: "this response has no wrapper
+        # path" is real information, and it has to be able to override a connection-wide
+        # records= the way `paginate: none` overrides a connection-wide paginate=.
+        hints: dict[str, Any] = {
+            "records": records_hint if records_hint and records_hint != "<root>" else None
+        }
+        size = next(
+            (query_names[n] for n in ("limit", "per_page", "page_size", "count", "$top")
+             if n in query_names),
+            None,
+        )
+        if pagination_hint == "page":
+            hints["paginate"] = "page"
+            if size:
+                hints["size_param"] = size
+        elif pagination_hint == "offset":
+            hints["paginate"] = "offset"
+            offset = next(
+                (query_names[n] for n in ("offset", "skip", "$skip") if n in query_names), None
+            )
+            if offset:
+                hints["offset_param"] = offset
+            if size:
+                hints["size_param"] = size
+        elif pagination_hint is None:
+            # The endpoint declares no pagination params at all — a detail endpoint. Saying so
+            # matters: a connection-wide `paginate=page` default would otherwise make every
+            # detail fetch append ?page=1 and re-request a single object until the repeat-page
+            # guard trips. Correct an under-documented endpoint with paginate= on the call.
+            hints["paginate"] = "none"
+        return styles, hints
+
+    def _fanout_bindings(
+        self, flow: str, rows_from: str, path: str, max_urls: int | None
+    ) -> tuple[list[dict[str, Any]], str, str]:
+        """Read one binding dict per distinct row of the ``rows_from`` result.
+
+        The prep query IS the fan-out spec: selecting, aliasing and limiting the rows is plain
+        SQL, so filtering to a top-N or anti-joining against what was already fetched composes
+        with everything. Rows are ordered by the bound columns so the same prep query always
+        produces the same snapshot, and a NULL in any bound column drops that row — a URL with
+        ``/None/`` in it is never what the caller meant.
+        """
+        placeholders = sorted(set(apifetch.placeholders_in(path)))
+        if not placeholders:
+            raise ValueError(
+                f"rows_from={rows_from!r} needs at least one {{placeholder}} in the path to "
+                "bind its columns to, e.g. path='/3/movie/{movie_id}'."
+            )
+        dep_flow, _, dep_name = rows_from.rpartition(".")
+        dep_flow = dep_flow or flow
+        cols = ", ".join(f'"{p}"' for p in placeholders)
+        limit = max_urls if max_urls is not None else apifetch.DEFAULT_MAX_URLS
+        with self._lock:
+            try:
+                rows = self._con.execute(
+                    f'SELECT DISTINCT {cols} FROM "{dep_flow}"."{dep_name}" '
+                    f"WHERE {' AND '.join(f'{c} IS NOT NULL' for c in cols.split(', '))} "
+                    f"ORDER BY {cols}"
+                ).fetchall()
+            except duckdb.Error as exc:
+                raise ValueError(
+                    f"rows_from={rows_from!r}: cannot read column(s) {placeholders} from it "
+                    f"({exc}). Alias the prep query's columns to the placeholder names, e.g. "
+                    f"SELECT id AS {placeholders[0]} FROM ..."
+                ) from None
+        if len(rows) > limit:
+            raise ValueError(
+                f"rows_from={rows_from!r} has {len(rows)} distinct rows, over the {limit}-URL "
+                "cap — that would be one HTTP request each. LIMIT the prep query (or raise "
+                "max_urls deliberately). Refusing rather than silently fetching a prefix."
+            )
+        return (
+            [{p: _to_python(v) for p, v in zip(placeholders, row)} for row in rows],
+            dep_flow,
+            dep_name,
+        )
+
+    def _materialize_fetch(
+        self,
+        flow: str,
+        name: str,
+        dest: str,
+        info: dict,
+        description: str | None,
+        provenance: dict[str, Any],
+        deps: list[dict[str, str]],
+        source_name: str,
+    ) -> dict:
+        """Load a fetched NDJSON snapshot into the flow + record its ``fetch`` lineage node."""
+        literal = sources_mod._duck_path(dest)
+        with self._lock:
+            self._con.execute(f'CREATE SCHEMA IF NOT EXISTS "{flow}"')
+            self._set_search_path(flow)
+            t0 = time.perf_counter()
+            self._con.execute(
+                f'CREATE OR REPLACE TABLE "{flow}"."{name}" AS SELECT * FROM '
+                f"read_json_auto('{literal}', format='newline_delimited')"
+            )
+            elapsed = time.perf_counter() - t0
+            row_count = int(
+                self._con.execute(f'SELECT COUNT(*) FROM "{flow}"."{name}"').fetchone()[0]
+            )
+            columns = self._columns_of(flow, name)
+            n = row_count if _full_sample_fits(row_count, len(columns)) else _SAMPLE_ROWS
+            sample = self._head_sample(flow, name, n)
+            self._record_lineage(
+                flow,
+                name,
+                _FETCH_PREFIX + json.dumps(provenance, sort_keys=True, default=str),
+                "fetch",
+                description,
+                deps=deps,
+                sources=[source_name],
+            )
+            self._checkpoint()
+        out = {
+            "name": name,
+            "flow": flow,
+            "row_count": row_count,
+            "columns": columns,
+            "sample": sample,
+            "complete": len(sample) == row_count,
+            "elapsed_s": round(elapsed, 3),
+            "info": info,
+        }
+        if info.get("skipped_count"):
+            out.setdefault("hints", []).append(
+                f"{info['skipped_count']} of {info['urls']} URLs 404'd and were skipped — see "
+                "info.skipped before aggregating over this result."
+            )
+        if info.get("truncated"):
+            out.setdefault("hints", []).append(
+                "A cap (max_pages/max_rows) stopped this fetch early — the API had more to give."
+            )
         return out
 
     def _materialize_query(
@@ -1320,6 +1653,13 @@ class DuckSession:
         rebuilt. With ``into`` the flow is rebuilt into a fresh namespace (non-destructive);
         without it the flow is refreshed in place. ``dry_run`` returns the plan without executing.
         Raises on a dependency cycle.
+
+        **``fetch`` results are preserved, not re-fetched** — they are inputs here, like a
+        source. Their rows are a pinned snapshot, and silently re-issuing the requests would put
+        network latency, rate limits and a changed upstream inside an operation whose whole
+        purpose is to rebuild deterministically. They are reported under ``preserved``; refresh
+        one by calling ``fetch`` again. In a rebuild ``into`` a fresh flow they are copied, so
+        the new flow is complete and the original snapshot stays untouched.
         """
         flow = self._resolve_flow(flow)
         target = self._resolve_flow(into) if into is not None else flow
@@ -1348,9 +1688,25 @@ class DuckSession:
             if target != flow:
                 self._con.execute(f'CREATE SCHEMA IF NOT EXISTS "{target}"')
             rebuilt = []
+            preserved = []
             for (_f, nm) in order:
                 node = selected[(_f, nm)]
                 self._set_search_path(target)
+                if node["kind"] == "fetch":
+                    # An input, not a step: keep the pinned snapshot rather than re-issuing the
+                    # request. Into a fresh flow it is copied so the rebuild is still complete.
+                    if target != flow:
+                        self._con.execute(
+                            f'CREATE OR REPLACE TABLE "{target}"."{nm}" AS '
+                            f'SELECT * FROM "{flow}"."{nm}"'
+                        )
+                        self._record_lineage(
+                            target, nm, node["sql"], "fetch", node.get("description"),
+                            deps=[], sources=[],
+                        )
+                    rc = self._con.execute(f'SELECT COUNT(*) FROM "{target}"."{nm}"').fetchone()[0]
+                    preserved.append({"name": nm, "kind": "fetch", "row_count": int(rc)})
+                    continue
                 with self._friendly_catalog_errors(target):
                     self._con.execute(
                         f'CREATE OR REPLACE TABLE "{target}"."{nm}" AS {node["sql"]}'
@@ -1360,13 +1716,16 @@ class DuckSession:
                 ).fetchone()[0]
                 self._record_lineage(target, nm, node["sql"], "query", node.get("description"))
                 rebuilt.append({"name": nm, "kind": node["kind"], "row_count": int(rc)})
-        return {
+        out = {
             "source_flow": flow,
             "target_flow": target,
             "dry_run": False,
             "order": [nm for (_f, nm) in order],
             "rebuilt": rebuilt,
         }
+        if preserved:
+            out["preserved"] = preserved
+        return out
 
     # ------------------------------------------------------------------ introspection - #
     def list_objects(self) -> list[TableInfo]:

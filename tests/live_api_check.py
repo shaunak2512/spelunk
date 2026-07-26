@@ -291,6 +291,66 @@ def _run_auth_failures(session: DuckSession) -> int:
     return failures
 
 
+def _run_connection_fanout(session: DuckSession) -> int:
+    """The eval task, in four calls: connect once, find the endpoint, fetch the list, fan out.
+
+    This is the shape the 2026-07-25 A/B eval could not express — budget/revenue live only on
+    /3/movie/{movie_id}, and attaching 200 sources to reach them was absurd. Runs only when the
+    local TMDB spec file and the TMDB token are both available.
+    """
+    token = "TMDB_API_READ_ACCESS_TOKEN"
+    if not os.path.isfile(_TMDB_SPEC) or not os.environ.get(token):
+        print("[SKIP] connection + fan-out: TMDB spec file or token not available")
+        return 0
+    try:
+        session.add_source(f"tmdb=openapi:{_TMDB_SPEC} auth_env={token}")
+
+        # 1. Which endpoints actually carry revenue? (impossible before response_fields)
+        carriers = session.query(
+            "SELECT path FROM tmdb WHERE method = 'get' AND 'revenue' IN "
+            "(SELECT f.name FROM UNNEST(response_fields) AS t(f)) ORDER BY path",
+            name="carriers",
+        )
+        paths = [r[0] for r in carriers["sample"]]
+        ok = "/3/movie/{movie_id}" in paths
+        print(f"[{'OK ' if ok else 'ERR'}] response_fields finds the revenue endpoint: {paths}")
+
+        # 2. The list endpoint — no records=/paginate= needed, the catalog knows.
+        top = session.fetch(source="tmdb", path="/3/movie/top_rated", name="top", max_pages=2)
+        print(f"[OK ] fetched {top['row_count']} chart movies (one source, not one per endpoint)")
+
+        # 3. The prep query IS the fan-out spec.
+        session.query(
+            "SELECT id AS movie_id FROM top ORDER BY vote_count DESC LIMIT 12", name="ids"
+        )
+        details = session.fetch(
+            source="tmdb", path="/3/movie/{movie_id}", rows_from="ids", name="details"
+        )
+        print(
+            f"[OK ] fan-out: {details['info']['urls']} URLs -> {details['row_count']} rows, "
+            f"keys {details['info']['key_columns']}"
+        )
+
+        # 4. The insight that was previously out of reach.
+        roi = session.query(
+            "SELECT g.name AS genre, ROUND(SUM(d.revenue) / NULLIF(SUM(d.budget), 0), 2) AS roi "
+            "FROM details d, UNNEST(d.genres) AS t(g) "
+            "WHERE d.budget > 0 GROUP BY 1 ORDER BY roi DESC NULLS LAST LIMIT 3",
+            name="genre_roi",
+        )
+        print(f"[OK ] genre ROI reachable through spelunk alone: {roi['sample']}")
+
+        graph = session.lineage(name="genre_roi")
+        chained = len(graph["nodes"]) >= 4
+        print(f"[{'OK ' if chained else 'ERR'}] lineage chains top->ids->details->genre_roi: "
+              f"{graph['order']}")
+        return 0 if (ok and chained) else 1
+    except Exception as exc:
+        print(f"[ERR] connection + fan-out: {exc}")
+        traceback.print_exc()
+        return 1
+
+
 def main() -> int:
     _load_dotenv()
     # NASA's published public demo key — fine to default (30 req/hr/IP); a real key in the
@@ -304,6 +364,7 @@ def main() -> int:
             failures += case_failures
             failures += _run_joins(session, attached)
             failures += _run_openapi_loop(session)
+            failures += _run_connection_fanout(session)
             failures += _run_auth_failures(session)
         finally:
             session.close()

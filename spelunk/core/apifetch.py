@@ -68,6 +68,29 @@ Safety rails: every page is retried on 429/5xx/network errors with exponential b
 (honouring ``Retry-After``); a paginating fetch that receives the *same page twice* stops (an
 API that ignores its page param would otherwise loop to ``max_pages``); the snapshot is written
 to a temp file and moved into place, so a failed fetch never leaves a half-written snapshot.
+
+Connections vs requests
+-----------------------
+The ``api:<url>`` grammar above describes *one endpoint* — fine for a single feed, absurd for
+an API you want to explore, where every endpoint would be another permanent source. So the
+same machinery is also driven from two halves:
+
+* :class:`ApiConnection` — base URL, credentials, and shared conventions, declared ONCE (an
+  ``openapi:`` source builds one; see ``sources.py``).
+* :class:`ApiRequest` — a path under it, params, and per-call fetch options.
+
+:func:`resolve_request` binds the two into the same :class:`ApiSpec` the ``api:`` grammar
+produces, so pagination, retries, auth and record extraction have exactly one implementation.
+Params are layered — the query string inside ``path``, then the connection's defaults, then the
+call's own — while pagination-managed and credential param names are *reserved* (passing one is
+an error, not a silent override). ``{placeholder}``s in the path are filled from params and
+percent-encoded as single segments, so a bound value can never redirect the request.
+
+:func:`fetch_fanout` is the list→detail primitive: one URL per row of a prep query, fetched
+through a small thread pool sharing one :class:`HostLimiter` so a 429 backs every worker off
+together. Each row is stamped ``_key_<placeholder>`` for the join back; a per-entity 404 is
+data (skipped and reported), while 401/403 or anything else aborts — a half-fetched detail
+table is a footgun, because aggregates over it look valid.
 """
 from __future__ import annotations
 
@@ -75,7 +98,9 @@ import json
 import os
 import re
 import shlex
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timezone
 from typing import Any
@@ -197,6 +222,15 @@ def parse_api_spec(text: str) -> ApiSpec:
         else:
             options[key] = value
     spec = ApiSpec(url=url, extra_headers=extra_headers, url_params=url_params, **options)
+    return _validated(spec)
+
+
+def _validated(spec: ApiSpec) -> ApiSpec:
+    """Cross-check a built :class:`ApiSpec` and desugar ``paginate=odata``.
+
+    Shared by ``parse_api_spec`` (the ``api:<url>`` grammar) and :func:`resolve_request` (a
+    connection + request), so both paths reject the same nonsense with the same wording.
+    """
     if spec.paginate not in _PAGINATE_STYLES:
         raise ValueError(
             f"Unknown paginate style {spec.paginate!r}. "
@@ -251,16 +285,304 @@ def _select_list(select: str) -> str:
     return ",".join(cols)
 
 
-def fetch_snapshot(spec: ApiSpec, dest_path: str) -> dict[str, Any]:
-    """Fetch *spec* into an NDJSON file at *dest_path*; return the fetch fingerprint.
+# --------------------------------------------------------------------------- #
+# Connections and requests
+# --------------------------------------------------------------------------- #
+# Query-param names that almost certainly carry a credential. A caller passing one as a plain
+# value has put a secret somewhere it will be written to the tool-call log verbatim, so we
+# refuse and point at param=<name>:<ENV>, which resolves from the environment at fetch time.
+_CREDENTIAL_PARAM_NAMES = frozenset({
+    "api_key", "apikey", "api-key", "key", "token", "access_token", "auth", "auth_token",
+    "password", "passwd", "secret", "client_secret", "private_key", "signature",
+})
+# Separator used to join a list param when it is NOT exploded, by OpenAPI serialization style.
+_STYLE_SEPARATORS = {"form": ",", "simple": ",", "spaceDelimited": " ", "pipeDelimited": "|"}
+_PLACEHOLDER_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
-    The fingerprint (``url``, ``fetched_at``, ``pages``, ``row_count``, ``snapshot``, plus
-    ``truncated`` when a cap stopped the fetch early) is what the caller records as source
-    provenance. Raises ``ValueError`` with an actionable message on HTTP failure, non-JSON
-    responses, a bad ``records`` path, or an API that yields zero records (almost always a
-    wrong/missing ``records=`` path — the error lists the response's top-level keys).
+
+@dataclass
+class ApiConnection:
+    """One API registered once: base URL, credentials, and its endpoints' shared conventions.
+
+    The counterpart to :class:`ApiRequest` — this half is declared on the source and reused by
+    every fetch, so an agent chasing five endpoints supplies the credential zero further times.
+    ``params`` are default query params merged into every request; ``defaults`` are default
+    :class:`ApiSpec` options (``records``, ``paginate``, …) a request may override.
     """
-    secrets: list[tuple[str, str]] = []  # (ENV var name, value) — for error-message scrubbing
+
+    base_url: str
+    auth_env: str | None = None
+    extra_headers: list[tuple[str, str]] = field(default_factory=list)
+    url_params: list[tuple[str, str]] = field(default_factory=list)
+    params: dict[str, Any] = field(default_factory=dict)
+    defaults: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def host(self) -> str:
+        return urlsplit(self.base_url).netloc.lower()
+
+
+@dataclass
+class ApiRequest:
+    """One endpoint call against an :class:`ApiConnection`: a path, params, and fetch options.
+
+    ``path`` is relative to the connection's base URL and may contain ``{placeholder}``s, each
+    filled from ``params`` (percent-encoded as a single path segment) or, for a fan-out, bound
+    per row. ``param_styles`` maps a param name to its ``(style, explode)`` from the endpoint
+    catalog, which is what decides whether a list serializes as ``a,b`` or ``k=a&k=b``.
+    """
+
+    path: str
+    params: dict[str, Any] = field(default_factory=dict)
+    options: dict[str, Any] = field(default_factory=dict)
+    param_styles: dict[str, tuple[str, bool]] = field(default_factory=dict)
+    # Per-endpoint fetch options read from the spec's catalog (this endpoint paginates by page,
+    # its records live under "results"). They sit between the connection's blanket defaults and
+    # the caller's explicit args — most specific wins — so a connection-wide `paginate=page`
+    # cannot make a detail endpoint try to paginate a single object.
+    hints: dict[str, Any] = field(default_factory=dict)
+
+
+def placeholders_in(path: str) -> list[str]:
+    """The ``{placeholder}`` names in a request path, in order of appearance."""
+    return _PLACEHOLDER_RE.findall(path.split("?")[0])
+
+
+def parse_connection(base_url: str, tokens: list[str]) -> ApiConnection:
+    """Build an :class:`ApiConnection` from the option tokens of a connection source spec.
+
+    Same option vocabulary as ``api:`` — ``auth_env=``, ``header=<Name>:<ENV>``,
+    ``param=<name>:<ENV>``, and any fetch option (``records=``, ``paginate=``, …) which becomes
+    a *default* every request inherits — plus ``default_param=<name>:<value>`` for a plain
+    query param that every request should carry (``default_param=language:en-US``).
+    """
+    conn = ApiConnection(base_url=base_url.rstrip("/"))
+    for tok in tokens:
+        key, sep, value = tok.partition("=")
+        if not sep or not key or not value:
+            raise ValueError(
+                f"Malformed connection option {tok!r} — options are key=value tokens after "
+                "the spec locator."
+            )
+        if key in ("header", "param", "default_param"):
+            name, csep, rest = value.partition(":")
+            if not csep or not name or not rest:
+                raise ValueError(
+                    f"Option {key}= takes <name>:<"
+                    + ("value" if key == "default_param" else "ENV_VAR")
+                    + f">, got {value!r}."
+                )
+            if key == "header":
+                conn.extra_headers.append((name, rest))
+            elif key == "param":
+                conn.url_params.append((name, rest))
+            else:
+                conn.params[name] = rest
+            continue
+        if key == "auth_env":
+            conn.auth_env = value
+            continue
+        if key not in _OPTION_NAMES:
+            raise ValueError(
+                f"Unknown connection option {key!r}. Valid options: {_VALID_OPTION_HELP}, "
+                "default_param."
+            )
+        conn.defaults[key] = int(value) if key in _INT_OPTIONS else value
+    # Fail at attach time on a nonsense default rather than on the first fetch that inherits it.
+    _validated(ApiSpec(url=conn.base_url, **conn.defaults))
+    return conn
+
+
+def _scalar(value: Any) -> str:
+    """One param value as the wire sees it — JSON's booleans, not Python's ``True``/``False``."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def _param_pairs(
+    name: str, value: Any, styles: dict[str, tuple[str, bool]]
+) -> list[tuple[str, str]]:
+    """Serialize one param to ``(key, value)`` pairs — ``None`` drops it, a list obeys its style.
+
+    A dropped ``None`` is deliberate: it lets a caller pass a param conditionally
+    (``{"region": maybe_region}``) without building the dict by hand.
+    """
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        items = [_scalar(v) for v in value if v is not None]
+        if not items:
+            return []
+        style, explode = styles.get(name, ("form", False))
+        if explode:
+            return [(name, item) for item in items]
+        return [(name, _STYLE_SEPARATORS.get(style, ",").join(items))]
+    return [(name, _scalar(value))]
+
+
+def _with_params(url: str, pairs: list[tuple[str, str]]) -> str:
+    """Append *pairs* to *url*'s query string, replacing any existing keys of the same name."""
+    if not pairs:
+        return url
+    parts = urlsplit(url)
+    replaced = {k for k, _ in pairs}
+    query = [
+        (k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k not in replaced
+    ]
+    query.extend(pairs)
+    return urlunsplit(parts._replace(query=urlencode(query, quote_via=quote)))
+
+
+def _reserved_param_names(spec_options: dict[str, Any], conn: ApiConnection) -> dict[str, str]:
+    """Param names the fetcher or the connection owns, mapped to the fix for using one."""
+    paginate = spec_options.get("paginate", "none")
+    reserved: dict[str, str] = {}
+    if paginate == "page":
+        reserved[spec_options.get("page_param") or "page"] = (
+            "the pagination loop sets it — use start=<n> for the first page number"
+        )
+    if paginate == "offset":
+        reserved[spec_options.get("offset_param") or "offset"] = "the pagination loop sets it"
+    if paginate in ("cursor", "keyset") and spec_options.get("cursor_param"):
+        reserved[spec_options["cursor_param"]] = "the pagination loop sets it"
+    if paginate in ("page", "offset", "keyset"):
+        size = spec_options.get("size_param")
+        if size:
+            reserved[size] = "the pagination loop sets it — use page_size=<n>"
+    for param_name, env_name in conn.url_params:
+        reserved[param_name] = (
+            f"the connection already sends it from ${env_name}; credentials never travel as "
+            "plain param values"
+        )
+    return reserved
+
+
+def resolve_request(
+    conn: ApiConnection, req: ApiRequest, *, allow_placeholders: bool = False
+) -> tuple[ApiSpec, dict[str, str]]:
+    """Bind a request to its connection: one validated :class:`ApiSpec` plus the values used.
+
+    Params are layered lowest-to-highest — the query string embedded in ``path``, then the
+    connection's default ``params``, then the request's own — with each layer replacing only
+    its own keys. Pagination-managed and credential params are *reserved*: passing one is an
+    error rather than a silent override, because a caller who sets ``page`` while the loop also
+    sets it gets page 1 as many times as it asks for.
+
+    Fetch *options* layer by specificity — the connection's blanket defaults, then the catalog's
+    per-endpoint ``hints``, then the caller's explicit args. Per-endpoint knowledge beating a
+    connection-wide default is what stops ``paginate=page`` on the connection from making every
+    detail fetch re-request one object; an under-documented endpoint is corrected per call,
+    which is where endpoint-specific knowledge belongs anyway.
+
+    Returns ``(spec, path_values)`` where ``path_values`` are the ``{placeholder}``
+    substitutions actually made, so a fan-out can stamp them onto the rows it fetched.
+    """
+    path = req.path.strip()
+    lowered = path.lower()
+    if lowered.startswith(("http://", "https://", "//")) or "://" in lowered.split("?")[0]:
+        raise ValueError(
+            f"fetch path must be relative to the source's base URL, got {req.path!r}. "
+            "A source reaches only its own API; attach another source for another host."
+        )
+    if ".." in path.split("?")[0].split("/"):
+        raise ValueError(f"fetch path may not contain '..' segments, got {req.path!r}.")
+
+    path_part, _, inline_query = path.partition("?")
+    merged: dict[str, Any] = {}
+    for key, value in parse_qsl(inline_query, keep_blank_values=True):
+        merged[key] = value
+    merged.update(conn.params)
+    merged.update(req.params)
+
+    # {placeholder}s consume their param and become path segments, percent-encoded so a value
+    # containing / ? or # cannot redirect the request to a different endpoint.
+    path_values: dict[str, str] = {}
+    missing: list[str] = []
+    for placeholder in _PLACEHOLDER_RE.findall(path_part):
+        if placeholder not in merged or merged[placeholder] is None:
+            missing.append(placeholder)
+            continue
+        value = _scalar(merged.pop(placeholder))
+        path_values[placeholder] = value
+        path_part = path_part.replace("{" + placeholder + "}", quote(value, safe=""))
+    if missing and not allow_placeholders:
+        raise ValueError(
+            f"path {req.path!r} has unfilled placeholder(s) {sorted(missing)}. Pass them in "
+            "params (params={\"" + missing[0] + "\": ...}), or bind them to a result's columns "
+            "with rows_from=<result> to fetch one URL per row."
+        )
+
+    options = dict(conn.defaults)
+    options.update(req.hints)
+    options.update({k: v for k, v in req.options.items() if v is not None})
+    reserved = _reserved_param_names(options, conn)
+    for key in merged:
+        if key in reserved:
+            raise ValueError(f"Param {key!r} is reserved: {reserved[key]}.")
+        if key.lower() in _CREDENTIAL_PARAM_NAMES:
+            raise ValueError(
+                f"Param {key!r} looks like a credential. Params are written to the tool-call "
+                f"log verbatim — put the value in an environment variable and add "
+                f"`param={key}:<ENV_VAR>` to the source spec instead, so only the variable "
+                "NAME is ever recorded."
+            )
+
+    url = conn.base_url.rstrip("/") + "/" + path_part.lstrip("/")
+    pairs: list[tuple[str, str]] = []
+    for key, value in merged.items():
+        pairs.extend(_param_pairs(key, value, req.param_styles))
+    url = _with_params(url, pairs)
+
+    spec = ApiSpec(
+        url=url,
+        auth_env=conn.auth_env,
+        extra_headers=list(conn.extra_headers),
+        url_params=list(conn.url_params),
+        **options,
+    )
+    return _validated(spec), path_values
+
+
+class HostLimiter:
+    """Shared pacing for every request of one fetch — so a 429 backs all of them off together.
+
+    Scoped to a single fetch operation rather than the process: a fan-out over 240 URLs is
+    exactly the case where independent per-request retries turn one rate limit into 240, while
+    a process-wide limiter would let one unlucky call slow unrelated ones (and make tests
+    order-dependent). ``min_interval`` paces steady-state requests; ``penalize`` is the
+    ``Retry-After`` every worker then honours.
+    """
+
+    def __init__(self, min_interval: float = 0.0) -> None:
+        self.min_interval = min_interval
+        self._lock = threading.Lock()
+        self._next_at = 0.0
+
+    def acquire(self) -> None:
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                if now >= self._next_at:
+                    self._next_at = now + self.min_interval
+                    return
+                wait = self._next_at - now
+            time.sleep(min(wait, _MAX_BACKOFF_SECONDS))
+
+    def penalize(self, seconds: float) -> None:
+        with self._lock:
+            self._next_at = max(self._next_at, time.monotonic() + seconds)
+
+
+def _prepare(spec: ApiSpec) -> tuple[ApiSpec, dict[str, str], list[tuple[str, str]]]:
+    """Resolve a spec's credentials from the environment, just before the wire.
+
+    Returns the spec with ``param=<name>:<ENV>`` values injected into its URL (so every
+    pagination style inherits them), the request headers, and the ``(ENV name, value)`` pairs
+    that must be scrubbed from any error message — a failing URL would otherwise echo a token
+    into the tool-call log.
+    """
+    secrets: list[tuple[str, str]] = []
 
     def env_value(env_name: str) -> str:
         value = os.environ.get(env_name)
@@ -278,14 +600,27 @@ def fetch_snapshot(spec: ApiSpec, dest_path: str) -> dict[str, Any]:
     for header_name, env_name in spec.extra_headers:
         headers[header_name] = env_value(env_name)
 
-    # Inject param=<name>:<ENV> query params into the base URL so every pagination style
-    # inherits them. The original URL is what gets reported/recorded — never the injected one.
-    original_url = spec.url
     if spec.url_params:
         url = spec.url
         for param_name, env_name in spec.url_params:
             url = _with_param(url, param_name, env_value(env_name))
         spec = replace(spec, url=url)
+    return spec, headers, secrets
+
+
+def fetch_snapshot(
+    spec: ApiSpec, dest_path: str, limiter: "HostLimiter | None" = None
+) -> dict[str, Any]:
+    """Fetch *spec* into an NDJSON file at *dest_path*; return the fetch fingerprint.
+
+    The fingerprint (``url``, ``fetched_at``, ``pages``, ``row_count``, ``snapshot``, plus
+    ``truncated`` when a cap stopped the fetch early) is what the caller records as source
+    provenance. Raises ``ValueError`` with an actionable message on HTTP failure, non-JSON
+    responses, a bad ``records`` path, or an API that yields zero records (almost always a
+    wrong/missing ``records=`` path — the error lists the response's top-level keys).
+    """
+    original_url = spec.url
+    spec, headers, secrets = _prepare(spec)
 
     rows = 0
     pages = 0
@@ -299,7 +634,7 @@ def fetch_snapshot(spec: ApiSpec, dest_path: str) -> dict[str, Any]:
         with open(tmp_path, "w", encoding="utf-8") as fh:
             while next_url is not None:
                 try:
-                    payload, resp_headers = _get_json(next_url, headers)
+                    payload, resp_headers = _get_json(next_url, headers, limiter)
                 except ApiHttpError as exc:
                     if pages > 0 and exc.status == 404:
                         break  # past-the-end page: some APIs 404 instead of returning []
@@ -366,14 +701,137 @@ def fetch_snapshot(spec: ApiSpec, dest_path: str) -> dict[str, Any]:
     return info
 
 
+DEFAULT_MAX_URLS = 500
+DEFAULT_CONCURRENCY = 4
+
+
+def fetch_fanout(
+    conn: ApiConnection,
+    req: ApiRequest,
+    bindings: list[dict[str, Any]],
+    dest_path: str,
+    *,
+    concurrency: int = DEFAULT_CONCURRENCY,
+) -> dict[str, Any]:
+    """Fetch one URL per binding into a single NDJSON snapshot — the list→detail fan-out.
+
+    Each item of *bindings* supplies the ``{placeholder}`` values for one request; every record
+    it returns is stamped with ``_key_<placeholder>`` columns so the result joins straight back
+    to the prep query that produced the bindings, even when the response omits the id.
+
+    Failure policy is deliberately asymmetric. A per-entity **404 is data** — the entity was
+    deleted, so it is skipped and reported in ``info["skipped"]``, never silently dropped.
+    401/403 aborts everything (the credential is wrong for every URL, so continuing just burns
+    quota). Any other error aborts too: a half-fetched detail table is a footgun, because the
+    aggregates an agent computes over it look perfectly valid.
+    """
+    if not bindings:
+        raise ValueError("rows_from produced no rows — nothing to fetch.")
+    order = sorted(_PLACEHOLDER_RE.findall(req.path))
+
+    specs: list[tuple[dict[str, str], ApiSpec]] = []
+    for binding in bindings:
+        bound = replace(req, params={**req.params, **binding})
+        spec, path_values = resolve_request(conn, bound)
+        if spec.paginate != "none":
+            raise ValueError(
+                "rows_from fetches one URL per row, so paginate must be 'none' — got "
+                f"{spec.paginate!r}. Fetch the list endpoint separately, then fan out over it."
+            )
+        specs.append((path_values, spec))
+
+    # Credentials resolve once — the headers are identical for every URL; only the injected
+    # param=<name>:<ENV> query values have to be written into each spec's own URL.
+    limiter = HostLimiter()
+    first_spec, headers, secrets = _prepare(specs[0][1])
+    prepared = [(specs[0][0], first_spec)]
+    prepared += [(values, _prepare(spec)[0]) for values, spec in specs[1:]]
+
+    results: list[list[dict] | None] = [None] * len(prepared)
+    skipped: list[dict[str, str]] = []
+    skipped_lock = threading.Lock()
+
+    def run(index: int) -> None:
+        values, spec = prepared[index]
+        try:
+            payload, _ = _get_json(spec.url, headers, limiter)
+        except ApiHttpError as exc:
+            if exc.status == 404:
+                with skipped_lock:
+                    skipped.append(values)
+                results[index] = []
+                return
+            raise
+        records = _extract_records(payload, spec.records, spec.url)
+        stamps = {f"_key_{k}": v for k, v in values.items()}
+        results[index] = [{**record, **stamps} for record in records]
+
+    try:
+        workers = max(1, min(concurrency, len(prepared)))
+        if workers == 1:
+            for i in range(len(prepared)):
+                run(i)
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                for future in [pool.submit(run, i) for i in range(len(prepared))]:
+                    future.result()  # re-raises the first worker failure
+    except BaseException as exc:
+        if secrets and isinstance(exc, ValueError):
+            raise ValueError(_scrub_secrets(str(exc), secrets)) from exc
+        raise
+
+    rows = 0
+    tmp_path = dest_path + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            for chunk in results:
+                for record in chunk or []:
+                    fh.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+                    rows += 1
+    except BaseException:
+        _remove_quietly(tmp_path)
+        raise
+    if rows == 0:
+        _remove_quietly(tmp_path)
+        raise ValueError(
+            f"Fan-out over {len(prepared)} URL(s) returned no records"
+            + (f" ({len(skipped)} were 404s)." if skipped else ".")
+        )
+    os.replace(tmp_path, dest_path)
+
+    info: dict[str, Any] = {
+        "url": conn.base_url.rstrip("/") + "/" + req.path.lstrip("/"),
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "urls": len(prepared),
+        "row_count": rows,
+        "key_columns": [f"_key_{k}" for k in order],
+        "snapshot": os.path.abspath(dest_path),
+    }
+    if skipped:
+        # Never a silent cap: the agent must be able to see which entities are missing before
+        # it aggregates over the result.
+        info["skipped"] = skipped
+        info["skipped_count"] = len(skipped)
+    return info
+
+
 # --------------------------------------------------------------------------- #
 # HTTP
 # --------------------------------------------------------------------------- #
-def _get_json(url: str, headers: dict[str, str]) -> tuple[Any, dict[str, str]]:
-    """GET *url* and parse the JSON body; retries 429/5xx/network errors with backoff."""
+def _get_json(
+    url: str, headers: dict[str, str], limiter: "HostLimiter | None" = None
+) -> tuple[Any, dict[str, str]]:
+    """GET *url* and parse the JSON body; retries 429/5xx/network errors with backoff.
+
+    When a *limiter* is given, every attempt passes through it and a 429/5xx backoff is applied
+    to the whole fetch rather than to this request alone — so concurrent workers hitting the
+    same rate limit wait once, together, instead of each discovering it in turn.
+    """
     last_error: Exception | None = None
     for attempt in range(_ATTEMPTS_PER_PAGE):
         try:
+            if limiter is not None:
+                limiter.acquire()
             req = _urlrequest.Request(url, headers=headers)
             with _urlrequest.urlopen(req, timeout=_TIMEOUT_SECONDS) as resp:
                 body = resp.read()
@@ -390,7 +848,10 @@ def _get_json(url: str, headers: dict[str, str]) -> tuple[Any, dict[str, str]]:
             if exc.code == 429 or 500 <= exc.code < 600:
                 last_error = exc
                 if attempt < _ATTEMPTS_PER_PAGE - 1:
-                    time.sleep(_backoff_delay(attempt, exc.headers.get("Retry-After")))
+                    delay = _backoff_delay(attempt, exc.headers.get("Retry-After"))
+                    if limiter is not None:
+                        limiter.penalize(delay)  # every worker waits, not just this one
+                    time.sleep(delay)
                     continue
             else:
                 detail = exc.read()[:200].decode("utf-8", errors="replace")

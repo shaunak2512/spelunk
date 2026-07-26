@@ -16,10 +16,14 @@ The unified engine is a single DuckDB connection. Every source is reached throug
     (deterministic, no re-fetch per query); refresh by re-attaching. See ``apifetch.py`` for
     the option grammar (paginate=page/offset/cursor/keyset/link, records=<dot.path>,
     auth_env=/header=/param=);
-  * **OpenAPI specs** (``openapi:<url-or-path>``) become a queryable *endpoint catalog* — one
-    row per (path, method) with params, auth shape, pagination/records hints, and a
-    paste-ready ``suggested_spec`` (an ``api:`` spec string) for GET endpoints. See
-    ``openapi.py``.
+  * **OpenAPI specs** (``openapi:<url-or-path> [auth_env=ENV] [header=N:ENV] [param=n:ENV]
+    [default_param=n:v] [records=…] [paginate=…]``) attach an API *connection* plus its
+    queryable *endpoint catalog* — one row per (path, method) with params, auth shape,
+    pagination/records hints, ``response_fields`` (what the endpoint returns), and a
+    paste-ready ``suggested_spec``. **One API is one source:** the connection holds the base
+    URL and credentials, and ``fetch`` calls any endpoint under it — so exploring 20 endpoints
+    costs 20 flow-scoped *results*, not 20 permanent sources. See ``openapi.py`` for the
+    catalog and ``apifetch.py`` for the connection/request split.
 
 Everything reachable is reached through the one DuckDB connection — there is no out-of-engine
 fallback. A source DuckDB can't attach (e.g. SQL Server) is not supported; export it to a file
@@ -34,8 +38,8 @@ A spec is a string, optionally prefixed ``name=``::
     events=delta:./warehouse/events            # a Delta Lake table directory
     catalog=iceberg:./warehouse/catalog/table  # an Iceberg table
     lake=ducklake:./catalog.ducklake           # a DuckLake catalog
-    gh=api:https://api.github.com/repos/o/r/issues paginate=link   # REST API -> snapshot
-    tmdb_api=openapi:./tmdb-api.json           # OpenAPI spec -> queryable endpoint catalog
+    gh=api:https://api.github.com/repos/o/r/issues paginate=link   # ONE endpoint -> snapshot
+    tmdb=openapi:./tmdb-api.json auth_env=TMDB_TOKEN  # the WHOLE API -> catalog + connection
     sqlite:///C:/data/app.db
     postgresql://user:pw@host/dbname
     ./reports/q1.csv               # name derived from the filename -> q1
@@ -52,12 +56,15 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Iterable, Literal
 from urllib.parse import parse_qsl, unquote, urlsplit
 
 if TYPE_CHECKING:
     import duckdb
+
+    from .apifetch import ApiConnection
 
 SourceKind = Literal[
     "file", "sqlite", "postgres", "mysql", "delta", "iceberg", "ducklake", "api", "openapi"
@@ -142,6 +149,10 @@ class Source:
     queryable (extension loads + ATTACH/CREATE VIEW). ``info`` carries kind-specific
     provenance — for an ``api`` source, the fetch fingerprint (url, fetched_at, pages,
     row_count, snapshot path) — and is ``None`` for kinds that have none.
+
+    ``connection`` is set only for an ``openapi:`` source, which is not just a catalog but a
+    live *connection*: base URL plus credentials, reusable by ``fetch`` for any endpoint of
+    that API. It is what makes one API one source instead of one source per endpoint.
     """
 
     name: str
@@ -149,6 +160,7 @@ class Source:
     locator: str
     setup_sql: list[str] = field(default_factory=list)
     info: dict | None = None
+    connection: "ApiConnection | None" = None
 
 
 def parse_spec(spec: str) -> tuple[str | None, str]:
@@ -365,21 +377,27 @@ def _build_api_source(name: str, locator: str, snapshot_dir: str | None) -> Sour
 
 
 def _build_openapi_source(name: str, locator: str, snapshot_dir: str | None) -> Source:
-    """An ``openapi:`` source: snapshot the spec's endpoint catalog, view over the snapshot.
+    """An ``openapi:`` source: an API *connection* plus its queryable endpoint catalog.
 
-    One row per (path, method) with params, auth shape, pagination/records hints, and a
-    paste-ready ``suggested_spec`` for GET endpoints — see ``openapi.py``. The catalog is
-    guidance-as-data: the agent queries it with SQL to find endpoints, then feeds a
-    ``suggested_spec`` (env var name filled in for ``<SET_ME>``) to ``add_source``.
+    Two things in one attach, because the spec describes both. The catalog is one row per
+    (path, method) with params, auth shape, pagination/records hints, ``response_fields``, and
+    a paste-ready ``suggested_spec`` — guidance-as-data the agent queries with SQL. The
+    connection is the spec's ``servers[0].url`` plus whatever credentials the locator's options
+    supply, and it is what ``fetch`` calls to reach ANY endpoint of the API without attaching
+    another source.
+
+    Grammar: ``openapi:<url-or-path> [auth_env=ENV] [header=N:ENV] [param=n:ENV]
+    [default_param=n:value] [records=…] [paginate=…] …`` — the trailing options are the
+    connection's, and the fetch options among them become defaults every request inherits.
     """
-    from . import openapi as openapi_mod
+    from . import apifetch, openapi as openapi_mod
 
     if snapshot_dir is None:
         raise ValueError(
             "openapi: sources need a workspace to store their catalog — open the session with "
             "a workspace (DuckSession.open) rather than calling build_source directly."
         )
-    inner = _strip_scheme(locator, "openapi")
+    inner, option_tokens = _split_locator_options(_strip_scheme(locator, "openapi"))
     spec = openapi_mod.load_spec(inner)
     rows = openapi_mod.endpoint_rows(spec, inner)
     if not rows:
@@ -395,13 +413,46 @@ def _build_openapi_source(name: str, locator: str, snapshot_dir: str | None) -> 
         f'CREATE OR REPLACE VIEW main."{name}" AS SELECT * FROM '
         f"read_json_auto('{_duck_path(dest)}', format='newline_delimited')"
     ]
+    base_url = openapi_mod.base_url_of(spec, inner)
+    connection = apifetch.parse_connection(base_url, option_tokens)
+    info = openapi_mod.catalog_info(inner, rows)
+    info["base_url"] = connection.base_url
+    info["auth"] = connection.auth_env or (
+        connection.extra_headers[0][0] if connection.extra_headers else None
+    )
     return Source(
         name=name,
         kind="openapi",
         locator=locator,
         setup_sql=setup,
-        info=openapi_mod.catalog_info(inner, rows),
+        info=info,
+        connection=connection,
     )
+
+
+_QUOTED_HEAD_RE = re.compile(r'^\s*(["\'])(.+?)\1\s*(.*)$', re.DOTALL)
+
+
+def _split_locator_options(body: str) -> tuple[str, list[str]]:
+    """Split ``<locator> [key=value ...]`` into its locator and shell-tokenized options.
+
+    The locator is taken off *before* ``shlex`` sees the string: an ``openapi:`` locator is
+    routinely a Windows path, and ``shlex`` in POSIX mode would eat every backslash in
+    ``C:\\specs\\api.json``. Quote the locator if it contains spaces.
+    """
+    match = _QUOTED_HEAD_RE.match(body)
+    if match:
+        locator, rest = match.group(2), match.group(3)
+    else:
+        parts = body.strip().split(None, 1)
+        if not parts:
+            raise ValueError("openapi: source needs a spec URL or path.")
+        locator, rest = parts[0], (parts[1] if len(parts) > 1 else "")
+    try:
+        tokens = shlex.split(rest)
+    except ValueError:
+        tokens = rest.split()
+    return locator, tokens
 
 
 def _build_ducklake_source(name: str, locator: str) -> Source:
@@ -482,7 +533,8 @@ def _derive_name(locator: str, kind: SourceKind) -> str:
         # Name from the URL's last path segment; drop the whitespace-separated options first.
         locator = _strip_scheme(locator, "api").split()[0]
     elif kind == "openapi":
-        locator = _strip_scheme(locator, "openapi")
+        # Name from the spec locator; drop the whitespace-separated connection options first.
+        locator = _strip_scheme(locator, "openapi").split()[0]
     if "://" in locator:
         try:
             url = urlsplit(locator)

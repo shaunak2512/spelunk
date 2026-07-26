@@ -35,17 +35,23 @@ One DuckDB session, wrapped by a thin MCP front-end:
 ```
 spelunk/core/
   duck.py        # DuckSession — THE engine+workspace. open() attaches sources, configures
-                 #   memory_limit/temp_directory; methods: query / profile / export / catalog /
-                 #   drop / lineage / replay + list_objects / describe. query() records
+                 #   memory_limit/temp_directory; methods: query / fetch / profile / export /
+                 #   catalog / drop / lineage / replay + list_objects / describe. fetch() calls
+                 #   one endpoint of an openapi: connection (network I/O OUTSIDE the lock) and
+                 #   materializes it like query does, with a kind='fetch' lineage node whose
+                 #   "sql" is `FETCH <json>` (source/path/params/rows_from — no secrets).
+                 #   query() records
                  #   provenance (SQL + dep edges) into the internal _spelunk_meta.lineage
                  #   table; lineage() reads that DAG, replay() rebuilds a flow from it.
   sources.py     # Source registry: spec -> DuckDB attach/scan SQL (files + lakehouse scans as
                  #   VIEWs, DBs/DuckLake ATTACHed READ_ONLY). Kinds: file (local OR remote
                  #   https://,s3://,gs://,az:// via httpfs/azure ext; ext-backed readers excel/avro),
                  #   sqlite/postgres/mysql, delta:/iceberg: (delta_scan/iceberg_scan VIEWs),
-                 #   ducklake:, api: (REST/JSON endpoint fetched ONCE at attach into an NDJSON
+                 #   ducklake:, api: (ONE REST/JSON endpoint fetched at attach into an NDJSON
                  #   snapshot under <workspace>/snapshots/, view over the snapshot — queries never
-                 #   re-fetch; refresh = re-attach). DuckDB-only — a source it can't attach (e.g.
+                 #   re-fetch; refresh = re-attach), openapi: (the WHOLE API — catalog view +
+                 #   Source.connection, an ApiConnection the `fetch` tool calls any endpoint of).
+                 #   DuckDB-only — a source it can't attach (e.g.
                  #   SQL Server) is rejected, not bridged. DSNs are parsed with stdlib urllib (no
                  #   SQLAlchemy dep).
   apifetch.py    # The api: fetcher (stdlib urllib): spec grammar `api:<url> [key=value ...]` —
@@ -64,6 +70,17 @@ spelunk/core/
                  #   backoff + Retry-After; repeat-page guard stops APIs that ignore page params;
                  #   a 404 mid-pagination = end-of-data (TVMaze-style), on page 1 = error;
                  #   fetch fingerprint (url/fetched_at/pages/row_count) returned as Source.info.
+                 #   ALSO the connection layer: ApiConnection (base URL + creds + shared
+                 #   conventions, built by an openapi: source) + ApiRequest (path/params/options)
+                 #   -> resolve_request() binds them into the SAME ApiSpec, so pagination/auth/
+                 #   record extraction have one implementation. Param layering: inline query <
+                 #   conn.params < call params; pagination-managed and credential-named params
+                 #   are RESERVED (error, never a silent override); {placeholder}s consume their
+                 #   param and are percent-encoded as single segments (a bound value can't
+                 #   redirect the request). fetch_fanout() = one URL per prep-query row through a
+                 #   thread pool sharing one HostLimiter (a 429 backs off every worker),
+                 #   _key_<placeholder> stamped for the join back, per-entity 404 = data
+                 #   (skipped + reported), 401/other = abort. max_urls is a HARD ERROR.
                  #   Live smoke-check: tests/live_api_check.py (manual; hits real public APIs).
   openapi.py     # openapi:<url-or-path> -> queryable ENDPOINT CATALOG (one row per path+method
                  #   — method LOWERCASE, matching the document's own keys): params (with the
@@ -82,7 +99,8 @@ spelunk/core/
   types.py       # FROZEN contracts: TableInfo, TableDescription, ColumnInfo, errors
 
 spelunk/mcp/
-  server.py      # FastMCP wrapper: build_server(session) registers 7 tools + 2 resources;
+  server.py      # FastMCP wrapper: build_server(session) registers 7 tools + 2 resources
+                 #   (+3 behind --allow-add-source: add_source/remove_source/fetch);
                  #   main() parses --source specs and serves over stdio
 ```
 
@@ -103,6 +121,7 @@ One row-returning tool (`query`) owns every SELECT; inspection lives on the reso
 | `lineage(name?, flow?, render?, path?)` | Provenance graph: with `name`, the upstream closure (transitive, cross-flow) that built a result; without, the whole flow's DAG. Returns nodes (SQL, deps, sources, kind), edges, a dependency-first `order`, and `missing` deps. `render="mermaid"` (or `"dot"`) adds a deterministic, ready-to-display diagram string (key = the format name) built server-side from the same nodes/edges — no agent parsing; Mermaid pastes into markdown/artifacts, DOT runs through `dot -Tsvg`. `path` writes it to a file (implies `render="mermaid"`, echoes `rendered_to`). Read-only. |
 | `replay(flow?, into?, dry_run?)` | Rebuild a flow from its recorded SQL in dependency order (re-run each `query`). `into` → non-destructive rebuild into a fresh flow; omitted → in-place refresh; `dry_run` → plan only. Errors on a dependency cycle. Sources + cross-flow results are read, not rebuilt. |
 | `add_source(spec)` / `remove_source(name)` | **Only registered with `--allow-add-source`** — attach/detach a file or DB at runtime (`spec` is the same grammar as `--source`). Connection-global: a source is visible in **every flow**, not flow-scoped (DuckDB `ATTACH` can't be per-schema). Isolation comes from the process-per-agent model. |
+| `fetch(source, path, name, params?, rows_from?, …)` | **Only registered with `--allow-add-source`** (agent-initiated network reach is one capability, one gate) — call ONE endpoint of an attached `openapi:` **connection** and materialize the response as result `name`. Same return shape as `query`. **One API is one source:** attach it once, then fetch as many endpoints as you like — each response is a flow-scoped *result* (droppable, in `lineage`), never a new source. `params` is a JSON object; a `{placeholder}` in `path` consumes the param of that name as a path segment. `rows_from=<result>` binds remaining placeholders to that result's columns and fetches **one URL per distinct row** (list→detail fan-out), stamping `_key_<placeholder>` for the join back. `steps=[…]` batches several fetches per round trip (fail-fast, like `query`). |
 
 Resources: `db://tables` (queryable objects — attached-DB tables named `<source>.<table>`, file
 views named bare) and `db://{table}` (columns, PK, sample, row count).
@@ -130,6 +149,15 @@ views named bare) and `db://{table}` (columns, PK, sample, row count).
   *current* definition (which permits logical cycles → `replay` topo-sorts and rejects them). This
   makes a flow a reproducible pipeline: `lineage` shows the DAG, `replay(into=...)` rebuilds it
   against (possibly changed) sources. Durable — survives `--shared-workspace` reopen.
+- **A fetched endpoint is a result, not a source.** That reframing is what makes one API one
+  source: `add_source` an `openapi:` connection once, then `fetch` any endpoint of it. Fetch
+  results get a `kind='fetch'` lineage node (deps/sources passed to `_record_lineage` explicitly
+  — there is no SQL to parse them out of), so `ids → details → roi` renders end-to-end. **`replay`
+  preserves fetch results instead of re-fetching** — they are inputs, like a source: the rows are
+  a pinned snapshot, and silently re-issuing N requests inside an operation whose whole purpose is
+  deterministic rebuilding would import network latency, rate limits, and a changed upstream. They
+  are reported under `preserved` (and copied when rebuilding `into` a fresh flow); refresh =
+  `fetch` again.
 - **Disk-backed always + out-of-core:** the workspace is a real DuckDB file (under `--session-dir`,
   else a temp dir). Sources are read on demand with pushdown; buffering operators spill to
   `temp_directory`. A source larger than RAM is the normal case, not a failure.
@@ -157,11 +185,16 @@ name). Optional guards: `--memory-limit`, `--temp-dir`, `--max-temp-size`. `--ds
 alias for one `--source`. A `.mcp.json` wires Claude Code to a local source (paths are
 machine-specific; edit before use).
 
-**`--allow-add-source` (off by default):** registers the `add_source` / `remove_source` tools so the
-agent can attach and detach sources at runtime. This lets the agent read **any** file or database the
-server process can reach (including DSNs with embedded credentials), so only enable it for a trusted
-setup — and it's sound precisely *because* of the process-per-agent default: each agent's server is
-its own process, so an add/remove touches only that agent's isolated connection and never another's.
+**`--allow-add-source` (off by default):** registers the `add_source` / `remove_source` / `fetch`
+tools so the agent can attach and detach sources at runtime and call endpoints of an attached API.
+This lets the agent read **any** file or database the server process can reach (including DSNs with
+embedded credentials), so only enable it for a trusted setup — and it's sound precisely *because* of
+the process-per-agent default: each agent's server is its own process, so an add/remove touches only
+that agent's isolated connection and never another's. `fetch` shares this one gate rather than
+getting its own flag: agent-initiated network reach is one capability an operator grants or doesn't.
+`fetch` is additionally confined to its connection's host + base path (absolute URLs, `..`, and
+traversal through a bound `{placeholder}` are all refused), so it reaches strictly *less* than
+`add_source` already does.
 
 **Per-process workspace (the default):** `--session-dir` is a *root* (default `./.spelunk_session`,
 created if missing, gitignored) and **each server process gets its own durable workspace** at

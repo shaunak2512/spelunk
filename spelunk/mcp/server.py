@@ -63,7 +63,8 @@ _tool_logger.propagate = False
 # and row payloads are summarised, never dumped. `steps` is a batch of {sql, name} — full SQL kept.
 _LOGGED_ARGS = (
     "sql", "name", "flow", "target", "format", "path", "spec", "steps", "into", "dry_run",
-    "description",
+    "description", "source", "params", "rows_from", "records", "paginate", "max_pages",
+    "max_rows", "max_urls",
 )
 _LOGGED_RESULT_FIELDS = (
     "name", "flow", "row_count", "format", "path", "dropped_results", "kind",
@@ -295,6 +296,21 @@ def build_server(
                 "mysql:// DSN; prefix with `name=` to set the source name (e.g. "
                 "`sales=./sales.parquet`). The source becomes queryable in every flow.\n"
                 "- `remove_source(name)` — detach a source by its name. Affects this session only.\n"
+                "\n## Work with APIs — one API is ONE source\n"
+                "- `add_source('tmdb=openapi:<spec-url-or-path> auth_env=<ENV>')` attaches a whole "
+                "API: a queryable endpoint catalog AND a live connection. Do this ONCE. Never "
+                "attach a source per endpoint.\n"
+                "- Find the endpoint with SQL over the catalog — `path`, `response_fields` (the "
+                "fields it RETURNS, so you can search by the data you need), `records_hint`, "
+                "`pagination_hint`, `params`. `method` is lowercase ('get').\n"
+                "- `fetch(source, path, name, params?)` calls one endpoint and stores the response "
+                "as result `name`, exactly like `query` does. Responses are RESULTS, not sources: "
+                "droppable, in `lineage`, flow-scoped. Batch with `fetch(steps=[...])`.\n"
+                "- `fetch(source, path='/x/{id}', rows_from=<result>, name=...)` fetches ONE URL "
+                "PER ROW of that result — the list->detail fan-out (a list endpoint rarely carries "
+                "the detail fields you need). Rows are stamped `_key_<placeholder>` to join back.\n"
+                "- Credentials live on the connection. NEVER pass one in `params` — params are "
+                "logged verbatim, and the attempt is refused.\n"
                 if allow_add_source
                 else ""
             )
@@ -512,6 +528,61 @@ def build_server(
         def _remove_source(name: str) -> dict:
             return session.remove_source(name)
 
+        @mcp.tool(
+            name="fetch",
+            description=(
+                "Call ONE endpoint of an attached API connection (an `openapi:` source) and "
+                "materialize the response as result `name` — the same return shape as `query`. "
+                "One API is ONE source: attach it once with add_source, then fetch as many "
+                "endpoints as you like. Each response is a flow-scoped RESULT (droppable, in "
+                "`lineage`), not a new source. Find the endpoint first by SQL-querying the "
+                "catalog — `path`, `response_fields` (what it returns), `records_hint`, "
+                "`pagination_hint` — then pass that same `path` here. "
+                "`params` is a JSON object of query params ({\"sort_by\": \"revenue.desc\"}); a "
+                "`{placeholder}` in the path consumes the param of that name as a path segment. "
+                "NEVER put a credential in `params` (they are logged verbatim) — the connection "
+                "already carries it. Pagination params are managed for you; passing one errors. "
+                "`rows_from=<result>` binds the remaining {placeholders} to that result's "
+                "columns and fetches ONE URL PER ROW — the list->detail fan-out (movies -> "
+                "/movie/{movie_id}); rows are stamped with _key_<placeholder> so they join back. "
+                "`steps=[{source,path,name,...},...]` runs several fetches in one call. "
+                "Snapshot semantics: fetched once, queries never re-hit the API; fetch again to "
+                "refresh."
+            ),
+        )
+        @_logged
+        def _fetch(
+            source: str | None = None,
+            path: str | None = None,
+            name: str | None = None,
+            params: dict | None = None,
+            rows_from: str | None = None,
+            records: str | None = None,
+            paginate: str | None = None,
+            max_pages: int | None = None,
+            max_rows: int | None = None,
+            max_urls: int | None = None,
+            concurrency: int | None = None,
+            options: dict | None = None,
+            steps: list[dict] | None = None,
+            description: str | None = None,
+            flow: str = "default",
+        ) -> dict:
+            if steps is not None:
+                if source is not None or path is not None or name is not None:
+                    raise ValueError(
+                        "Pass either source+path+name (one fetch) or steps (batch), not both."
+                    )
+                return session.fetch_steps(steps, flow=flow)
+            if not source or not path or not name:
+                raise ValueError("fetch needs source, path and name (or steps=[...]).")
+            return session.fetch(
+                source=source, path=path, name=name, params=params, flow=flow,
+                description=description, rows_from=rows_from, records=records,
+                paginate=paginate, max_pages=max_pages, max_rows=max_rows,
+                max_urls=max_urls, concurrency=concurrency, options=options,
+            )
+
     return mcp
 
 
@@ -598,10 +669,10 @@ def main() -> None:
         "--allow-add-source",
         action="store_true",
         help=(
-            "Register the add_source / remove_source tools so the agent can attach and detach "
-            "data sources at runtime. This lets the agent read any file/database the server "
-            "process can reach — only enable it for a trusted, process-per-agent setup. Off by "
-            "default."
+            "Register the add_source / remove_source / fetch tools so the agent can attach and "
+            "detach data sources at runtime and call endpoints of an attached API connection. "
+            "This lets the agent read any file/database the server process can reach — only "
+            "enable it for a trusted, process-per-agent setup. Off by default."
         ),
     )
     parser.add_argument(

@@ -385,6 +385,11 @@ def _flatten_fields(
     return out
 
 
+def base_url_of(spec: dict, locator: str) -> str:
+    """Public alias for the spec's server URL — the base of the API *connection*."""
+    return _base_url(spec, locator)
+
+
 def _base_url(spec: dict, locator: str) -> str:
     """The first server URL, resolved against the spec's own URL when relative."""
     servers = spec.get("servers") or []

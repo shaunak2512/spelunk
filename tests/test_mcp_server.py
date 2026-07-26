@@ -301,12 +301,36 @@ class TestAddSourceGating:
     def test_tools_absent_without_flag(self, mcp_server):
         names = {t.name for t in _run(mcp_server.list_tools())}
         assert "add_source" not in names and "remove_source" not in names
+        # fetch reaches the network on the agent's behalf, so it shares the same gate
+        assert "fetch" not in names
 
     def test_tools_present_with_flag(self, sqlite_file):
         session = DuckSession.open([f"shop={sqlite_file}"])
         try:
             names = {t.name for t in _run(build_server(session, allow_add_source=True).list_tools())}
-            assert {"add_source", "remove_source"} <= names
+            assert {"add_source", "remove_source", "fetch"} <= names
+        finally:
+            session.close()
+
+    def test_fetch_rejects_mixing_single_and_batch(self, sqlite_file):
+        session = DuckSession.open([f"shop={sqlite_file}"])
+        server = build_server(session, allow_add_source=True)
+        try:
+            with pytest.raises(Exception, match="not both"):
+                _run(server.call_tool("fetch", {
+                    "source": "x", "path": "/a", "name": "n", "steps": [{"path": "/b"}],
+                }))
+        finally:
+            session.close()
+
+    def test_fetch_needs_a_connection_source(self, sqlite_file):
+        session = DuckSession.open([f"shop={sqlite_file}"])
+        server = build_server(session, allow_add_source=True)
+        try:
+            with pytest.raises(Exception, match="No API connection"):
+                _run(server.call_tool(
+                    "fetch", {"source": "shop", "path": "/movies", "name": "m"}
+                ))
         finally:
             session.close()
 

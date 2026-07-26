@@ -1,10 +1,69 @@
 """Shared fixtures. The fixture builds the sample DB with stdlib sqlite3 (NOT spelunk.core),
-so it works regardless of whether the core functions are implemented yet."""
+so it works regardless of whether the core functions are implemented yet.
+
+The ``api`` fixture is a local threaded mock HTTP server shared by the ``api:`` source tests
+and the ``fetch`` tests — no network anywhere in the suite.
+"""
 from __future__ import annotations
 
+import json
 import sqlite3
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
+
+
+class _Handler(BaseHTTPRequestHandler):
+    def do_GET(self):  # noqa: N802 (BaseHTTPRequestHandler API)
+        parts = urlsplit(self.path)
+        query = {k: v[-1] for k, v in parse_qs(parts.query, keep_blank_values=True).items()}
+        srv = self.server
+        srv.calls.append(
+            {
+                "path": parts.path,
+                "query": query,
+                # The parsed dict collapses repeated keys; serialization tests need the raw form.
+                "query_string": parts.query,
+                "headers": {k.lower(): v for k, v in self.headers.items()},
+            }
+        )
+        handler = srv.handlers.get(parts.path)
+        if handler is None:
+            self._send(404, {"error": f"no route {parts.path}"}, {})
+            return
+        nth = sum(1 for c in srv.calls if c["path"] == parts.path)  # 1-based, per path
+        status, payload, extra = handler(nth, query)
+        self._send(status, payload, extra)
+
+    def _send(self, status, payload, extra_headers):
+        body = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        for key, val in extra_headers.items():
+            self.send_header(key, val)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):  # silence per-request stderr noise
+        pass
+
+
+@pytest.fixture()
+def api():
+    """A local mock API: set ``api.handlers[path] = fn(nth_call, query) -> (status, payload,
+    extra_headers)``; requests are logged to ``api.calls``. ``api.base`` is the URL root."""
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    srv.calls = []
+    srv.handlers = {}
+    srv.base = f"http://127.0.0.1:{srv.server_address[1]}"
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    yield srv
+    srv.shutdown()
+    srv.server_close()
 
 
 @pytest.fixture
