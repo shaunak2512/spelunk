@@ -225,7 +225,11 @@ def _run_joins(session: DuckSession, attached: set[str]) -> int:
     return failures
 
 
-_TMDB_SPEC = r"C:\Users\shaun\repo\movie-tracker\tmdb-api.json"
+# The TMDB OpenAPI spec ships in the repo, so these checks run for anyone with a token. An
+# absolute path elsewhere still wins via SPELUNK_TMDB_SPEC, for a newer copy of the spec.
+_TMDB_SPEC = os.environ.get(
+    "SPELUNK_TMDB_SPEC", os.path.join(_REPO_ROOT, "sample_data", "tmdb-api.json")
+)
 
 
 def _run_openapi_loop(session: DuckSession) -> int:
