@@ -637,3 +637,107 @@ class TestSessionIntegration:
     def test_build_source_without_workspace_rejected(self):
         with pytest.raises(ValueError, match="workspace"):
             sources.build_source("api:https://example.com/x")
+
+
+class TestSnapshotTyping:
+    """Type inference over the snapshot — where a well-fetched API still becomes unqueryable."""
+
+    @staticmethod
+    def _wide(value):
+        # >200 keys is DuckDB's map_inference_threshold: past it an object is typed
+        # MAP(VARCHAR, <one value type>) instead of a STRUCT, and one value type cannot hold a
+        # payload where a sibling key is a string.
+        row = {f"k{i}": 10**19 + i for i in range(250)}
+        row["k7"] = value
+        return row
+
+    def test_wide_object_with_mixed_value_types_is_queryable(self, api, tmp_path):
+        # Two snapshots of the same endpoint whose wide object differs in ONE key's type. Typed
+        # as MAP this UNION fails with "Could not convert string ... to INT128"; as STRUCT each
+        # field keeps its own type and the union reconciles by name.
+        api.handlers["/a"] = lambda n, q: (200, [{"cve": self._wide(10**19)}], {})
+        api.handlers["/b"] = lambda n, q: (200, [{"cve": self._wide("ics-cert@hq.dhs.gov")}], {})
+        session = DuckSession.open(
+            [f"a=api:{api.base}/a", f"b=api:{api.base}/b"], session_dir=str(tmp_path / "sess")
+        )
+        try:
+            # The whole object is unioned, not a pre-projected field — reconciling the two
+            # inferred types is the point, and casting each side first would sidestep it.
+            out = session.query(
+                "SELECT cve.k7::VARCHAR AS k7 FROM "
+                "(SELECT cve FROM a UNION ALL SELECT cve FROM b)",
+                name="both",
+            )
+            assert out["row_count"] == 2
+            assert sorted(r[0] for r in out["sample"]) == [
+                "10000000000000000000",
+                "ics-cert@hq.dhs.gov",
+            ]
+        finally:
+            session.close()
+
+    def test_field_first_appearing_past_the_inference_sample(self, api, tmp_path):
+        # An optional field that no record carries until past DuckDB's default 20480-row
+        # inference sample. Sampled inference never sees it, and the scan then dies on the row
+        # that has it ('unknown key "late_field"') — a whole multi-page fetch made unreadable by
+        # one late optional field, which is ordinary in a paginated API.
+        rows = [{"id": i, "v": 1} for i in range(20600)]
+        rows.append({"id": 99999, "v": 2, "late_field": "appears only at the end"})
+        api.handlers["/late"] = lambda n, q: (200, rows, {})
+        session = DuckSession.open(
+            [f"late=api:{api.base}/late"], session_dir=str(tmp_path / "sess")
+        )
+        try:
+            assert "late_field" in [c.name for c in session.describe("late").columns]
+            out = session.query(
+                "SELECT COUNT(*) AS n, COUNT(late_field) AS with_late FROM late", name="c"
+            )
+            assert out["sample"] == [[len(rows), 1]]
+        finally:
+            session.close()
+
+    def test_json_true_gives_one_raw_json_column(self, api, tmp_path):
+        # The escape hatch for payloads no inference can reconcile: a field that is an object in
+        # one record and an array in the next.
+        api.handlers["/poly"] = lambda n, q: (
+            200,
+            [{"id": 1, "detail": {"a": 1}}, {"id": 2, "detail": [1, 2]}],
+            {},
+        )
+        session = DuckSession.open(
+            [f"poly=api:{api.base}/poly json=true"], session_dir=str(tmp_path / "sess")
+        )
+        try:
+            assert [c.name for c in session.describe("poly").columns] == ["json"]
+            out = session.query(
+                "SELECT json->>'$.id' AS id FROM poly ORDER BY id", name="ids"
+            )
+            assert out["sample"] == [["1"], ["2"]]
+            assert session.sources[0].info["typing"] == "json"
+        finally:
+            session.close()
+
+    def test_conversion_error_over_api_sources_explains_itself(self, api, tmp_path):
+        # DuckDB reports only the value that wouldn't cast. Over api: snapshots that is a long
+        # bisect, so the message names the mechanism and both ways out.
+        api.handlers["/x"] = lambda n, q: (200, _rows(1), {})
+        session = DuckSession.open([f"x=api:{api.base}/x"], session_dir=str(tmp_path / "sess"))
+        try:
+            msg = session._conversion_help(
+                "SELECT * FROM x", ValueError("Could not convert string 'a@b.gov' to INT128")
+            )
+            assert "INFERRED" in msg and "json=true" in msg and "x" in msg
+            # A query that touches no api: source is left exactly as DuckDB wrote it.
+            plain = session._conversion_help("SELECT 1", ValueError("boom"))
+            assert plain == "boom"
+        finally:
+            session.close()
+
+    def test_json_option_must_be_boolean(self):
+        with pytest.raises(ValueError, match="must be a boolean"):
+            parse_api_spec("https://x.test/a json=maybe")
+
+    def test_json_option_parsed(self):
+        assert parse_api_spec("https://x.test/a json=true").json is True
+        assert parse_api_spec("https://x.test/a json=false").json is False
+        assert parse_api_spec("https://x.test/a").json is False

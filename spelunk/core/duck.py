@@ -876,7 +876,8 @@ class DuckSession:
             spec, _values = apifetch.resolve_request(conn, req)
             info = apifetch.fetch_snapshot(spec, dest, apifetch.HostLimiter())
         return self._materialize_fetch(
-            flow, name, dest, info, description, provenance, deps, source_name
+            flow, name, dest, info, description, provenance, deps, source_name,
+            as_json=bool(apifetch.resolved_option(conn, req, "json", False)),
         )
 
     def fetch_steps(self, steps: list[dict], flow: str | None = None) -> dict:
@@ -1072,16 +1073,22 @@ class DuckSession:
         provenance: dict[str, Any],
         deps: list[dict[str, str]],
         source_name: str,
+        *,
+        as_json: bool = False,
     ) -> dict:
-        """Load a fetched NDJSON snapshot into the flow + record its ``fetch`` lineage node."""
-        literal = sources_mod._duck_path(dest)
+        """Load a fetched NDJSON snapshot into the flow + record its ``fetch`` lineage node.
+
+        Reads the snapshot through the same scan an ``api:`` source view uses, so a fetched
+        endpoint and an attached one infer their columns identically — including the inference
+        settings that keep a wide or late-varying payload from failing the load.
+        """
         with self._lock:
             self._con.execute(f'CREATE SCHEMA IF NOT EXISTS "{flow}"')
             self._set_search_path(flow)
             t0 = time.perf_counter()
             self._con.execute(
                 f'CREATE OR REPLACE TABLE "{flow}"."{name}" AS SELECT * FROM '
-                f"read_json_auto('{literal}', format='newline_delimited')"
+                + sources_mod._snapshot_scan(dest, as_json)
             )
             elapsed = time.perf_counter() - t0
             row_count = int(
@@ -1129,7 +1136,7 @@ class DuckSession:
             self._con.execute(f'CREATE SCHEMA IF NOT EXISTS "{flow}"')
             self._set_search_path(flow)
             t0 = time.perf_counter()
-            with self._friendly_catalog_errors(flow):
+            with self._friendly_catalog_errors(flow, sql):
                 self._con.execute(f'CREATE OR REPLACE TABLE "{flow}"."{name}" AS {sql}')
             elapsed = time.perf_counter() - t0
             row_count = int(self._con.execute(f'SELECT COUNT(*) FROM "{flow}"."{name}"').fetchone()[0])
@@ -1190,22 +1197,46 @@ class DuckSession:
             "(reference attached databases as \"<source>\".\"<table>\"; read db://tables to list them)."
         )
 
+    def _conversion_help(self, sql: str, exc: Exception) -> str:
+        """Name the JSON-typing trap behind a conversion error over API-snapshot sources.
+
+        DuckDB reports the *value* that wouldn't cast and not the column, the file, or the reason
+        — "Could not convert string 'x@y.gov' to INT128" — which is a long bisect for anyone who
+        doesn't already know that two JSON snapshots infer their types independently. We can't
+        name the field either, but naming the mechanism is what turns the bisect into a fix.
+        """
+        involved = [s.name for s in self.sources if s.kind == "api" and _references(sql, s.name)]
+        if not involved:
+            return str(exc)
+        return (
+            f"{exc}\nThis query reads API snapshot source(s) {', '.join(involved)}, whose columns "
+            "are INFERRED from each snapshot's own JSON — independently per source. Combining two "
+            "of them (UNION/UNION ALL) can therefore hit a type one side never saw. Either query "
+            "them separately, or re-add the source(s) with json=true to get one raw JSON column "
+            "and pick fields out with json_extract / ->> instead of inferred types."
+        )
+
     @contextmanager
-    def _friendly_catalog_errors(self, flow: str):
+    def _friendly_catalog_errors(self, flow: str, sql: str = ""):
         """Rewrite a DuckDB CatalogException (unknown table/source) into an actionable
         ``ValueError`` listing the flow's results and configured sources — shared by
-        ``query`` / ``profile`` / ``export`` so all three fail the same helpful way."""
+        ``query`` / ``profile`` / ``export`` so all three fail the same helpful way.
+
+        A ConversionException over an ``api:`` source gets the same treatment for the same
+        reason: the raw DuckDB message names a value and nothing else."""
         try:
             yield
         except duckdb.CatalogException as exc:
             raise ValueError(self._catalog_help(flow, exc)) from exc
+        except duckdb.ConversionException as exc:
+            raise ValueError(self._conversion_help(sql, exc)) from exc
 
     # ------------------------------------------------------------------ profile ------- #
     def profile(self, sql: str, flow: str | None = None) -> dict:
         """Per-column stats over the full result of *sql*, computed in DuckDB."""
         flow = self._resolve_flow(flow)
         guard.assert_read_only(sql, "duckdb")
-        with self._lock, self._friendly_catalog_errors(flow):
+        with self._lock, self._friendly_catalog_errors(flow, sql):
             self._con.execute(f'CREATE SCHEMA IF NOT EXISTS "{flow}"')
             self._set_search_path(flow)
             t0 = time.perf_counter()
@@ -1287,7 +1318,7 @@ class DuckSession:
         else:
             source_expr = _quote_qualified(target)
 
-        with self._lock, self._friendly_catalog_errors(flow):
+        with self._lock, self._friendly_catalog_errors(flow, source_expr):
             self._con.execute(f'CREATE SCHEMA IF NOT EXISTS "{flow}"')
             self._set_search_path(flow)
             self._con.execute(f"COPY {source_expr} TO '{safe_path}' {copy_opts[fmt]}")
@@ -1707,7 +1738,7 @@ class DuckSession:
                     rc = self._con.execute(f'SELECT COUNT(*) FROM "{target}"."{nm}"').fetchone()[0]
                     preserved.append({"name": nm, "kind": "fetch", "row_count": int(rc)})
                     continue
-                with self._friendly_catalog_errors(target):
+                with self._friendly_catalog_errors(target, node["sql"]):
                     self._con.execute(
                         f'CREATE OR REPLACE TABLE "{target}"."{nm}" AS {node["sql"]}'
                     )
@@ -1827,6 +1858,24 @@ class DuckSession:
             return int(self._con.execute(f"SELECT COUNT(*) FROM {ref}").fetchone()[0])
         except duckdb.Error:
             return None
+
+
+def _references(sql: str, name: str) -> bool:
+    """Whether *sql* reads a table/view called *name* (case-insensitive).
+
+    Used only to decide whether an error message is worth enriching, so an unparseable query
+    falls back to a word-boundary match rather than giving up: a missed hint is worse than an
+    occasional one aimed at a name that appeared in a string literal.
+    """
+    import sqlglot
+    from sqlglot import exp
+    from sqlglot.errors import SqlglotError
+
+    try:
+        tree = sqlglot.parse_one(sql, read="duckdb")
+    except SqlglotError:
+        return re.search(rf"\b{re.escape(name)}\b", sql, re.IGNORECASE) is not None
+    return any(t.name.lower() == name.lower() for t in tree.find_all(exp.Table))
 
 
 def _is_unfiltered_star(sql: str) -> bool:

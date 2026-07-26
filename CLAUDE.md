@@ -51,6 +51,15 @@ spelunk/core/
                  #   snapshot under <workspace>/snapshots/, view over the snapshot — queries never
                  #   re-fetch; refresh = re-attach), openapi: (the WHOLE API — catalog view +
                  #   Source.connection, an ApiConnection the `fetch` tool calls any endpoint of).
+                 #   Every JSON snapshot (api: view, openapi: catalog, and fetch results via
+                 #   _snapshot_scan) is read with _JSON_SNAPSHOT_OPTS = sample_size=-1 +
+                 #   map_inference_threshold=-1: DuckDB's sampled defaults otherwise infer from
+                 #   the first 20480 rows (a field first appearing later kills the scan with
+                 #   `unknown key`) and type a >200-key object as MAP(VARCHAR,<one type>) (which
+                 #   can't hold mixed values, and won't union with the STRUCT a sibling snapshot
+                 #   inferred — the `Could not convert string 'x@y.gov' to INT128` trap). Both
+                 #   cost nothing measurable on a local file. json=true opts a snapshot out of
+                 #   inference entirely (one raw JSON column) for genuinely polymorphic payloads.
                  #   DuckDB-only — a source it can't attach (e.g.
                  #   SQL Server) is rejected, not bridged. DSNs are parsed with stdlib urllib (no
                  #   SQLAlchemy dep).
@@ -63,7 +72,13 @@ spelunk/core/
                  #   $filter/$select via sqlglot — untranslatable SQL errors loudly, never
                  #   silently fetches everything; options tokenized shell-style so quoted
                  #   values may contain spaces),
-                 #   max_pages/max_rows caps. Auth: auth_env=<ENV> (Bearer), header=<Name>:<ENV>
+                 #   max_pages/max_rows caps. EVERY paging param NAME is configurable —
+                 #   page_param/offset_param/size_param/page_size/start/cursor_param/cursor_path/
+                 #   keyset_field — so page/offset/limit are conventions, not requirements, and an
+                 #   API with its own vocabulary (startIndex/resultsPerPage, startAt/maxResults)
+                 #   is one source, not N hand-paged ones. Sending an unrecognized paging param
+                 #   isn't always harmless: some APIs reject the request outright.
+                 #   Auth: auth_env=<ENV> (Bearer), header=<Name>:<ENV>
                  #   (any header, e.g. X-Api-Key), param=<name>:<ENV> (query-param keys) — specs
                  #   carry env var NAMES, never values; injected values are scrubbed from error
                  #   messages ($ENV placeholder). Retries 429/5xx with
@@ -85,7 +100,12 @@ spelunk/core/
   openapi.py     # openapi:<url-or-path> -> queryable ENDPOINT CATALOG (one row per path+method
                  #   — method LOWERCASE, matching the document's own keys): params (with the
                  #   EFFECTIVE style/explode, which decides list-param serialization), auth shape
-                 #   mapped onto auth_env=/header=/param=, pagination/records hints,
+                 #   mapped onto auth_env=/header=/param=, pagination/records hints (when no
+                 #   paging CONVENTION matches, pagination_hint still names the paging-shaped
+                 #   params the endpoint declares — "unknown; endpoint declares startIndex,
+                 #   resultsPerPage — set …" — because the vocabulary list can never be complete
+                 #   and going silent is what pushes an agent into hand-paging; named as a hint,
+                 #   never guessed into suggested_spec),
                  #   response_fields (what the endpoint RETURNS — {name,type} structs flattened 2
                  #   levels: a.b for nested objects, a[].b for arrays of objects — so an agent can
                  #   find an endpoint by the data it carries, not just its URL), and a paste-ready
@@ -180,8 +200,10 @@ shared by the resources; treat changes as barrier-level.
 python -m spelunk.mcp.server --source sales=./data/sales.parquet --source sqlite:///app.db --session-dir .spelunk_session
 ```
 
-`--source` is repeatable and auto-detects by extension/scheme (`name=` prefix sets the catalog/view
-name). Optional guards: `--memory-limit`, `--temp-dir`, `--max-temp-size`. `--dsn` is a back-compat
+`--source` is repeatable and auto-detects by extension/scheme (a `<your-name>=` prefix sets the
+catalog/view name — the word before the `=` IS the name, e.g. `sales=`; writing the placeholder
+literally as `name=sales <locator>` parses as the name `name` plus an unclassifiable locator, and
+`detect_kind` says so rather than blaming the locator). Optional guards: `--memory-limit`, `--temp-dir`, `--max-temp-size`. `--dsn` is a back-compat
 alias for one `--source`. A `.mcp.json` wires Claude Code to a local source (paths are
 machine-specific; edit before use).
 

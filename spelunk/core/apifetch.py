@@ -46,7 +46,18 @@ Options (whitespace-separated ``key=value`` after the URL; unknown keys are reje
                  NB: ``$filter`` values contain spaces — percent-encode them in the URL
                  (``$filter=Amount%20gt%20100``), since spec options split on whitespace.
 * ``page_param`` / ``start`` / ``size_param`` / ``page_size`` / ``offset_param`` /
-  ``cursor_param`` / ``cursor_path`` / ``keyset_field`` — style knobs, above.
+  ``cursor_param`` / ``cursor_path`` / ``keyset_field`` — style knobs, above. **The defaults
+  (``page``/``offset``/``limit``) are conventions, not requirements: every paging param name is
+  yours to set**, so an API that pages with its own vocabulary needs no special support —
+  ``paginate=offset offset_param=startIndex size_param=resultsPerPage`` and
+  ``paginate=offset offset_param=startAt size_param=maxResults`` are the same feature. Sending a
+  paging param an API does not recognize is not always harmless (some reject the request
+  outright), so set these rather than letting the defaults ride.
+* ``json=true`` — type the snapshot as ONE raw ``json`` column instead of inferring columns from
+  the records. The escape hatch for genuinely polymorphic payloads (a field that is an object in
+  some records and an array in others has no inferred type to find); query it with
+  ``json_extract`` / ``->>``. Inference handles ordinary variation on its own — see
+  ``_JSON_SNAPSHOT_OPTS`` in ``sources.py`` — so reach for this only after a scan actually fails.
 * ``max_pages=<n>`` — hard cap on requests (default 20). ``max_rows=<n>`` — optional row cap.
 * ``auth_env=<ENV_VAR>`` — send ``Authorization: Bearer $ENV_VAR``. The spec carries the env
   var *name*, never the token, so specs stay safe to log and echo.
@@ -121,6 +132,9 @@ _MAX_BACKOFF_SECONDS = 30.0
 _USER_AGENT = "spelunk-api-source (github.com/shaunak2512/spelunk)"
 
 _INT_OPTIONS = frozenset({"start", "page_size", "max_pages", "max_rows"})
+_BOOL_OPTIONS = frozenset({"json"})
+_TRUTHY = {"true", "1", "yes", "on"}
+_FALSY = {"false", "0", "no", "off"}
 
 _LINK_NEXT_RE = re.compile(r'<([^>]+)>\s*;[^,]*\brel="?next"?')
 
@@ -161,6 +175,10 @@ class ApiSpec:
     # supported: filter="Freight > 500 AND ShipCountry = 'Germany'".
     filter: str | None = None
     select: str | None = None
+    # Type the snapshot as one raw JSON column instead of inferring columns from the records.
+    # A *typing* option rather than a fetch option — it changes nothing about the request — but
+    # it rides the same grammar because it is a property of the endpoint's payload shape.
+    json: bool = False
     # (header name, ENV var) / (query param, ENV var) pairs from repeatable header=/param=
     # options — values are resolved from the environment at fetch time, never stored.
     extra_headers: list[tuple[str, str]] = field(default_factory=list)
@@ -219,6 +237,12 @@ def parse_api_spec(text: str) -> ApiSpec:
                 options[key] = int(value)
             except ValueError:
                 raise ValueError(f"api: option {key} must be an integer, got {value!r}.") from None
+        elif key in _BOOL_OPTIONS:
+            if value.lower() not in _TRUTHY | _FALSY:
+                raise ValueError(
+                    f"api: option {key} must be a boolean (true/false), got {value!r}."
+                )
+            options[key] = value.lower() in _TRUTHY
         else:
             options[key] = value
     spec = ApiSpec(url=url, extra_headers=extra_headers, url_params=url_params, **options)
@@ -542,6 +566,19 @@ def resolve_request(
         **options,
     )
     return _validated(spec), path_values
+
+
+def resolved_option(conn: ApiConnection, req: ApiRequest, key: str, default: Any = None) -> Any:
+    """One fetch option resolved across the layers :func:`resolve_request` merges.
+
+    Same precedence — the call's own options, then the catalog's per-endpoint hints, then the
+    connection's defaults — for a caller that needs an option's effective value *without* an
+    :class:`ApiSpec` in hand (a fan-out resolves one spec per row, not one per call).
+    """
+    for layer in (req.options, req.hints, conn.defaults):
+        if layer.get(key) is not None:
+            return layer[key]
+    return default
 
 
 class HostLimiter:

@@ -69,6 +69,21 @@ class TestDetectKind:
         with pytest.raises(ValueError, match="format prefix"):
             sources.build_source("https://host/data/mystery.dat")
 
+    def test_literal_name_prefix_is_explained(self):
+        # `name=<n> <locator>` — writing the prefix placeholder literally — parses as the name
+        # 'name' plus an unclassifiable locator. The error has to say so, or it reads as "this
+        # URL is unsupported" and the fix (nvd=api:...) stays invisible.
+        with pytest.raises(ValueError) as excinfo:
+            sources.build_source("name=nvd api:https://services.nvd.nist.gov/rest/json/cves/2.0")
+        msg = str(excinfo.value)
+        assert "nvd=api:https://services.nvd.nist.gov/rest/json/cves/2.0" in msg
+        assert "not the literal word 'name'" in msg
+
+    def test_stripped_name_reported_on_unknown_locator(self):
+        # Any consumed prefix is named when detection fails, so the split is never a mystery.
+        with pytest.raises(ValueError, match="taken as the source name"):
+            sources.build_source("mydata=mystery.xyz")
+
     def test_sql_server_unsupported(self):
         # DuckDB can't attach SQL Server; it's rejected with a clear message (no fallback).
         with pytest.raises(ValueError, match="SQL Server sources are not supported"):

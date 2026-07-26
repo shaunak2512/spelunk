@@ -241,6 +241,58 @@ class TestEndpointRows:
         assert "offset_param=$skip" in row["suggested_spec"]
         assert "size_param=$top" in row["suggested_spec"]
 
+    def test_unrecognized_paging_vocabulary_names_the_candidates(self):
+        # No convention matches (startIndex/resultsPerPage is one house style among many, and
+        # the list of styles has no end). Reporting nothing here is what pushes an agent into
+        # hand-paging N sources, so the hint names the params the document itself declares.
+        spec = {
+            "openapi": "3.0.0",
+            "servers": [{"url": "https://svc.test"}],
+            "paths": {
+                "/cves": {
+                    "get": {
+                        "parameters": [
+                            {"name": "startIndex", "in": "query", "schema": {"type": "integer"}},
+                            {
+                                "name": "resultsPerPage",
+                                "in": "query",
+                                "schema": {"type": "integer"},
+                            },
+                            {"name": "keyword", "in": "query", "schema": {"type": "string"}},
+                        ],
+                        "responses": {},
+                    }
+                }
+            },
+        }
+        row = openapi.endpoint_rows(spec, "s.json")[0]
+        assert row["pagination_hint"] == (
+            "unknown; endpoint declares resultsPerPage, startIndex — set the matching "
+            "paginate=/offset_param=/size_param= yourself"
+        )
+        # Named, never guessed: a paging param the API doesn't recognize can fail the request,
+        # so the paste-ready spec stays free of pagination.
+        assert "paginate" not in row["suggested_spec"]
+
+    def test_no_paging_params_hints_nothing(self):
+        # A detail endpoint must not acquire a pagination hint out of an unrelated param.
+        spec = {
+            "openapi": "3.0.0",
+            "servers": [{"url": "https://svc.test"}],
+            "paths": {
+                "/thing/{id}": {
+                    "get": {
+                        "parameters": [
+                            {"name": "id", "in": "path", "schema": {"type": "string"}},
+                            {"name": "language", "in": "query", "schema": {"type": "string"}},
+                        ],
+                        "responses": {},
+                    }
+                }
+            },
+        }
+        assert openapi.endpoint_rows(spec, "s.json")[0]["pagination_hint"] is None
+
 
 # A second spec aimed at response_fields: allOf composition, nesting past the depth cap,
 # arrays of objects vs arrays of scalars, a bare {} property, and the envelope-vs-record test.

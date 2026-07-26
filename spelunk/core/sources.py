@@ -29,7 +29,8 @@ Everything reachable is reached through the one DuckDB connection — there is n
 fallback. A source DuckDB can't attach (e.g. SQL Server) is not supported; export it to a file
 (Parquet/CSV) and point a ``--source`` at that instead.
 
-A spec is a string, optionally prefixed ``name=``::
+A spec is a string, optionally prefixed with ``<your-chosen-name>=`` (the word before the ``=``
+is the name itself — ``nvd=api:…``, never the literal token ``name=``)::
 
     sales=./data/sales.parquet
     remote=https://example.com/data/sales.parquet
@@ -106,6 +107,21 @@ _FORMAT_PREFIX: dict[str, str] = {
     "excel": ".xlsx",
     "avro": ".avro",
 }
+
+# Read options for a JSON snapshot we wrote ourselves (an ``api:`` fetch, the ``openapi:``
+# catalog). Both DuckDB defaults being overridden here are *sampling* heuristics that turn into
+# hard cast errors later, far from the attach that caused them:
+#   * ``sample_size`` caps type inference at the first 20480 rows, so a field whose type first
+#     varies past that point breaks the scan mid-query.
+#   * ``map_inference_threshold`` silently types a wide object as MAP(VARCHAR, <one value type>).
+#     A MAP has ONE value type, so a key holding a string in a record whose siblings hold numbers
+#     is unrepresentable, and two snapshots that infer different value types cannot be reconciled
+#     at all — this is the source of the notorious
+#     ``Could not convert string 'x@y.gov' to INT128`` on a UNION of two API snapshots. A STRUCT
+#     reconciles by field name and keeps each field's own type, so we always prefer one.
+# Both are cheap to disable on a local file we just wrote (no measurable cost on a 28MB/6k-row
+# snapshot) and buy correctness that the sampled defaults only approximate.
+_JSON_SNAPSHOT_OPTS = "format='newline_delimited', sample_size=-1, map_inference_threshold=-1"
 
 # Remote-path schemes reachable through a DuckDB filesystem extension, mapped to the extension
 # that provides them. httpfs covers http(s)/S3/GCS/R2; azure covers Azure Blob / ADLS.
@@ -190,11 +206,37 @@ def _split_format_prefix(locator: str) -> tuple[str | None, str]:
     return None, locator
 
 
-def detect_kind(locator: str, forced_ext: str | None = None) -> SourceKind:
+def _prefix_help(stripped_name: str | None, locator: str) -> str:
+    """Explain a consumed ``<name>=`` prefix when the rest of the spec won't classify.
+
+    The common miss is writing the placeholder literally — ``name=nvd api:<url>`` — which parses
+    as the name ``name`` and the locator ``nvd api:<url>``. That is worth naming outright, since
+    the resulting error otherwise points at the URL, which was never the problem.
+    """
+    if stripped_name is None:
+        return ""
+    head, sep, rest = locator.partition(" ")
+    if sep and _NAME_RE.match(head) and rest.strip():
+        return (
+            f"The spec was read as source name {stripped_name!r} plus locator {locator!r} — the "
+            f"prefix is the name YOU choose, not the literal word 'name': write "
+            f"'{head}={rest.strip()}'. "
+        )
+    return f"({stripped_name!r} was taken as the source name, from its '=' prefix.) "
+
+
+def detect_kind(
+    locator: str, forced_ext: str | None = None, *, stripped_name: str | None = None
+) -> SourceKind:
     """Classify a locator into a :data:`SourceKind` by scheme/extension.
 
     ``forced_ext`` (the canonical extension from a ``csv:``/``json:``/... format prefix) pins the
     locator to a ``file`` source regardless of its own extension.
+
+    ``stripped_name`` is the ``<name>=`` prefix the caller already removed; it is used only to
+    explain the split when detection fails. Without it, writing the prefix literally
+    (``name=nvd api:https://…``) reports an unclassifiable locator of ``nvd api:https://…`` and
+    never reveals that a name was consumed — which reads as "the API URL is unsupported".
     """
     if forced_ext is not None:
         return "file"
@@ -226,7 +268,9 @@ def detect_kind(locator: str, forced_ext: str | None = None) -> SourceKind:
     if ext in _SQLITE_EXTS:
         return "sqlite"
     raise ValueError(
-        f"Could not determine the source type of {locator!r}. If it is a data file with an "
+        f"Could not determine the source type of {locator!r}. "
+        + _prefix_help(stripped_name, locator)
+        + "If it is a data file with an "
         "unrecognized or absent extension (a .dat dump, an extensionless API URL), force the "
         f"reader with a format prefix — csv:/tsv:/json:/parquet:/excel:/avro: — e.g. csv:{locator}. "
         "Recognized extensions: "
@@ -245,7 +289,7 @@ def build_source(spec: str, *, snapshot_dir: str | None = None) -> Source:
     """
     explicit, locator = parse_spec(spec)
     forced_ext, locator = _split_format_prefix(locator)
-    kind = detect_kind(locator, forced_ext=forced_ext)
+    kind = detect_kind(locator, forced_ext=forced_ext, stripped_name=explicit)
     name = explicit or _derive_name(locator, kind)
     if not _NAME_RE.match(name):
         raise ValueError(
@@ -370,10 +414,26 @@ def _build_api_source(name: str, locator: str, snapshot_dir: str | None) -> Sour
     dest = os.path.join(snapshot_dir, f"{name}.ndjson")
     info = apifetch.fetch_snapshot(spec, dest)
     setup = [
-        f'CREATE OR REPLACE VIEW main."{name}" AS SELECT * FROM '
-        f"read_json_auto('{_duck_path(dest)}', format='newline_delimited')"
+        f'CREATE OR REPLACE VIEW main."{name}" AS SELECT * FROM {_snapshot_scan(dest, spec.json)}'
     ]
+    if spec.json:
+        info = {**info, "typing": "json"}
     return Source(name=name, kind="api", locator=locator, setup_sql=setup, info=info)
+
+
+def _snapshot_scan(dest: str, as_json: bool = False) -> str:
+    """The scan expression for an NDJSON snapshot — inferred columns, or one raw JSON column.
+
+    ``as_json`` (the ``json=true`` spec option) is the escape hatch for an API whose records are
+    genuinely polymorphic — a field that is an object in some records and an array in others has
+    no single inferred type, and no inference setting can conjure one. The view then has a single
+    ``json`` column to pick apart with ``json_extract`` / ``->>``, which is exactly what a caller
+    would otherwise hand-roll with ``to_json(...)::VARCHAR`` after the scan has already failed.
+    """
+    path = _duck_path(dest)
+    if as_json:
+        return f"read_ndjson_objects('{path}')"
+    return f"read_json_auto('{path}', {_JSON_SNAPSHOT_OPTS})"
 
 
 def _build_openapi_source(name: str, locator: str, snapshot_dir: str | None) -> Source:
@@ -409,10 +469,7 @@ def _build_openapi_source(name: str, locator: str, snapshot_dir: str | None) -> 
         for row in rows:
             fh.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
     os.replace(tmp, dest)
-    setup = [
-        f'CREATE OR REPLACE VIEW main."{name}" AS SELECT * FROM '
-        f"read_json_auto('{_duck_path(dest)}', format='newline_delimited')"
-    ]
+    setup = [f'CREATE OR REPLACE VIEW main."{name}" AS SELECT * FROM {_snapshot_scan(dest)}']
     base_url = openapi_mod.base_url_of(spec, inner)
     connection = apifetch.parse_connection(base_url, option_tokens)
     info = openapi_mod.catalog_info(inner, rows)

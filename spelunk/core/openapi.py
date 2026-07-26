@@ -11,7 +11,11 @@ an ``api:`` source:
   which is what decides whether a list param serializes as ``a,b`` or ``k=a&k=b``.
 * ``auth`` — the auth shape, mapped from ``securitySchemes`` onto the ``auth_env=`` /
   ``header=`` / ``param=`` options.
-* ``pagination_hint`` — heuristic over query param names.
+* ``pagination_hint`` — heuristic over query param names. When no convention is recognized but
+  the endpoint does declare paging-shaped params, the hint names them
+  (``unknown; endpoint declares startIndex, resultsPerPage — set the matching
+  paginate=/offset_param=/size_param= yourself``) instead of reporting nothing: the param names
+  are the one thing the document always knows and the naming conventions are endless.
 * ``records_hint`` — dot path to the records array in the 200-response schema (one nested
   level, ``$ref``-resolved). NULL for a detail endpoint whose response *is* the record.
 * ``response_fields`` — **what the endpoint returns**: the record's declared fields as
@@ -240,6 +244,13 @@ def _auth_of(spec: dict, op: dict) -> tuple[str, str | None]:
 # Query-param names that reveal the pagination style. Order matters: an API with both
 # page and limit params is page-style.
 _CURSORISH = ("cursor", "starting_after", "since_id", "after", "page_token", "next_token")
+# Substrings that make a query param *look* like it participates in paging. Deliberately broad
+# and used only to name candidates in a hint — never to configure a fetch — so a false positive
+# costs the agent a glance and a false negative costs it a silent page-1-only fetch.
+_PAGINGISH = (
+    "page", "offset", "skip", "start", "limit", "size", "count",
+    "per", "max", "result", "row", "top", "cursor", "token", "after", "from",
+)
 
 
 def _pagination_of(params: list[dict]) -> tuple[str | None, str | None]:
@@ -265,6 +276,20 @@ def _pagination_of(params: list[dict]) -> tuple[str | None, str | None]:
         # Cursor/keyset needs response-side knowledge (cursor_path / keyset_field) the spec
         # doesn't declare reliably — hint it, don't guess it into the suggested spec.
         return f"cursor-param:{cursor}", None
+    # No convention matched. The vocabulary above can never be complete — startIndex/
+    # resultsPerPage, startAt/maxResults, from/size are all somebody's house style — so rather
+    # than going silent exactly where the agent needs the most help, report the paging-shaped
+    # params this endpoint actually declares and let it set offset_param=/size_param= itself.
+    # Reported, never guessed into suggested_spec: a wrong paging param is not always ignored,
+    # and some APIs reject the whole request over one they don't recognize.
+    candidates = [orig for low, orig in qnames.items() if any(w in low for w in _PAGINGISH)]
+    if candidates:
+        return (
+            "unknown; endpoint declares "
+            + ", ".join(sorted(candidates))
+            + " — set the matching paginate=/offset_param=/size_param= yourself",
+            None,
+        )
     return None, None
 
 
