@@ -242,7 +242,7 @@ def _run_openapi_loop(session: DuckSession) -> int:
         print(f"[{'OK ' if ok else 'ERR'}] openapi: catalog attached: {n} endpoints")
         # Agent move: find an endpoint by SQL, take its ready-made spec, fill in the env var.
         row = session.query(
-            "SELECT suggested_spec FROM tmdb_api WHERE method = 'GET' "
+            "SELECT suggested_spec FROM tmdb_api WHERE method = 'get' "
             "AND path = '/3/movie/top_rated'",
             name="pick",
         )["sample"]

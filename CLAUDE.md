@@ -65,11 +65,18 @@ spelunk/core/
                  #   a 404 mid-pagination = end-of-data (TVMaze-style), on page 1 = error;
                  #   fetch fingerprint (url/fetched_at/pages/row_count) returned as Source.info.
                  #   Live smoke-check: tests/live_api_check.py (manual; hits real public APIs).
-  openapi.py     # openapi:<url-or-path> -> queryable ENDPOINT CATALOG (one row per path+method:
-                 #   params, auth shape mapped onto auth_env=/header=/param=, pagination/records
-                 #   hints, and a paste-ready suggested_spec api: string for GETs with <SET_ME>
-                 #   where the credential env var name goes). Guidance-as-data: the agent SQL-
-                 #   queries the catalog, fills <SET_ME>, feeds suggested_spec to add_source.
+  openapi.py     # openapi:<url-or-path> -> queryable ENDPOINT CATALOG (one row per path+method
+                 #   — method LOWERCASE, matching the document's own keys): params (with the
+                 #   EFFECTIVE style/explode, which decides list-param serialization), auth shape
+                 #   mapped onto auth_env=/header=/param=, pagination/records hints,
+                 #   response_fields (what the endpoint RETURNS — {name,type} structs flattened 2
+                 #   levels: a.b for nested objects, a[].b for arrays of objects — so an agent can
+                 #   find an endpoint by the data it carries, not just its URL), and a paste-ready
+                 #   suggested_spec api: string for GETs with <SET_ME> where the credential env
+                 #   var name goes. records_hint uses an ENVELOPE test (conventional wrapper key,
+                 #   else a small object with one array beside scalars) — first-array-wins called
+                 #   TMDB's /movie/{id} a list of genres. Guidance-as-data: the agent SQL-queries
+                 #   the catalog, fills <SET_ME>, feeds suggested_spec to add_source.
                  #   OpenAPI 3.x JSON only (YAML/Swagger2 rejected with conversion pointers).
   guard.py       # sqlglot AST safety: assert_read_only(), enforce_limit() — called dialect="duckdb"
   types.py       # FROZEN contracts: TableInfo, TableDescription, ColumnInfo, errors
