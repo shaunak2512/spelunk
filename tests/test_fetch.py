@@ -130,6 +130,27 @@ class TestConnection:
         with pytest.raises(ValueError, match="Unknown connection option"):
             _attach(session, "bogus=1")
 
+    def test_bool_default_is_coerced_not_left_a_string(self, session):
+        """`json=false` must be False — the string "false" is truthy and would flip typing ON."""
+        _attach(session, "json=false")
+        conn = next(s for s in session.sources if s.name == "mock").connection
+        assert conn.defaults == {"json": False}
+        req = apifetch.ApiRequest(path="/movies")
+        assert apifetch.resolved_option(conn, req, "json", False) is False
+
+    def test_bool_default_true_is_coerced(self, session):
+        _attach(session, "json=true")
+        conn = next(s for s in session.sources if s.name == "mock").connection
+        assert conn.defaults == {"json": True}
+
+    def test_non_boolean_bool_default_rejected_at_attach(self, session):
+        with pytest.raises(ValueError, match="must be a boolean"):
+            _attach(session, "json=banana")
+
+    def test_non_integer_int_default_rejected_at_attach(self, session):
+        with pytest.raises(ValueError, match="must be an integer"):
+            _attach(session, "max_pages=lots")
+
 
 # --------------------------------------------------------------------------- #
 # fetch — the single-request path
@@ -294,6 +315,21 @@ class TestPathSafety:
         assert api.calls[0]["path"] == "/movies/a%2F..%2Fadmin%3Fx%3D1"
         assert api.calls[0]["query"] == {}
 
+    def test_query_string_placeholder_refused(self, session, api):  # noqa: F811
+        """Nothing substitutes a `{name}` after the `?` — it would go on the wire literally."""
+        _attach(session)
+        with pytest.raises(ValueError, match="templates query param"):
+            session.fetch(source="mock", path="/movies?language={lang}", name="x",
+                          params={"lang": "en-US"})
+        assert api.calls == []
+
+    def test_query_string_placeholder_error_names_the_query_key(self, session):
+        """The fix is params={"language": ...} — the placeholder's own name would be wrong."""
+        _attach(session)
+        with pytest.raises(ValueError, match=r'params=\{"language"'):
+            session.fetch(source="mock", path="/movies/{movie_id}?language={lang}", name="x",
+                          params={"movie_id": 1, "lang": "en"})
+
     def test_uncatalogued_path_is_still_fetched(self, session, api):  # noqa: F811
         """The spec establishes the connection, not the reachable surface — specs go stale."""
         api.handlers["/undocumented"] = lambda n, q: (200, [{"id": 1}], {})
@@ -389,6 +425,13 @@ class TestFanOut:
                             rows_from="pairs")
         assert out["row_count"] == 2
         assert {"_key_country", "_key_studio"} <= {c["name"] for c in out["columns"]}
+
+    def test_key_columns_are_exactly_the_stamped_columns(self, session, api):  # noqa: F811
+        """`key_columns` is the join contract — it must never name a column no row carries."""
+        self._prep(session, api)
+        out = session.fetch(source="mock", path="/movies/{movie_id}", name="d", rows_from="ids")
+        columns = {c["name"] for c in out["columns"]}
+        assert set(out["info"]["key_columns"]) <= columns
 
     def test_404_is_data_not_an_error(self, session, api):  # noqa: F811
         self._prep(session, api, ids=(1, 2))

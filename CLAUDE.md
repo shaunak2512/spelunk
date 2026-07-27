@@ -92,7 +92,10 @@ spelunk/core/
                  #   conn.params < call params; pagination-managed and credential-named params
                  #   are RESERVED (error, never a silent override); {placeholder}s consume their
                  #   param and are percent-encoded as single segments (a bound value can't
-                 #   redirect the request). fetch_fanout() = one URL per prep-query row through a
+                 #   redirect the request) — PATH SEGMENTS ONLY: one in the query string
+                 #   (?language={lang}) is refused, since nothing substitutes it and it would
+                 #   otherwise reach the API as the literal %7Blang%7D.
+                 #   fetch_fanout() = one URL per prep-query row through a
                  #   thread pool sharing one HostLimiter (a 429 backs off every worker),
                  #   _key_<placeholder> stamped for the join back, per-entity 404 = data
                  #   (skipped + reported), 401/other = abort. max_urls is a HARD ERROR.

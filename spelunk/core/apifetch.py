@@ -94,8 +94,9 @@ same machinery is also driven from two halves:
 produces, so pagination, retries, auth and record extraction have exactly one implementation.
 Params are layered — the query string inside ``path``, then the connection's defaults, then the
 call's own — while pagination-managed and credential param names are *reserved* (passing one is
-an error, not a silent override). ``{placeholder}``s in the path are filled from params and
-percent-encoded as single segments, so a bound value can never redirect the request.
+an error, not a silent override). ``{placeholder}``s in the path's *segments* are filled from
+params and percent-encoded, so a bound value can never redirect the request; one in the query
+string is refused, since nothing would substitute it.
 
 :func:`fetch_fanout` is the list→detail primitive: one URL per row of a prep query, fetched
 through a small thread pool sharing one :class:`HostLimiter` so a 429 backs every worker off
@@ -232,21 +233,29 @@ def parse_api_spec(text: str) -> ApiSpec:
             raise ValueError(
                 f"Unknown api: option {key!r}. Valid options: {_VALID_OPTION_HELP}."
             )
-        if key in _INT_OPTIONS:
-            try:
-                options[key] = int(value)
-            except ValueError:
-                raise ValueError(f"api: option {key} must be an integer, got {value!r}.") from None
-        elif key in _BOOL_OPTIONS:
-            if value.lower() not in _TRUTHY | _FALSY:
-                raise ValueError(
-                    f"api: option {key} must be a boolean (true/false), got {value!r}."
-                )
-            options[key] = value.lower() in _TRUTHY
-        else:
-            options[key] = value
+        options[key] = _coerce_option(key, value)
     spec = ApiSpec(url=url, extra_headers=extra_headers, url_params=url_params, **options)
     return _validated(spec)
+
+
+def _coerce_option(key: str, value: str) -> Any:
+    """One ``key=value`` option's string coerced to the type :class:`ApiSpec` declares.
+
+    Shared by both grammars that build options from text — the ``api:`` locator and a
+    connection's defaults — because a default that survives as the wrong *type* is worse than
+    a rejected one: a string ``"false"`` is truthy, so a connection-wide ``json=false`` would
+    have switched raw-JSON typing ON for every fetch that inherited it.
+    """
+    if key in _INT_OPTIONS:
+        try:
+            return int(value)
+        except ValueError:
+            raise ValueError(f"api: option {key} must be an integer, got {value!r}.") from None
+    if key in _BOOL_OPTIONS:
+        if value.lower() not in _TRUTHY | _FALSY:
+            raise ValueError(f"api: option {key} must be a boolean (true/false), got {value!r}.")
+        return value.lower() in _TRUTHY
+    return value
 
 
 def _validated(spec: ApiSpec) -> ApiSpec:
@@ -350,9 +359,11 @@ class ApiConnection:
 class ApiRequest:
     """One endpoint call against an :class:`ApiConnection`: a path, params, and fetch options.
 
-    ``path`` is relative to the connection's base URL and may contain ``{placeholder}``s, each
-    filled from ``params`` (percent-encoded as a single path segment) or, for a fan-out, bound
-    per row. ``param_styles`` maps a param name to its ``(style, explode)`` from the endpoint
+    ``path`` is relative to the connection's base URL and its *segments* may contain
+    ``{placeholder}``s, each filled from ``params`` (percent-encoded as a single path segment)
+    or, for a fan-out, bound per row. A placeholder in the query string is an error, not a
+    substitution — query params are passed by name. ``param_styles`` maps a param name to its
+    ``(style, explode)`` from the endpoint
     catalog, which is what decides whether a list serializes as ``a,b`` or ``k=a&k=b``.
     """
 
@@ -411,7 +422,7 @@ def parse_connection(base_url: str, tokens: list[str]) -> ApiConnection:
                 f"Unknown connection option {key!r}. Valid options: {_VALID_OPTION_HELP}, "
                 "default_param."
             )
-        conn.defaults[key] = int(value) if key in _INT_OPTIONS else value
+        conn.defaults[key] = _coerce_option(key, value)
     # Fail at attach time on a nonsense default rather than on the first fetch that inherits it.
     _validated(ApiSpec(url=conn.base_url, **conn.defaults))
     return conn
@@ -513,6 +524,25 @@ def resolve_request(
         raise ValueError(f"fetch path may not contain '..' segments, got {req.path!r}.")
 
     path_part, _, inline_query = path.partition("?")
+    # Placeholders are a PATH-segment feature: only path_part is templated below, so a
+    # `{name}` in the query string would otherwise travel to the API percent-encoded as the
+    # literal `%7Bname%7D` — and, if the caller also passed it, alongside a second param under
+    # the placeholder's own name. Both requests look fine and neither is the one asked for, so
+    # refuse rather than send it.
+    stray = [
+        (key, _PLACEHOLDER_RE.findall(value))
+        for key, value in parse_qsl(inline_query, keep_blank_values=True)
+        if _PLACEHOLDER_RE.search(value)
+    ]
+    if stray:
+        # Name the QUERY KEY in the fix, not the placeholder: `?language={lang}` wants
+        # params={"language": ...}, and suggesting {"lang": ...} would send the wrong param.
+        raise ValueError(
+            f"path {req.path!r} templates query param(s) {sorted(k for k, _ in stray)} with "
+            f"{{placeholder}}(s) {sorted({p for _, ps in stray for p in ps})}, which are only "
+            'substituted in path segments. Pass the value by param name instead: path="'
+            + path_part + '", params={"' + stray[0][0] + '": ...}.'
+        )
     merged: dict[str, Any] = {}
     for key, value in parse_qsl(inline_query, keep_blank_values=True):
         merged[key] = value
@@ -764,7 +794,9 @@ def fetch_fanout(
     """
     if not bindings:
         raise ValueError("rows_from produced no rows — nothing to fetch.")
-    order = sorted(_PLACEHOLDER_RE.findall(req.path))
+    # The same function the stamps come from (path segments only), so ``key_columns`` can never
+    # advertise a ``_key_`` column that no row actually carries.
+    order = sorted(set(placeholders_in(req.path)))
 
     specs: list[tuple[dict[str, str], ApiSpec]] = []
     for binding in bindings:
