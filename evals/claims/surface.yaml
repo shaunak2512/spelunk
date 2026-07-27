@@ -1,0 +1,179 @@
+area: MCP surface, CLI, packaging, tool-call logging
+prefix: MCP
+claims:
+
+- id: MCP-001
+  claim: build_server(session) registers 7 tools and 2 resources, plus 3 more behind --allow-add-source.
+  source: CLAUDE.md#mcp/server.py
+  mode: behavioral
+  falsifier: A documented tool or resource is missing, or an undocumented one is exposed.
+  status: verified
+  covered_by:
+    - tests/test_cli.py::TestStdioTransport::test_registered_surface_is_exactly_the_documented_one
+    - tests/test_cli.py::TestStdioTransport::test_gated_tools_absent_without_the_flag
+    - tests/test_cli.py::TestSourceArguments::test_allow_add_source_registers_the_gated_tools
+    - tests/test_cli.py::TestStdioTransport::test_resources_are_served
+    - tests/test_mcp_server.py::TestRegistration::test_resources_registered
+    - tests/test_mcp_server.py::TestOtherTools::test_lineage_and_replay_registered
+    - tests/test_mcp_server.py::TestRegistration::test_no_import_remote_tool
+  note: >
+    The in-process registration tests assert documented names are a SUBSET of what is
+    registered, so an EXTRA exposed tool passed them. The CLI test now asserts set EQUALITY
+    against the documented 7, over the real transport. (The older subset test is still called
+    test_five_core_tools_registered — stale name, harmless now that equality is pinned.)
+
+- id: MCP-002
+  claim: The @_logged decorator preserves each function's signature, so FastMCP's schema is unchanged.
+  source: CLAUDE.md#tool-call-logging
+  mode: behavioral
+  falsifier: A wrapped tool's advertised parameter schema differs from the undecorated function's.
+  status: unverified
+  covered_by: []
+  gap: >
+    If this breaks, every tool's schema degrades to (*args, **kwargs) and agents lose all
+    parameter guidance while the suite stays green. One introspection test per tool closes it.
+
+- id: MCP-003
+  claim: Every tool call appends ONE JSON line with ts, tool, args, outcome, result summary, duration_ms.
+  source: CLAUDE.md#tool-call-logging
+  mode: behavioral
+  falsifier: A call logs zero or two lines, or a documented field is absent.
+  status: verified
+  covered_by:
+    - tests/test_mcp_server.py::TestToolLogging::test_each_call_logs_one_json_line
+    - tests/test_mcp_server.py::TestToolLogging::test_batch_call_logs_steps_and_summary
+    - tests/test_mcp_server.py::TestToolLogging::test_failed_call_logs_error_outcome
+
+- id: MCP-004
+  claim: >
+    --tool-log takes a file path, '-' for stderr, or 'off'; the default is <session-dir>/tool-calls.jsonl
+    when --session-dir is set, else stderr — NEVER stdout (that is the stdio MCP transport).
+  source: CLAUDE.md#tool-call-logging
+  mode: invariant
+  falsifier: Any log byte reaches stdout, corrupting the MCP stream.
+  status: verified
+  covered_by:
+    - tests/test_cli.py::TestStdoutPurity::test_every_stdout_line_is_protocol
+    - tests/test_cli.py::TestToolLogSink::test_default_log_lands_in_the_per_process_workspace
+    - tests/test_cli.py::TestToolLogSink::test_off_writes_no_log
+    - tests/test_cli.py::TestToolLogSink::test_explicit_path_is_honoured
+  note: >
+    Every stdout line of a real subprocess run must parse as JSON-RPC, exercised with
+    --tool-log - (logs actively writing to stderr) and including a FAILING call, since error
+    paths are where stray output hides. All three sink modes and the default resolution are
+    pinned alongside it.
+
+- id: MCP-005
+  claim: The tool log lives inside the workspace dir, so it is reclaimed with it — route --tool-log elsewhere to retain history.
+  source: CLAUDE.md#running-the-server
+  mode: behavioral
+  falsifier: A log written outside the workspace is deleted by GC, or a default log survives reclamation.
+  status: partial
+  covered_by:
+    - tests/test_cli.py::TestToolLogSink::test_default_log_lands_in_the_per_process_workspace
+    - tests/test_cli.py::TestToolLogSink::test_explicit_path_is_honoured
+  gap: >
+    Location is pinned now — the default lands in <session-dir>/<pid>-<rand>/, an explicit path
+    goes where told. The RECLAMATION half is still untested: nothing proves a default log is
+    swept away with its workspace while a redirected one survives. That is the data-loss-shaped
+    part of the claim.
+
+- id: MCP-006
+  claim: Library callers of build_server(session) log NOWHERE unless passed tool_log=.
+  source: CLAUDE.md#tool-call-logging
+  mode: behavioral
+  falsifier: A library embedding writes a JSONL file it never asked for.
+  status: unverified
+  covered_by: []
+  gap: Silent file creation inside someone else's process. One assertion closes it.
+
+- id: MCP-007
+  claim: The JSONL is queryable by Spelunk itself via read_json_auto(...).
+  source: CLAUDE.md#tool-call-logging
+  mode: behavioral
+  falsifier: The log's own shape defeats DuckDB inference (heterogeneous args across tools).
+  status: unverified
+  covered_by: []
+  gap: >
+    Dogfooding claim, and plausibly false in practice: `args` differs per tool, which is the
+    exact shape that trips JSON inference (see SRC-020/021). Worth testing precisely because it
+    might already be broken.
+
+- id: MCP-008
+  claim: The server's `instructions` block documents the tool surface an agent should follow.
+  source: server.py#instructions
+  mode: behavioral
+  falsifier: The instructions describe a tool, parameter, or column that does not exist.
+  status: unverified
+  covered_by: []
+  gap: >
+    The instructions are the agent's ONLY orientation and they are pure prose today. A
+    consistency test — every tool name and parameter mentioned exists in the registered
+    schemas — is mechanical and prevents the most damaging kind of doc rot.
+
+- id: MCP-009
+  claim: "--source is repeatable and auto-detects by extension/scheme; --dsn is a back-compat alias for one --source."
+  source: CLAUDE.md#running-the-server
+  mode: behavioral
+  falsifier: A second --source overwrites the first, or --dsn is ignored.
+  status: verified
+  covered_by:
+    - tests/test_cli.py::TestSourceArguments::test_source_is_repeatable_and_dsn_is_an_alias
+    - tests/test_cli.py::TestStdioTransport::test_query_spans_both_sources_through_the_transport
+  note: >
+    main() now runs as a real subprocess in tests/test_cli.py, so the startup path (arg
+    parsing, source wiring, stdio transport, tool-log resolution, clean shutdown on closed
+    stdin) is exercised end to end rather than assumed.
+
+- id: MCP-010
+  claim: The package is published as spelunk-mcp, the command is spelunk, and `uvx --from spelunk-mcp spelunk` runs it with no clone.
+  source: README.md#install-and-run
+  mode: behavioral
+  falsifier: The documented uvx invocation fails, or the entry point is named differently.
+  status: unverified
+  covered_by: []
+  gap: >
+    The first thing a new user runs, verified by nobody. A packaging smoke test (build the
+    wheel, install into a clean venv, run `spelunk --help`) belongs in release CI.
+
+- id: MCP-011
+  claim: __version__ matches the version declared in pyproject.toml.
+  source: repo convention
+  mode: behavioral
+  falsifier: The reported server version disagrees with the published package version.
+  status: verified
+  covered_by:
+    - tests/test_version.py::test_dunder_version_matches_pyproject
+
+- id: MCP-012
+  claim: "__init__.py files do not re-export submodules — import from the submodule directly."
+  source: CLAUDE.md#architecture
+  mode: behavioral
+  falsifier: A re-export appears, making the documented import style optional and the boundary meaningless.
+  status: unverified
+  covered_by: []
+  gap: A one-line assertion over the package namespace; currently held by convention alone.
+
+- id: MCP-013
+  claim: >
+    Tools run on worker threads, and DuckSession.open() calls _warm_native_imports() on the main
+    thread because a first-time numpy/pandas import on a worker thread deadlocks on Windows —
+    hanging the tool call forever.
+  source: CLAUDE.md#tools-run-on-worker-threads
+  mode: behavioral
+  falsifier: A first tool call from a worker thread under a running asyncio loop hangs.
+  status: unverified
+  covered_by: []
+  gap: >
+    A HANG — the worst failure mode in the register, invisible to a normal test run because
+    nothing here ever calls a tool through anyio.to_thread under a live loop. Needs a
+    Windows-CI regression test that reproduces the original conditions with a timeout.
+
+- id: MCP-014
+  claim: A .mcp.json wires Claude Code to a local source (paths are machine-specific; edit before use).
+  source: CLAUDE.md#running-the-server
+  mode: behavioral
+  falsifier: The checked-in .mcp.json is malformed, so the documented wiring cannot work.
+  status: unverified
+  covered_by: []
+  gap: Schema-validate the checked-in file; a broken example config is a first-run failure.

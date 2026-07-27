@@ -3,10 +3,15 @@ so it works regardless of whether the core functions are implemented yet.
 
 The ``api`` fixture is a local threaded mock HTTP server shared by the ``api:`` source tests
 and the ``fetch`` tests — no network anywhere in the suite.
+
+The ``postgres_dsn`` / ``mysql_dsn`` fixtures are the exception: they need a real server,
+because DuckDB's postgres/mysql extensions speak the wire protocol. Each reads a DSN from the
+environment and skips when there isn't one.
 """
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -129,6 +134,68 @@ def csv_file(tmp_path) -> str:
         for row in [(1, 1, 120.5), (2, 1, 75.0), (3, 2, 250.0)]:
             w.writerow(row)
     return str(p)
+
+
+# --- Real database servers (Postgres / MySQL) ---------------------------------------- #
+#
+# Claims SRC-003 (databases attach READ_ONLY), QRY-001 (one query spanning Parquet x Postgres x
+# SQLite x a prior result) and QRY-019 (<source>.<schema>.<table> naming) cannot be falsified
+# without a live server: DuckDB's postgres/mysql extensions speak the real wire protocol.
+#
+# Point the suite at one you already have; without it these tests skip, which leaves those
+# claims honestly unverified rather than silently unexercised:
+#
+#   $env:SPELUNK_TEST_POSTGRES_DSN = "postgresql://postgres:pw@127.0.0.1:5432/spelunk"
+#   $env:SPELUNK_TEST_MYSQL_DSN    = "mysql://root:pw@127.0.0.1:3306/spelunk"
+#
+# Any throwaway server works, e.g.
+#   docker run -d --rm -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=spelunk -p 5432:5432 postgres:16-alpine
+
+
+def _seed_db(engine: str, dsn: str) -> None:
+    """Create the shared `employees` table (plus, on Postgres, a non-default schema).
+
+    Seeded through DuckDB's own extension so the fixture needs no psycopg/mysqlclient — and so
+    a seed failure is a real signal that the extension cannot reach the server.
+    """
+    import duckdb
+
+    con = duckdb.connect()
+    con.execute(f"INSTALL {engine}; LOAD {engine};")
+    con.execute(f"ATTACH '{dsn}' AS seed (TYPE {engine})")
+    try:
+        con.execute("DROP TABLE IF EXISTS seed.employees")
+        con.execute("CREATE TABLE seed.employees (id INTEGER, name VARCHAR, city VARCHAR)")
+        con.execute(
+            "INSERT INTO seed.employees VALUES (1,'Ada','Sydney'),(2,'Linus','Melbourne'),"
+            "(3,'Grace','Sydney')"
+        )
+        if engine == "postgres":
+            # QRY-019's <source>.<schema>.<table> form only exists off the default schema.
+            con.execute("CREATE SCHEMA IF NOT EXISTS hr")
+            con.execute("DROP TABLE IF EXISTS seed.hr.salaries")
+            con.execute("CREATE TABLE seed.hr.salaries (id INTEGER, salary INTEGER)")
+            con.execute("INSERT INTO seed.hr.salaries VALUES (1,120000),(2,95000),(3,150000)")
+    finally:
+        con.close()
+
+
+def _live_db(engine: str, env_var: str) -> str:
+    dsn = os.environ.get(env_var)
+    if not dsn:
+        pytest.skip(f"needs a live {engine} server — set {env_var} (see tests/conftest.py)")
+    _seed_db(engine, dsn)
+    return dsn
+
+
+@pytest.fixture(scope="session")
+def postgres_dsn() -> str:
+    return _live_db("postgres", "SPELUNK_TEST_POSTGRES_DSN")
+
+
+@pytest.fixture(scope="session")
+def mysql_dsn() -> str:
+    return _live_db("mysql", "SPELUNK_TEST_MYSQL_DSN")
 
 
 @pytest.fixture

@@ -1,0 +1,199 @@
+area: >
+  Affordance claims — assertions about what an AGENT does when handed this surface. None of
+  these can be falsified by a unit test; they need an agent harness with an ablation arm, and
+  they stay unverified until one exists. This file is the argument for building it.
+prefix: AFF
+claims:
+
+- id: AFF-001
+  claim: >
+    query is the ONE tool for looking AND building — results are named and immediately reusable,
+    so an agent does not need a separate inspect step.
+  source: CLAUDE.md#tool-surface
+  mode: affordance
+  falsifier: Agents routinely run a throwaway query to look, then a second to build the same thing.
+  status: unverified
+  covered_by: []
+  gap: >
+    Measure from the tool log: fraction of results never referenced downstream and never
+    reported. Ablation is not needed — the baseline number IS the claim.
+
+- id: AFF-002
+  claim: >
+    Returning full rows for small results means an agent reads a small deliverable without paging
+    it out into junk tables.
+  source: CLAUDE.md#tool-surface
+  mode: affordance
+  falsifier: With full-rows enabled, agents still issue LIMIT/OFFSET follow-ups on small results.
+  status: unverified
+  covered_by: []
+  gap: >
+    QRY-003 proves the mechanism; this claims the BEHAVIOUR. Needs a task producing a ~20-row
+    deliverable, run with the threshold on and off, comparing follow-up query count and junk
+    tables created. The ablation is the whole test.
+
+- id: AFF-003
+  claim: A hint after 3 consecutive single-query calls nudges agents toward the batch.
+  source: CLAUDE.md#tool-surface
+  mode: affordance
+  falsifier: Batch adoption is the same with the nudge suppressed.
+  status: unverified
+  covered_by: []
+  gap: >
+    QRY-009 proves the hint FIRES. Whether it CHANGES anything is unmeasured, and without a
+    no-nudge arm any adoption number is uninterpretable.
+
+- id: AFF-004
+  claim: "ALWAYS batch instead of firing sequential single calls — agents should adopt batch mode."
+  source: server.py#instructions
+  mode: affordance
+  falsifier: Agents run mostly single calls despite the instruction.
+  status: unverified
+  covered_by: []
+  gap: Measurable directly from the tool log as steps-per-query-call across a task suite.
+
+- id: AFF-005
+  claim: >
+    One API is ONE source: an agent attaches an openapi: connection once and fetches many
+    endpoints, rather than attaching a source per endpoint.
+  source: server.py#fetch
+  mode: affordance
+  falsifier: An agent given a multi-endpoint task calls add_source more than once for one API.
+  status: unverified
+  covered_by: []
+  gap: >
+    CONN-001 proves it is POSSIBLE; this claims agents actually do it. A binary, cheap
+    assertion over the tool log: count add_source calls per API.
+
+- id: AFF-006
+  claim: >
+    Guidance-as-data: the agent SQL-queries the catalog, fills <SET_ME>, and feeds suggested_spec
+    to add_source — instead of hand-writing a spec or hand-paging the API.
+  source: CLAUDE.md#openapi.py
+  mode: affordance
+  falsifier: Agents skip the catalog, or hand-author specs that the catalog would have supplied.
+  status: unverified
+  covered_by: []
+  gap: >
+    The entire justification for building a catalog rather than documentation. Trace check:
+    did a query hit the catalog before the add_source, and did the resulting spec match
+    suggested_spec?
+
+- id: AFF-007
+  claim: >
+    pagination_hint naming the paging-shaped params keeps an agent out of hand-paging when no
+    convention matches ("going silent is what pushes an agent into hand-paging").
+  source: CLAUDE.md#openapi.py
+  mode: affordance
+  falsifier: With the hint suppressed, agents page by hand at the same rate as with it.
+  status: unverified
+  covered_by: []
+  gap: >
+    A causal claim stated as fact in the docs. Task: an API with startIndex/resultsPerPage; arms
+    with and without the hint; measure whether the agent produces ONE paginating source.
+
+- id: AFF-008
+  claim: >
+    response_fields lets an agent find an endpoint by the DATA it carries, not just its URL.
+  source: CLAUDE.md#openapi.py
+  mode: affordance
+  falsifier: Agents locate endpoints by path guessing even when response_fields is available.
+  status: unverified
+  covered_by: []
+  gap: >
+    Sharp task design: ask for a field that lives only in an endpoint whose path does not
+    suggest it. With and without response_fields populated. Success is finding it at all.
+
+- id: AFF-009
+  claim: >
+    Error messages teach the fix — the literal `name=` explanation, the format-prefix pointer,
+    the query-string placeholder refusal, the reserved-param error, "missing column names the fix".
+  source: sources.py / apifetch.py error-message design
+  mode: affordance
+  falsifier: An agent handed each mistake does not recover in one further call.
+  status: unverified
+  covered_by: []
+  gap: >
+    The suite asserts these messages CONTAIN the guidance; nobody has checked an agent ACTS on
+    it. Calls-to-recovery per seeded mistake is a clean, cheap, per-message metric — and the
+    messages were explicitly written for this, so it is the most directly testable design
+    intent in the codebase.
+
+- id: AFF-010
+  claim: >
+    Lineage is an audit trail: a supervisor can verify an agent's claims against recorded SQL
+    instead of trusting its prose.
+  source: CLAUDE.md#key-concepts
+  mode: affordance
+  falsifier: A discrepancy between an agent's report and its recorded SQL is not detectable from lineage alone.
+  status: unverified
+  covered_by: []
+  gap: >
+    Testable adversarially and deterministically: seed a run whose report overstates its
+    filtering, then check a mechanical lineage-vs-report comparison catches it. This is the
+    strongest positioning claim spelunk makes and has no falsifier.
+
+- id: AFF-011
+  claim: >
+    A flow is a reproducible pipeline — replay(into=...) rebuilds it against possibly changed
+    sources, so "how would you re-run this?" has a one-call answer.
+  source: CLAUDE.md#key-concepts
+  mode: affordance
+  falsifier: Asked to re-run after a source changes, an agent rebuilds by hand instead of using replay.
+  status: unverified
+  covered_by: []
+  gap: >
+    Two claims in one: the MECHANISM (LIN-019, also unverified) and the DISCOVERABILITY. The
+    second needs a task that asks for a refresh without naming replay — and the tool list given
+    to the agent must not name it either, or the probe is primed.
+
+- id: AFF-012
+  claim: >
+    Isolation comes from the process-per-agent model plus flows: concurrent lines of analysis
+    never collide.
+  source: CLAUDE.md#tool-surface
+  mode: affordance
+  falsifier: Concurrent agents in separate flows corrupt or overwrite each other's results.
+  status: unverified
+  covered_by: []
+  gap: >
+    Depends on QRY-014 (concurrency, also unverified). Prove the mechanism first, then the
+    agent-level claim with N agents on one server, each in its own flow.
+
+- id: AFF-013
+  claim: >
+    Materialize-once-reuse makes pipeline work cheaper: a result computed once is cheap to reuse,
+    which is what amortises MCP round trips.
+  source: CLAUDE.md#key-concepts
+  mode: affordance
+  falsifier: A multi-stage task costs no less than the same work re-expressed each time.
+  status: unverified
+  covered_by: []
+  gap: >
+    An economic claim. Measure tokens/round-trips/wall-clock on a fixed multi-stage task, with
+    a control that forbids reuse. Needs n>=3 per arm to say anything.
+
+- id: AFF-014
+  claim: >
+    Credential isolation is STRUCTURAL, not behavioural: the token is never in the agent's
+    context, by construction.
+  source: CLAUDE.md#running-the-server (auth_env design)
+  mode: affordance
+  falsifier: The credential value appears anywhere in an agent transcript.
+  status: unverified
+  covered_by: []
+  gap: >
+    The one affordance claim with a DETERMINISTIC falsifier — grep the full transcript for a
+    canary token. No judge, no variance, no ablation. It should be the first agent-tier test
+    written, and it doubles as the transcript-level arm of SEC-004.
+
+- id: AFF-015
+  claim: Snapshot-once means an agent's analysis costs far fewer API requests than scripting the same work.
+  source: CLAUDE.md#sources.py (queries never re-fetch)
+  mode: affordance
+  falsifier: "Repeated analysis over an api: source issues requests proportional to query count."
+  status: unverified
+  covered_by: []
+  gap: >
+    Deterministic once a counting fixture server exists (see SRC-018): run a fixed multi-query
+    analysis and assert total requests is bounded by pages fetched, not queries run.

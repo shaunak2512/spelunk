@@ -77,12 +77,23 @@ _COUNTED_RESULT_FIELDS = ("columns", "nodes", "edges", "order", "missing", "rebu
 # add_source accepts DSNs that can embed credentials (postgresql://user:pw@host/db); strip the
 # userinfo (user:pass@) before the spec is written to the on-disk tool-call log.
 _DSN_CREDENTIALS_RE = re.compile(r"//[^/@\s]+@")
+# DuckDB rewrites a postgresql:// DSN into libpq keyword form before connecting, so a failed
+# ATTACH reports `password=<secret>` — a shape the userinfo pattern above cannot match. Both
+# forms have to be masked, or the error path leaks what the arg path redacts.
+_KEYWORD_PASSWORD_RE = re.compile(
+    r"""(?i)\b(password\s*=\s*)('[^']*'|"[^"]*"|[^\s'";]+)"""
+)
 
 
 def _redact(value: object) -> object:
-    """Mask userinfo (user:pass@) in DSN-like strings so credentials never reach the log."""
+    """Mask credentials in DSN-like strings so they never reach the log.
+
+    Handles both the URL form (``//user:pass@host``) and the keyword form
+    (``password=secret``) that database drivers produce in connection errors.
+    """
     if isinstance(value, str):
-        return _DSN_CREDENTIALS_RE.sub("//***@", value)
+        masked = _DSN_CREDENTIALS_RE.sub("//***@", value)
+        return _KEYWORD_PASSWORD_RE.sub(r"\1***", masked)
     return value
 
 
@@ -158,7 +169,9 @@ def _logged(fn):
             result = fn(*args, **kwargs)
         except Exception as exc:
             record["outcome"] = "error"
-            record["error"] = f"{type(exc).__name__}: {exc}"
+            # Redacted like the args are: a driver's connection error quotes the DSN back,
+            # so an unmasked message would write to disk exactly what _log_arg withheld.
+            record["error"] = _redact(f"{type(exc).__name__}: {exc}")
             record["duration_ms"] = round((time.perf_counter() - start) * 1000, 1)
             _tool_logger.info(json.dumps(record, default=str))
             raise

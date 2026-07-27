@@ -1,0 +1,304 @@
+area: "api: source fetcher — spec grammar, pagination, auth, retry, caps"
+prefix: API
+claims:
+
+- id: API-001
+  claim: "The spec grammar is `api:<url> [key=value ...]`, tokenised shell-style so quoted values may contain spaces."
+  source: CLAUDE.md#apifetch.py
+  mode: behavioral
+  falsifier: A quoted option value containing spaces is split, or a malformed option is silently ignored.
+  status: verified
+  covered_by:
+    - tests/test_api_source.py::TestParseApiSpec::test_url_only
+    - tests/test_api_source.py::TestParseApiSpec::test_options
+    - tests/test_api_source.py::TestParseApiSpec::test_malformed_option
+    - tests/test_api_source.py::TestParseApiSpec::test_unknown_option
+    - tests/test_api_source.py::TestParseApiSpec::test_non_integer
+    - tests/test_api_source.py::TestParseApiSpec::test_not_http_url
+
+- id: API-002
+  claim: "records=<dot.path> selects the record array; with no records=, a conventional wrapper key is auto-detected."
+  source: CLAUDE.md#apifetch.py
+  mode: behavioral
+  falsifier: A wrapped payload yields one row (the envelope) instead of N records, or a bad path fails silently.
+  status: verified
+  covered_by:
+    - tests/test_api_source.py::TestFetchBasics::test_records_dot_path
+    - tests/test_api_source.py::TestFetchBasics::test_records_autodetect_common_key
+    - tests/test_api_source.py::TestFetchBasics::test_records_autodetect_odata_value_key
+    - tests/test_api_source.py::TestFetchBasics::test_records_autodetect_single_list_key
+    - tests/test_api_source.py::TestFetchBasics::test_bad_records_path
+    - tests/test_api_source.py::TestPagination::test_dig_literal_key_beats_nesting
+
+- id: API-003
+  claim: A plain array, a single object, and scalar records all materialise sensibly (object = one record; scalars wrapped).
+  source: CLAUDE.md#apifetch.py
+  mode: behavioral
+  falsifier: A single-object response yields zero rows, or a scalar array crashes the scan.
+  status: verified
+  covered_by:
+    - tests/test_api_source.py::TestFetchBasics::test_plain_array
+    - tests/test_api_source.py::TestFetchBasics::test_single_object_response_is_one_record
+    - tests/test_api_source.py::TestFetchBasics::test_scalar_records_are_wrapped
+
+- id: API-004
+  claim: A response yielding zero records errors and names the keys it actually saw.
+  source: CLAUDE.md#apifetch.py
+  mode: behavioral
+  falsifier: Zero records attaches an empty view, leaving the user to guess the records path.
+  status: verified
+  covered_by:
+    - tests/test_api_source.py::TestFetchBasics::test_zero_records_errors_with_keys
+
+- id: API-005
+  claim: "paginate=page walks pages until exhausted."
+  source: CLAUDE.md#apifetch.py
+  mode: behavioral
+  falsifier: Paging stops after page 1, or never terminates on an empty page.
+  status: verified
+  covered_by:
+    - tests/test_api_source.py::TestPagination::test_page_until_empty
+    - tests/test_api_source.py::TestPagination::test_page_with_size_param
+
+- id: API-006
+  claim: A repeat-page guard stops APIs that ignore the page param instead of looping forever.
+  source: CLAUDE.md#apifetch.py
+  mode: behavioral
+  falsifier: A server returning identical page 1 forever is fetched until max_pages (or forever).
+  status: verified
+  covered_by:
+    - tests/test_api_source.py::TestPagination::test_page_repeat_guard
+
+- id: API-007
+  claim: "paginate=offset walks by offset/limit."
+  source: CLAUDE.md#apifetch.py
+  mode: behavioral
+  falsifier: Offset paging re-requests offset 0, or skips records.
+  status: verified
+  covered_by:
+    - tests/test_api_source.py::TestPagination::test_offset
+
+- id: API-008
+  claim: "paginate=cursor follows a full OR relative next-URL directly (PokeAPI-style)."
+  source: CLAUDE.md#apifetch.py
+  mode: behavioral
+  falsifier: A relative next-URL is not resolved against the base, or an opaque cursor token is not resent.
+  status: verified
+  covered_by:
+    - tests/test_api_source.py::TestPagination::test_cursor_opaque
+    - tests/test_api_source.py::TestPagination::test_cursor_full_url
+    - tests/test_api_source.py::TestPagination::test_cursor_opaque_without_cursor_param_errors
+    - tests/test_api_source.py::TestParseApiSpec::test_cursor_requires_cursor_path
+
+- id: API-009
+  claim: >
+    paginate=keyset is Stripe-style starting_after taken from the LAST RECORD's keyset_field,
+    with exclusive semantics.
+  source: CLAUDE.md#apifetch.py
+  mode: behavioral
+  falsifier: The keyset value is taken from the first record, or the boundary record is duplicated/skipped.
+  status: verified
+  covered_by:
+    - tests/test_api_source.py::TestPagination::test_keyset_stripe_style
+    - tests/test_api_source.py::TestPagination::test_keyset_nested_field_and_short_page_stop
+    - tests/test_api_source.py::TestPagination::test_keyset_stops_when_field_missing
+    - tests/test_api_source.py::TestParseApiSpec::test_keyset_requires_field_and_param
+
+- id: API-010
+  claim: "paginate=link follows RFC 5988 Link: rel=next headers."
+  source: CLAUDE.md#apifetch.py
+  mode: behavioral
+  falsifier: A rel="next" link is ignored, or a rel="prev" link is followed.
+  status: partial
+  covered_by:
+    - tests/test_api_source.py::TestPagination::test_link_header
+  gap: >
+    One well-formed header shape. Not covered: multiple rels in one header, quoted/unquoted
+    param forms, a relative URL in the Link header, or a self-referential next (infinite loop).
+
+- id: API-011
+  claim: "paginate=odata is cursor pre-configured for @odata.nextLink + records=value."
+  source: CLAUDE.md#apifetch.py
+  mode: behavioral
+  falsifier: An OData feed needs manual cursor_path/records to page, or explicit overrides are ignored.
+  status: verified
+  covered_by:
+    - tests/test_api_source.py::TestParseApiSpec::test_odata_alias_normalizes_to_cursor
+    - tests/test_api_source.py::TestParseApiSpec::test_odata_alias_explicit_overrides_win
+    - tests/test_api_source.py::TestPagination::test_odata_v4_absolute_nextlink
+    - tests/test_api_source.py::TestPagination::test_odata_relative_nextlink_resolved
+    - tests/test_api_source.py::TestPagination::test_odata_v2_shape
+
+- id: API-012
+  claim: >
+    OData sources take filter="<SQL predicate>" and select=<cols>, translated server-side to
+    $filter/$select via sqlglot.
+  source: CLAUDE.md#apifetch.py
+  mode: behavioral
+  falsifier: The filter is applied client-side (all rows fetched), or reaches the server mangled.
+  status: verified
+  covered_by:
+    - tests/test_api_source.py::TestSqlToODataFilter::test_translations
+    - tests/test_api_source.py::TestParseApiSpec::test_filter_and_select_injected_into_url
+    - tests/test_api_source.py::TestParseApiSpec::test_filter_select_require_odata
+    - tests/test_api_source.py::TestPagination::test_odata_filter_reaches_server_decoded
+
+- id: API-013
+  claim: An untranslatable SQL predicate errors loudly — it never silently fetches everything.
+  source: CLAUDE.md#apifetch.py
+  mode: invariant
+  falsifier: Any predicate that cannot be translated results in an unfiltered fetch.
+  status: partial
+  covered_by:
+    - tests/test_api_source.py::TestSqlToODataFilter::test_rejections_are_loud
+    - tests/test_api_source.py::TestParseApiSpec::test_select_rejects_garbage
+  gap: >
+    Example-based. This is an invariant over the whole SQL grammar and the failure mode is
+    silent over-fetch — the archetypal case for a fuzz arm generating predicates from a grammar
+    and asserting translate-or-raise, never translate-to-nothing.
+
+- id: API-014
+  claim: >
+    EVERY paging param NAME is configurable — page_param/offset_param/size_param/page_size/start/
+    cursor_param/cursor_path/keyset_field — so page/offset/limit are conventions, not requirements.
+  source: CLAUDE.md#apifetch.py
+  mode: behavioral
+  falsifier: An API using startIndex/resultsPerPage (or startAt/maxResults) cannot be paged as one source.
+  status: partial
+  covered_by:
+    - tests/test_api_source.py::TestParseApiSpec::test_options
+    - tests/test_api_source.py::TestPagination::test_page_with_size_param
+    - tests/test_api_source.py::TestPagination::test_keyset_nested_field_and_short_page_stop
+  gap: >
+    Individual params are exercised piecemeal. No end-to-end fetch against a server speaking a
+    fully non-default vocabulary (the exact case the claim is written to cover).
+
+- id: API-015
+  claim: Sending an unrecognised paging param isn't always harmless — some APIs reject the request outright.
+  source: CLAUDE.md#apifetch.py
+  mode: behavioral
+  falsifier: The fetcher sends default paging params to an endpoint that declared none.
+  status: unverified
+  covered_by: []
+  gap: >
+    Stated as the reason to configure names, but nothing asserts what is actually put on the
+    wire when paginate=none, or when only some paging params are configured. A strict fixture
+    server (400 on any unexpected query key) falsifies this directly.
+
+- id: API-016
+  claim: "max_pages / max_rows cap a fetch."
+  source: CLAUDE.md#apifetch.py
+  mode: behavioral
+  falsifier: A cap is exceeded, or truncation is silent when it happens.
+  status: partial
+  covered_by:
+    - tests/test_api_source.py::TestPagination::test_max_pages_truncates
+    - tests/test_api_source.py::TestPagination::test_max_rows_truncates
+  gap: >
+    Truncation is verified to happen; whether the user is TOLD it happened is not asserted.
+    Silent truncation of a source is a correctness trap for every downstream aggregate.
+
+- id: API-017
+  claim: "Auth: auth_env=<ENV> sends a Bearer token; header=<Name>:<ENV> sends any header; param=<name>:<ENV> sends a query-param key."
+  source: CLAUDE.md#apifetch.py
+  mode: behavioral
+  falsifier: The credential does not reach the wire, or a query-param credential is dropped after page 1.
+  status: verified
+  covered_by:
+    - tests/test_api_source.py::TestAuthAndRetry::test_auth_env_bearer
+    - tests/test_api_source.py::TestAuthAndRetry::test_extra_header_from_env
+    - tests/test_api_source.py::TestAuthAndRetry::test_query_param_from_env_persists_across_pages
+    - tests/test_api_source.py::TestParseApiSpec::test_header_and_param_options
+    - tests/test_api_source.py::TestParseApiSpec::test_header_malformed
+    - tests/test_api_source.py::TestParseApiSpec::test_param_malformed
+
+- id: API-018
+  claim: A missing environment variable named by an auth option fails at attach with an actionable message.
+  source: CLAUDE.md#apifetch.py
+  mode: behavioral
+  falsifier: A missing env var yields an anonymous request (and a confusing 401) instead of a named error.
+  status: verified
+  covered_by:
+    - tests/test_api_source.py::TestAuthAndRetry::test_auth_env_missing
+    - tests/test_api_source.py::TestAuthAndRetry::test_missing_env_for_header
+    - tests/test_api_source.py::TestParseApiSpec::test_unknown_option_lists_header_and_param
+
+- id: API-019
+  claim: 429/5xx are retried with backoff, honouring Retry-After; a persistent 5xx eventually gives up; a 404 is not retried.
+  source: CLAUDE.md#apifetch.py
+  mode: behavioral
+  falsifier: A 429 is treated as fatal, Retry-After is ignored, or a 404 is retried.
+  status: verified
+  covered_by:
+    - tests/test_api_source.py::TestAuthAndRetry::test_retry_on_500_then_success
+    - tests/test_api_source.py::TestAuthAndRetry::test_retry_429_honours_retry_after
+    - tests/test_api_source.py::TestAuthAndRetry::test_persistent_500_gives_up
+    - tests/test_api_source.py::TestAuthAndRetry::test_404_no_retry
+
+- id: API-020
+  claim: A 404 mid-pagination means end-of-data (TVMaze-style); a 404 on page 1 is an error.
+  source: CLAUDE.md#apifetch.py
+  mode: behavioral
+  falsifier: A mid-pagination 404 aborts the source, or a page-1 404 attaches an empty view.
+  status: verified
+  covered_by:
+    - tests/test_api_source.py::TestPagination::test_404_mid_pagination_is_end_of_data
+
+- id: API-021
+  claim: A non-JSON response is rejected with a clear error rather than a parse traceback.
+  source: CLAUDE.md#apifetch.py
+  mode: behavioral
+  falsifier: An HTML error page produces a JSONDecodeError or an empty source.
+  status: verified
+  covered_by:
+    - tests/test_api_source.py::TestAuthAndRetry::test_non_json_response
+
+- id: API-022
+  claim: A failed fetch leaves no files behind.
+  source: CLAUDE.md#apifetch.py
+  mode: behavioral
+  falsifier: A partial snapshot survives a failed attach and is later scanned as if complete.
+  status: verified
+  covered_by:
+    - tests/test_api_source.py::TestAuthAndRetry::test_failed_fetch_leaves_no_files
+
+- id: API-023
+  claim: A fetch fingerprint (url / fetched_at / pages / row_count) is returned as Source.info.
+  source: CLAUDE.md#apifetch.py
+  mode: behavioral
+  falsifier: "Attaching an api: source reports no provenance for what was actually fetched."
+  status: unverified
+  covered_by: []
+  gap: >
+    Nothing asserts the fingerprint's presence or its fields. It is the only record of WHEN a
+    snapshot was taken — load-bearing for interpreting any analysis built on it.
+
+- id: API-024
+  claim: A User-Agent identifying the client is always sent.
+  source: apifetch.py (behaviour promised to API operators)
+  mode: invariant
+  falsifier: Any request leaves without a User-Agent header.
+  status: verified
+  covered_by:
+    - tests/test_api_source.py::TestAuthAndRetry::test_user_agent_always_sent
+
+- id: API-025
+  claim: "detect_kind recognises `api:` and `openapi:` specs as their own kinds."
+  source: CLAUDE.md#sources.py
+  mode: behavioral
+  falsifier: "An api: spec is classified as a file path."
+  status: verified
+  covered_by:
+    - tests/test_api_source.py::TestParseApiSpec::test_detect_kind
+    - tests/test_openapi_source.py::TestSessionIntegration::test_detect_kind
+    - tests/test_sources.py::TestDetectKind::test_detect
+    - tests/test_sources.py::TestDetectKind::test_detect_new_kinds
+
+- id: API-026
+  claim: An unknown paginate style is rejected at parse time, not at first fetch.
+  source: CLAUDE.md#apifetch.py
+  mode: behavioral
+  falsifier: A typo'd paginate value attaches and silently fetches one page.
+  status: verified
+  covered_by:
+    - tests/test_api_source.py::TestParseApiSpec::test_bad_paginate_style

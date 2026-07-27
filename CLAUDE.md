@@ -252,12 +252,36 @@ single-writer contention (only the first concurrent server is durable, the rest 
 ephemeral). `DuckSession.open(session_dir=None)` is still an ephemeral private temp workspace.
 
 **Tool-call logging:** every tool call appends one JSON line (ts, tool, args, outcome, result
-summary, duration_ms) for usage analysis — wired by the `@_logged` decorator in `mcp/server.py`,
+summary, duration_ms) for usage analysis. DSN credentials are masked before anything is written
+— in the `spec` arg *and* in the `error` field, in both the URL form (`//user:pass@`) and the
+libpq keyword form (`password=…`) that DuckDB reports back on a failed ATTACH. Redacting only
+the arg leaks the secret on the error path, which is where a connection failure quotes the whole
+DSN back at you — wired by the `@_logged` decorator in `mcp/server.py`,
 which preserves each function's signature so FastMCP's schema is unchanged. `--tool-log` controls
 the sink: a file path, `-` for stderr, or `off` to disable. Default: `<session-dir>/tool-calls.jsonl`
 when `--session-dir` is set, else stderr — never stdout (that's the stdio MCP transport). Library
 callers of `build_server(session)` log nowhere unless passed `tool_log=`. The JSONL is queryable by
 Spelunk itself via `read_json_auto(...)`.
+
+## Claim register (`evals/`)
+
+The docs are the spec: `evals/claims/*.yaml` turns every falsifiable assertion in README.md /
+CLAUDE.md / the tool descriptions into a numbered claim with the observation that would prove it
+false, its falsification mode (invariant / behavioral / quantitative / affordance), and the tests
+that would fail if it were false. `python evals/coverage.py [--strict|--unverified]` validates
+the register and reports coverage; `--strict` fails on an unresolvable `covered_by` node id, a
+`verified` claim with no test, or a non-verified claim with no stated gap.
+
+When you change behaviour, update the claim — a `refuted` status means either the code or the doc
+is wrong, and the register forces the choice instead of letting it drift. `affordance` claims
+(what an *agent* does when handed this surface) cannot be closed by unit tests at all; they need
+an agent harness with an ablation arm, and they are why one is worth building.
+
+Tests needing a live Postgres/MySQL (`tests/test_multi_source.py`) skip unless
+`SPELUNK_TEST_POSTGRES_DSN` / `SPELUNK_TEST_MYSQL_DSN` are set — see `tests/conftest.py`.
+`tests/test_cli.py` drives `main()` as a real subprocess over stdio; when writing such a test,
+drain the child's stdout **and** stderr concurrently, or a ~4KB Windows pipe buffer fills on an
+error path and the server blocks mid-response looking exactly like a hang.
 
 ## After making a change
 

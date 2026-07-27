@@ -1,0 +1,266 @@
+area: Query engine surface — materialisation, sampling, batch, flows, profile, export
+prefix: QRY
+claims:
+
+- id: QRY-001
+  claim: >
+    One DuckDB session is both engine and workspace, so a single query can join a Parquet file to
+    a Postgres table to a result built two steps ago.
+  source: README.md#architecture
+  mode: behavioral
+  falsifier: A single SELECT spanning two source kinds fails.
+  status: partial
+  covered_by:
+    - tests/test_multi_source.py::TestCrossEngineJoin::test_three_engines_in_one_select
+    - tests/test_multi_source.py::TestCrossEngineJoin::test_a_prior_result_joins_back_into_the_same_query
+    - tests/test_multi_source.py::TestMySQL::test_mysql_joins_and_is_read_only
+    - tests/test_duck.py::TestQuery::test_cross_source_join
+    - tests/test_mcp_server.py::TestQueryTool::test_cross_source_join
+    - tests/test_duck.py::TestQuery::test_result_is_reusable_by_name
+  gap: >
+    The four-way join (Parquet x Postgres x SQLite x a prior result) now has a real falsifier,
+    but it SKIPS unless SPELUNK_TEST_POSTGRES_DSN / SPELUNK_TEST_MYSQL_DSN point at a live
+    server — so on a default run the headline claim is still unexercised. Promote to verified
+    once CI provides the servers.
+
+- id: QRY-002
+  claim: query materialises the FULL result as table `name` with no row cap, and `name` is required.
+  source: CLAUDE.md#tool-surface
+  mode: behavioral
+  falsifier: A large result is truncated on materialisation, or a missing name defaults silently.
+  status: verified
+  covered_by:
+    - tests/test_duck.py::TestQuery::test_materializes_and_returns_sample
+    - tests/test_duck.py::TestQuery::test_required_name_validated
+    - tests/test_mcp_server.py::TestQueryTool::test_query_materializes_and_samples
+
+- id: QRY-003
+  claim: >
+    The result sample is EVERY row (with complete: true) when small on both axes — row_count <= 50
+    and row_count x cols <= 1000 — else a 5-row head.
+  source: CLAUDE.md#tool-surface
+  mode: behavioral
+  falsifier: A 20-row deliverable comes back as a 5-row head, forcing pagination queries.
+  status: verified
+  covered_by:
+    - tests/test_duck.py::TestQuery::test_small_result_returns_all_rows_complete
+    - tests/test_duck.py::TestQuery::test_large_result_falls_back_to_head
+    - tests/test_duck.py::TestQuery::test_wide_result_over_cell_cap_falls_back
+    - tests/test_duck.py::TestQuery::test_tiny_result_is_complete
+
+- id: QRY-004
+  claim: The returned row_count is the TRUE count, not the sample size.
+  source: CLAUDE.md#tool-surface
+  mode: behavioral
+  falsifier: row_count reports 5 for a 1M-row result.
+  status: verified
+  covered_by:
+    - tests/test_duck.py::TestQuery::test_large_result_falls_back_to_head
+
+- id: QRY-005
+  claim: "query(steps=[...]) runs an ordered batch with semantics identical to N sequential calls — same guard, same lineage rows."
+  source: CLAUDE.md#tool-surface
+  mode: behavioral
+  falsifier: A batch produces different lineage or different results than the same steps run singly.
+  status: verified
+  covered_by:
+    - tests/test_duck.py::TestQuerySteps::test_dependent_steps_run_in_order
+    - tests/test_duck.py::TestQuerySteps::test_steps_record_lineage_like_sequential_calls
+    - tests/test_mcp_server.py::TestQueryTool::test_batch_steps_pipeline_in_one_call
+
+- id: QRY-006
+  claim: >
+    Batch is fail-fast — completed steps stay materialised, the failing step reports its error,
+    the rest are skipped — and a malformed batch is rejected before ANY side effect.
+  source: CLAUDE.md#tool-surface
+  mode: behavioral
+  falsifier: A failure rolls back earlier steps, or a batch with a bad step materialises some of it before validating.
+  status: verified
+  covered_by:
+    - tests/test_duck.py::TestQuerySteps::test_fail_fast_keeps_earlier_skips_later
+    - tests/test_duck.py::TestQuerySteps::test_static_validation_rejects_batch_before_any_side_effect
+    - tests/test_duck.py::TestQuerySteps::test_empty_or_malformed_steps_rejected
+
+- id: QRY-007
+  claim: >
+    Every TERMINAL step (one no later step references — the last, plus any independent query)
+    returns a sample; downstream-consumed intermediates stay compact.
+  source: CLAUDE.md#tool-surface
+  mode: behavioral
+  falsifier: An intermediate returns full rows (noise), or a terminal returns none (forcing a follow-up query).
+  status: verified
+  covered_by:
+    - tests/test_duck.py::TestQuerySteps::test_disconnected_batch_samples_every_step
+    - tests/test_duck.py::TestQuerySteps::test_mixed_batch_samples_only_terminals
+    - tests/test_duck.py::TestQuerySteps::test_final_step_full_sample_when_small
+
+- id: QRY-008
+  claim: "`sql`/`name` and `steps` are mutually exclusive."
+  source: CLAUDE.md#tool-surface
+  mode: behavioral
+  falsifier: Passing both runs one and silently ignores the other.
+  status: verified
+  covered_by:
+    - tests/test_mcp_server.py::TestQueryTool::test_sql_and_steps_are_mutually_exclusive
+
+- id: QRY-009
+  claim: A hint after 3 consecutive single-query calls nudges agents toward the batch.
+  source: CLAUDE.md#tool-surface
+  mode: behavioral
+  falsifier: The nudge never fires, or fires on the first call (noise).
+  status: verified
+  covered_by:
+    - tests/test_duck.py::TestQuerySteps::test_batch_nudge_after_consecutive_single_queries
+
+- id: QRY-010
+  claim: A nudge fires on an unfiltered SELECT * that copies a large source table wholesale, and not on small ones.
+  source: CLAUDE.md#key-concepts
+  mode: behavioral
+  falsifier: The nudge fires on every query (noise) or never on the wholesale copy it exists for.
+  status: verified
+  covered_by:
+    - tests/test_duck.py::TestQuery::test_large_unfiltered_star_hint
+    - tests/test_duck.py::TestQuery::test_small_query_has_no_hint
+
+- id: QRY-011
+  claim: >
+    Materialize-by-default: query does CREATE OR REPLACE TABLE, because a DuckDB view re-executes
+    its whole upstream on every reference.
+  source: CLAUDE.md#key-concepts
+  mode: behavioral
+  falsifier: A result is created as a view, so referencing it twice re-runs the upstream.
+  status: partial
+  covered_by:
+    - tests/test_duck.py::TestQuery::test_result_is_reusable_by_name
+  gap: >
+    That a result is reusable does not prove it is a TABLE. Assert the object type in the
+    catalog, or (better) that referencing a result twice does not re-read the source — the
+    performance property the design exists for.
+
+- id: QRY-012
+  claim: >
+    A flow is an isolated result namespace (a DuckDB schema, default "default"); the same result
+    name in two flows never collides.
+  source: CLAUDE.md#key-concepts
+  mode: behavioral
+  falsifier: Writing `x` in flow A overwrites `x` in flow B.
+  status: verified
+  covered_by:
+    - tests/test_duck.py::TestFlows::test_flows_isolate_same_name
+
+- id: QRY-013
+  claim: >
+    query's search_path is <flow>,main — flow results and file views resolve bare; cross-flow
+    results are reachable as "<flow>"."<name>".
+  source: CLAUDE.md#key-concepts
+  mode: behavioral
+  falsifier: A bare result name resolves to another flow's table, or a cross-flow reference fails.
+  status: partial
+  covered_by:
+    - tests/test_duck.py::TestFlows::test_flows_isolate_same_name
+    - tests/test_lineage.py::TestLineageRecording::test_cross_flow_dependency_followed
+  gap: >
+    Resolution ORDER is untested: a result and a file view sharing a name should have defined
+    precedence, and today nobody knows which wins. That is a silent-wrong-answer bug class.
+
+- id: QRY-014
+  claim: Calls within a flow are serialised (one connection, one lock); across flows they are parallel-safe.
+  source: CLAUDE.md#key-concepts
+  mode: invariant
+  falsifier: Two concurrent flows corrupt each other's results, deadlock, or lose lineage rows.
+  status: unverified
+  covered_by: []
+  gap: >
+    No concurrency test exists at all. The claim underwrites the multi-agent isolation pitch.
+    Needs a thread-pool test: N flows x M queries interleaved, then assert every result and
+    every lineage row is present and correct.
+
+- id: QRY-015
+  claim: "catalog() lists flows and counts; catalog(flow) lists that flow's results with columns, types, row counts, descriptions."
+  source: server.py#catalog
+  mode: behavioral
+  falsifier: A documented field is missing from either shape.
+  status: verified
+  covered_by:
+    - tests/test_duck.py::TestFlows::test_catalog_lists_flows_then_results
+    - tests/test_mcp_server.py::TestOtherTools::test_catalog_and_drop
+    - tests/test_lineage.py::TestDescriptions::test_description_recorded_in_lineage_and_catalog
+
+- id: QRY-016
+  claim: "drop(name) drops one result; drop(flow=...) with no name drops the whole flow; reserved schemas cannot be dropped."
+  source: server.py#drop
+  mode: behavioral
+  falsifier: A reserved schema is droppable, or dropping a flow leaves results behind.
+  status: verified
+  covered_by:
+    - tests/test_duck.py::TestFlows::test_drop_result_then_flow
+    - tests/test_duck.py::TestFlows::test_cannot_drop_reserved
+
+- id: QRY-017
+  claim: >
+    profile returns per-column stats over the FULL result with no row cap — numerics get
+    null_rate/min/max/mean/std/p25/p50/p75/p95, text gets unique/top/freq.
+  source: CLAUDE.md#tool-surface
+  mode: behavioral
+  falsifier: A documented statistic is missing, or stats are computed from a sample.
+  status: partial
+  covered_by:
+    - tests/test_duck.py::TestProfile::test_numeric_and_text_stats
+    - tests/test_mcp_server.py::TestOtherTools::test_profile
+  gap: >
+    The no-row-cap half is unproven: nothing profiles a result larger than any internal sampling
+    threshold and checks the stats are exact. Percentile correctness is also not checked against
+    a known distribution.
+
+- id: QRY-018
+  claim: export writes a saved result name OR a full SELECT to csv/json/parquet, creating parent directories, with no row cap.
+  source: server.py#export
+  mode: behavioral
+  falsifier: Export truncates, refuses a raw SELECT, or fails on a missing parent directory.
+  status: partial
+  covered_by:
+    - tests/test_duck.py::TestExport::test_export_result_name
+    - tests/test_duck.py::TestExport::test_export_raw_select
+    - tests/test_duck.py::TestExport::test_export_bad_format
+    - tests/test_mcp_server.py::TestOtherTools::test_export
+  gap: >
+    Parent-directory creation and the no-row-cap promise are not asserted; nor is round-trip
+    fidelity (export then re-attach then compare), which is what an export is FOR.
+
+- id: QRY-019
+  claim: db://tables lists queryable objects — attached-DB tables as <source>.<table> (or <source>.<schema>.<table>), file sources as a bare view name.
+  source: server.py#instructions
+  mode: behavioral
+  falsifier: A listed name is not paste-ready into SQL.
+  status: partial
+  covered_by:
+    - tests/test_multi_source.py::TestObjectNaming::test_non_default_schema_is_listed_three_part
+    - tests/test_multi_source.py::TestObjectNaming::test_every_listed_name_is_paste_ready
+    - tests/test_duck.py::TestIntrospection::test_list_objects_spans_sources
+    - tests/test_mcp_server.py::TestResources::test_list_tables_spans_sources
+    - tests/test_mcp_server.py::TestRegistration::test_resources_registered
+  gap: >
+    "Paste-ready" is now asserted generatively — every listed name is quoted back into a
+    SELECT and must succeed — and the three-part form is checked. Both live in the
+    env-gated multi-source file, so they skip without a Postgres DSN.
+
+- id: QRY-020
+  claim: "db://{table} describes one object: columns, types, primary key, a sample, and a row count."
+  source: server.py#instructions
+  mode: behavioral
+  falsifier: PK or row count is absent for an object that has one.
+  status: verified
+  covered_by:
+    - tests/test_duck.py::TestIntrospection::test_describe_columns_and_pk
+    - tests/test_mcp_server.py::TestResources::test_describe_qualified_table
+
+- id: QRY-021
+  claim: "TableInfo / TableDescription / ColumnInfo are a FROZEN contract shared by the resources."
+  source: CLAUDE.md#frozen-contract
+  mode: invariant
+  falsifier: A field is renamed or dropped and the suite stays green.
+  status: unverified
+  covered_by: []
+  gap: >
+    "Frozen" is enforced by convention only. A golden-schema test (assert the JSON schema of
+    each model against a checked-in snapshot) turns barrier-level into build-breaking.
