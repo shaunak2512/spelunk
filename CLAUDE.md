@@ -277,11 +277,20 @@ is wrong, and the register forces the choice instead of letting it drift. `affor
 (what an *agent* does when handed this surface) cannot be closed by unit tests at all; they need
 an agent harness with an ablation arm, and they are why one is worth building.
 
-Tests needing a live Postgres/MySQL (`tests/test_multi_source.py`) skip unless
-`SPELUNK_TEST_POSTGRES_DSN` / `SPELUNK_TEST_MYSQL_DSN` are set — see `tests/conftest.py`.
-`tests/test_cli.py` drives `main()` as a real subprocess over stdio; when writing such a test,
-drain the child's stdout **and** stderr concurrently, or a ~4KB Windows pipe buffer fills on an
-error path and the server blocks mid-response looking exactly like a hang.
+Tests needing a live Postgres/MySQL (`tests/test_multi_source.py`) resolve a server in order:
+`SPELUNK_TEST_POSTGRES_DSN` / `SPELUNK_TEST_MYSQL_DSN`, else a throwaway Docker container the
+fixture starts and kills, else skip. Docker running = the full suite has zero skips.
+
+Traps worth knowing before writing tests here:
+- **Drain both pipes.** `tests/test_cli.py` drives `main()` as a real subprocess over stdio;
+  read stdout **and** stderr concurrently, or a ~4KB Windows pipe buffer fills on an error path
+  and the server blocks mid-response, looking exactly like a hang.
+- **`DuckDBPyConnection.execute` is read-only** — it cannot be monkeypatched. Swap `_con` for a
+  forwarding proxy instead (`tests/test_workspace.py::_ConnectionProxy`).
+- **`_materialize_query` takes `_lock` internally**, so instrumenting it samples *outside* the
+  critical section and reports overlaps that aren't real. Probe concurrency at the connection.
+- **Memory-limit tests need calibration, not guesses.** DuckDB's usable floor is close to the
+  data size; run any new limit 3x before asserting on it.
 
 ## After making a change
 

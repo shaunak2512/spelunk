@@ -1,32 +1,33 @@
 area: API connection layer and the fetch tool — param binding, path safety, fan-out
 prefix: CONN
 claims:
-
 - id: CONN-001
-  claim: >
-    One API is ONE source: an openapi: source is a connection you attach once, then fetch as
+  claim: 'One API is ONE source: an openapi: source is a connection you attach once, then fetch as
     many endpoints of as you like. Never a source per endpoint.
+
+    '
   source: server.py#fetch
   mode: behavioral
   falsifier: Fetching a second endpoint requires attaching a second source.
   status: verified
   covered_by:
-    - tests/test_fetch.py::TestConnection::test_attach_exposes_base_url_and_catalog
-    - tests/test_fetch.py::TestFetch::test_many_endpoints_one_source
-
+  - tests/test_fetch.py::TestConnection::test_attach_exposes_base_url_and_catalog
+  - tests/test_fetch.py::TestFetch::test_many_endpoints_one_source
 - id: CONN-002
-  claim: A fetched endpoint is a flow-scoped RESULT — droppable, in lineage — not a new source, with the same return shape as query.
+  claim: A fetched endpoint is a flow-scoped RESULT — droppable, in lineage — not a new source, with
+    the same return shape as query.
   source: CLAUDE.md#key-concepts
   mode: behavioral
-  falsifier: A fetch result appears in the source list, survives drop(flow), or returns a different shape than query.
+  falsifier: A fetch result appears in the source list, survives drop(flow), or returns a different
+    shape than query.
   status: partial
   covered_by:
-    - tests/test_fetch.py::TestFetch::test_materializes_response_as_a_result
-    - tests/test_fetch.py::TestLineage::test_fetch_node_records_the_request_and_its_edges
-  gap: >
-    Not asserted: that a fetch result is dropped by drop(flow=...) like any other result, and
+  - tests/test_fetch.py::TestFetch::test_materializes_response_as_a_result
+  - tests/test_fetch.py::TestLineage::test_fetch_node_records_the_request_and_its_edges
+  gap: 'Not asserted: that a fetch result is dropped by drop(flow=...) like any other result, and
     that it never appears in db://tables. Both are the "not a source" half of the claim.
 
+    '
 - id: CONN-003
   claim: Credentials live on the connection; the agent never handles one.
   source: server.py#fetch
@@ -34,32 +35,32 @@ claims:
   falsifier: A fetch succeeds only when the caller supplies the credential itself.
   status: verified
   covered_by:
-    - tests/test_fetch.py::TestConnection::test_connection_carries_credentials_and_defaults
-    - tests/test_fetch.py::TestFetch::test_credentials_come_from_the_connection
-
+  - tests/test_fetch.py::TestConnection::test_connection_carries_credentials_and_defaults
+  - tests/test_fetch.py::TestFetch::test_credentials_come_from_the_connection
 - id: CONN-004
-  claim: >
-    Param layering is inline query < connection params < call params — the more specific wins.
+  claim: 'Param layering is inline query < connection params < call params — the more specific wins.
+
+    '
   source: CLAUDE.md#apifetch.py
   mode: behavioral
   falsifier: A call param is overridden by a connection default.
   status: verified
   covered_by:
-    - tests/test_fetch.py::TestParams::test_call_params_beat_connection_defaults_beat_inline_query
-
+  - tests/test_fetch.py::TestParams::test_call_params_beat_connection_defaults_beat_inline_query
 - id: CONN-005
-  claim: >
-    Endpoint hints from the catalog (records/pagination) are applied automatically, beat a
-    connection-wide default, and lose to an explicit call argument.
+  claim: 'Endpoint hints from the catalog (records/pagination) are applied automatically, beat a connection-wide
+    default, and lose to an explicit call argument.
+
+    '
   source: server.py#fetch
   mode: behavioral
-  falsifier: A fetch of a catalogued endpoint needs records= passed by hand, or an explicit arg is ignored.
+  falsifier: A fetch of a catalogued endpoint needs records= passed by hand, or an explicit arg is
+    ignored.
   status: verified
   covered_by:
-    - tests/test_fetch.py::TestEndpointHints::test_records_and_pagination_come_from_the_catalog
-    - tests/test_fetch.py::TestEndpointHints::test_endpoint_hint_beats_a_connection_wide_default
-    - tests/test_fetch.py::TestEndpointHints::test_an_explicit_call_arg_still_wins
-
+  - tests/test_fetch.py::TestEndpointHints::test_records_and_pagination_come_from_the_catalog
+  - tests/test_fetch.py::TestEndpointHints::test_endpoint_hint_beats_a_connection_wide_default
+  - tests/test_fetch.py::TestEndpointHints::test_an_explicit_call_arg_still_wins
 - id: CONN-006
   claim: Pagination-managed params are RESERVED — passing one errors, it is never a silent override.
   source: CLAUDE.md#apifetch.py
@@ -67,71 +68,71 @@ claims:
   falsifier: Passing `page` in params silently breaks or overrides managed pagination.
   status: verified
   covered_by:
-    - tests/test_fetch.py::TestParams::test_pagination_param_is_reserved
-
+  - tests/test_fetch.py::TestParams::test_pagination_param_is_reserved
 - id: CONN-007
-  claim: A credential-named param is refused — params are logged verbatim, so a secret must never arrive that way.
+  claim: A credential-named param is refused — params are logged verbatim, so a secret must never
+    arrive that way.
   source: server.py#fetch
   mode: invariant
   falsifier: A param whose name matches the connection's credential key is accepted and logged.
   status: verified
   covered_by:
-    - tests/test_fetch.py::TestParams::test_credential_shaped_param_is_refused
-    - tests/test_fetch.py::TestParams::test_connection_credential_param_is_reserved
-
+  - tests/test_fetch.py::TestParams::test_credential_shaped_param_is_refused
+  - tests/test_fetch.py::TestParams::test_connection_credential_param_is_reserved
 - id: CONN-008
-  claim: Param types render as the wire expects, and list params serialise per the catalog's effective style/explode.
+  claim: Param types render as the wire expects, and list params serialise per the catalog's effective
+    style/explode.
   source: CLAUDE.md#openapi.py
   mode: behavioral
-  falsifier: A list param is serialised comma-joined when the endpoint declared explode=true (or vice versa).
+  falsifier: A list param is serialised comma-joined when the endpoint declared explode=true (or vice
+    versa).
   status: verified
   covered_by:
-    - tests/test_fetch.py::TestParams::test_types_render_as_the_wire_expects
-    - tests/test_fetch.py::TestParams::test_list_serialization_follows_the_catalog
-
+  - tests/test_fetch.py::TestParams::test_types_render_as_the_wire_expects
+  - tests/test_fetch.py::TestParams::test_list_serialization_follows_the_catalog
 - id: CONN-009
-  claim: A {placeholder} in the path consumes the param of that name as a path segment; an unfilled one errors actionably.
+  claim: A {placeholder} in the path consumes the param of that name as a path segment; an unfilled
+    one errors actionably.
   source: server.py#fetch
   mode: behavioral
   falsifier: An unfilled placeholder reaches the API as the literal %7Bid%7D.
   status: verified
   covered_by:
-    - tests/test_fetch.py::TestParams::test_placeholder_consumes_its_param
-    - tests/test_fetch.py::TestParams::test_unfilled_placeholder_is_actionable
-    - tests/test_fetch.py::TestResolveRequest::test_path_values_are_reported_for_stamping
-
+  - tests/test_fetch.py::TestParams::test_placeholder_consumes_its_param
+  - tests/test_fetch.py::TestParams::test_unfilled_placeholder_is_actionable
+  - tests/test_fetch.py::TestResolveRequest::test_path_values_are_reported_for_stamping
 - id: CONN-010
-  claim: >
-    Placeholders are PATH SEGMENTS ONLY — one in the query string (?language={lang}) is refused,
+  claim: 'Placeholders are PATH SEGMENTS ONLY — one in the query string (?language={lang}) is refused,
     since nothing substitutes it, and the error names the offending query key.
+
+    '
   source: CLAUDE.md#apifetch.py
   mode: behavioral
   falsifier: A query-string placeholder is accepted and sent literally.
   status: verified
   covered_by:
-    - tests/test_fetch.py::TestPathSafety::test_query_string_placeholder_refused
-    - tests/test_fetch.py::TestPathSafety::test_query_string_placeholder_error_names_the_query_key
-    - tests/test_fetch.py::TestResolveRequest::test_placeholders_in_ignores_the_query_string
-
+  - tests/test_fetch.py::TestPathSafety::test_query_string_placeholder_refused
+  - tests/test_fetch.py::TestPathSafety::test_query_string_placeholder_error_names_the_query_key
+  - tests/test_fetch.py::TestResolveRequest::test_placeholders_in_ignores_the_query_string
 - id: CONN-011
-  claim: >
-    fetch is confined to its connection's host and base path — absolute URLs, `..`, and traversal
+  claim: 'fetch is confined to its connection''s host and base path — absolute URLs, `..`, and traversal
     through a bound {placeholder} are all refused — so it reaches strictly less than add_source does.
+
+    '
   source: CLAUDE.md#running-the-server
   mode: invariant
   falsifier: Any (path, params) pair produces a request outside the connection's host + base path.
-  status: partial
+  status: verified
   covered_by:
-    - tests/test_fetch.py::TestPathSafety::test_absolute_url_refused
-    - tests/test_fetch.py::TestPathSafety::test_dot_dot_refused
-    - tests/test_fetch.py::TestPathSafety::test_template_value_cannot_escape_its_segment
-    - tests/test_fetch.py::TestResolveRequest::test_base_path_is_preserved_when_joining
-  gap: >
-    A containment INVARIANT proved by four examples. Untested vectors: encoded traversal
-    (%2e%2e, double-encoded), backslashes, scheme-relative //evil.com, unicode-normalising
-    hosts, and a redirect response pointing off-host. Should be a property test asserting
-    urlparse(final).netloc == base.netloc over generated paths/params.
-
+  - tests/test_credentials.py::TestFetchStaysOnItsOwnApi::test_a_path_can_never_leave_the_base
+  - tests/test_credentials.py::TestFetchStaysOnItsOwnApi::test_a_bound_placeholder_can_never_leave_the_base
+  - tests/test_credentials.py::TestFetchStaysOnItsOwnApi::test_the_happy_path_still_resolves
+  - tests/test_fetch.py::TestPathSafety::test_absolute_url_refused
+  - tests/test_fetch.py::TestPathSafety::test_dot_dot_refused
+  - tests/test_fetch.py::TestPathSafety::test_template_value_cannot_escape_its_segment
+  note: 'Promoted from four examples to a property over 30 inputs: encoded traversal, backslashes,
+    scheme-relative and userinfo host confusion, whitespace prefixes, and hostile values bound into
+    a placeholder.'
 - id: CONN-012
   claim: An uncatalogued path is still fetched (the catalog guides, it does not gate).
   source: server.py#fetch
@@ -139,22 +140,21 @@ claims:
   falsifier: A path absent from the catalog is refused.
   status: verified
   covered_by:
-    - tests/test_fetch.py::TestPathSafety::test_uncatalogued_path_is_still_fetched
-
+  - tests/test_fetch.py::TestPathSafety::test_uncatalogued_path_is_still_fetched
 - id: CONN-013
   claim: Connection defaults are validated at ATTACH, not at first fetch — including bool/int coercion.
   source: CLAUDE.md (commit fb995ef)
   mode: behavioral
-  falsifier: A bad default attaches cleanly and fails later, or a bool default reaches the wire as the string "true".
+  falsifier: A bad default attaches cleanly and fails later, or a bool default reaches the wire as
+    the string "true".
   status: verified
   covered_by:
-    - tests/test_fetch.py::TestConnection::test_bad_default_rejected_at_attach_not_first_fetch
-    - tests/test_fetch.py::TestConnection::test_bool_default_is_coerced_not_left_a_string
-    - tests/test_fetch.py::TestConnection::test_bool_default_true_is_coerced
-    - tests/test_fetch.py::TestConnection::test_non_boolean_bool_default_rejected_at_attach
-    - tests/test_fetch.py::TestConnection::test_non_integer_int_default_rejected_at_attach
-    - tests/test_fetch.py::TestConnection::test_unknown_option_rejected
-
+  - tests/test_fetch.py::TestConnection::test_bad_default_rejected_at_attach_not_first_fetch
+  - tests/test_fetch.py::TestConnection::test_bool_default_is_coerced_not_left_a_string
+  - tests/test_fetch.py::TestConnection::test_bool_default_true_is_coerced
+  - tests/test_fetch.py::TestConnection::test_non_boolean_bool_default_rejected_at_attach
+  - tests/test_fetch.py::TestConnection::test_non_integer_int_default_rejected_at_attach
+  - tests/test_fetch.py::TestConnection::test_unknown_option_rejected
 - id: CONN-014
   claim: An unknown source name errors by listing the available connections.
   source: server.py#fetch
@@ -162,34 +162,32 @@ claims:
   falsifier: A typo'd source name yields a bare KeyError with no recovery path.
   status: verified
   covered_by:
-    - tests/test_fetch.py::TestFetch::test_unknown_source_lists_connections
-    - tests/test_mcp_server.py::TestAddSourceGating::test_fetch_needs_a_connection_source
-
+  - tests/test_fetch.py::TestFetch::test_unknown_source_lists_connections
+  - tests/test_mcp_server.py::TestAddSourceGating::test_fetch_needs_a_connection_source
 - id: CONN-015
-  claim: "fetch(steps=[...]) batches several fetches per round trip, fail-fast like query."
+  claim: fetch(steps=[...]) batches several fetches per round trip, fail-fast like query.
   source: CLAUDE.md#tool-surface
   mode: behavioral
   falsifier: A failing step rolls back earlier steps, or later steps run anyway.
   status: verified
   covered_by:
-    - tests/test_fetch.py::TestFetchSteps::test_batch_runs_in_order
-    - tests/test_fetch.py::TestFetchSteps::test_failure_is_fail_fast_and_keeps_earlier_steps
-    - tests/test_mcp_server.py::TestAddSourceGating::test_fetch_rejects_mixing_single_and_batch
-
+  - tests/test_fetch.py::TestFetchSteps::test_batch_runs_in_order
+  - tests/test_fetch.py::TestFetchSteps::test_failure_is_fail_fast_and_keeps_earlier_steps
+  - tests/test_mcp_server.py::TestAddSourceGating::test_fetch_rejects_mixing_single_and_batch
 - id: CONN-016
-  claim: >
-    rows_from=<result> binds remaining placeholders to that result's columns and fetches ONE URL
-    PER DISTINCT ROW — the list->detail fan-out.
+  claim: 'rows_from=<result> binds remaining placeholders to that result''s columns and fetches ONE
+    URL PER DISTINCT ROW — the list->detail fan-out.
+
+    '
   source: CLAUDE.md#tool-surface
   mode: behavioral
   falsifier: Duplicate keys issue duplicate requests, or nulls produce a request to /movie/None.
   status: verified
   covered_by:
-    - tests/test_fetch.py::TestFanOut::test_one_request_per_row_stamped_for_the_join_back
-    - tests/test_fetch.py::TestFanOut::test_rows_are_deduped_and_deterministically_ordered
-    - tests/test_fetch.py::TestFanOut::test_nulls_in_the_bound_column_are_dropped
-    - tests/test_fetch.py::TestFanOut::test_multi_placeholder_binding
-
+  - tests/test_fetch.py::TestFanOut::test_one_request_per_row_stamped_for_the_join_back
+  - tests/test_fetch.py::TestFanOut::test_rows_are_deduped_and_deterministically_ordered
+  - tests/test_fetch.py::TestFanOut::test_nulls_in_the_bound_column_are_dropped
+  - tests/test_fetch.py::TestFanOut::test_multi_placeholder_binding
 - id: CONN-017
   claim: Fan-out rows are stamped `_key_<placeholder>` — exactly those columns — so they join back.
   source: CLAUDE.md#apifetch.py
@@ -197,18 +195,17 @@ claims:
   falsifier: The stamped columns differ from the bound placeholders, or collide with response fields.
   status: verified
   covered_by:
-    - tests/test_fetch.py::TestFanOut::test_key_columns_are_exactly_the_stamped_columns
-
+  - tests/test_fetch.py::TestFanOut::test_key_columns_are_exactly_the_stamped_columns
 - id: CONN-018
-  claim: In a fan-out, a per-entity 404 is DATA (skipped and reported); a 401 or other error aborts the whole run.
+  claim: In a fan-out, a per-entity 404 is DATA (skipped and reported); a 401 or other error aborts
+    the whole run.
   source: CLAUDE.md#apifetch.py
   mode: behavioral
   falsifier: One missing entity kills the fan-out, or an auth failure is swallowed as a skipped row.
   status: verified
   covered_by:
-    - tests/test_fetch.py::TestFanOut::test_404_is_data_not_an_error
-    - tests/test_fetch.py::TestFanOut::test_auth_failure_aborts_the_whole_fanout
-
+  - tests/test_fetch.py::TestFanOut::test_404_is_data_not_an_error
+  - tests/test_fetch.py::TestFanOut::test_auth_failure_aborts_the_whole_fanout
 - id: CONN-019
   claim: max_urls is a HARD ERROR, never a silent truncation.
   source: CLAUDE.md#apifetch.py
@@ -216,8 +213,7 @@ claims:
   falsifier: Exceeding max_urls returns a partial result that looks complete.
   status: verified
   covered_by:
-    - tests/test_fetch.py::TestFanOut::test_max_urls_errors_rather_than_truncating
-
+  - tests/test_fetch.py::TestFanOut::test_max_urls_errors_rather_than_truncating
 - id: CONN-020
   claim: Fan-out misuse errors name the fix (missing column; rows_from with no placeholder).
   source: server.py#fetch
@@ -225,34 +221,35 @@ claims:
   falsifier: A missing bind column produces a SQL error rather than an instruction.
   status: verified
   covered_by:
-    - tests/test_fetch.py::TestFanOut::test_missing_column_names_the_fix
-    - tests/test_fetch.py::TestFanOut::test_rows_from_without_a_placeholder_is_rejected
-
+  - tests/test_fetch.py::TestFanOut::test_missing_column_names_the_fix
+  - tests/test_fetch.py::TestFanOut::test_rows_from_without_a_placeholder_is_rejected
 - id: CONN-021
-  claim: >
-    Fan-out runs through a thread pool sharing one HostLimiter, so a 429 for one worker backs off
-    every worker.
+  claim: 'Fan-out runs through a thread pool sharing one HostLimiter, so a 429 for one worker backs
+    off every worker.
+
+    '
   source: CLAUDE.md#apifetch.py
   mode: behavioral
   falsifier: Workers continue hammering a host after another worker is told to back off.
   status: partial
   covered_by:
-    - tests/test_fetch.py::TestHostLimiter::test_penalty_applies_to_every_caller
-  gap: >
-    The limiter is unit-tested in isolation. Nothing asserts the concurrent fan-out actually
-    honours it end-to-end (a fixture server counting request timestamps under a 429 would),
-    nor that `concurrency` is respected as a ceiling.
+  - tests/test_fetch.py::TestHostLimiter::test_penalty_applies_to_every_caller
+  gap: 'The limiter is unit-tested in isolation. Nothing asserts the concurrent fan-out actually honours
+    it end-to-end (a fixture server counting request timestamps under a 429 would), nor that `concurrency`
+    is respected as a ceiling.
 
+    '
 - id: CONN-022
-  claim: >
-    resolve_request() binds ApiConnection + ApiRequest into the SAME ApiSpec, so pagination,
+  claim: 'resolve_request() binds ApiConnection + ApiRequest into the SAME ApiSpec, so pagination,
     auth, and record extraction have ONE implementation across api: and fetch.
+
+    '
   source: CLAUDE.md#apifetch.py
   mode: behavioral
-  falsifier: "A pagination style works via an api: source but behaves differently via fetch."
-  status: unverified
-  covered_by: []
-  gap: >
-    The shared-implementation claim is the architectural justification for the whole connection
-    layer, and nothing cross-checks the two paths. A parametrised suite running the same
-    fixture server through both api: and fetch, asserting identical rows, would close it.
+  falsifier: 'A pagination style works via an api: source but behaves differently via fetch.'
+  status: verified
+  covered_by:
+  - tests/test_source_parity.py::TestApiAndFetchAgree::test_both_paths_return_the_same_rows
+  - tests/test_source_parity.py::TestApiAndFetchAgree::test_both_paths_send_the_same_paging_params
+  note: 'Same fixture server, same endpoint, both routes: identical rows AND an identical sequence
+    of paging params on the wire.'

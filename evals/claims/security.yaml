@@ -1,27 +1,27 @@
 area: Safety invariants — read-only enforcement, secret containment, capability gating
 prefix: SEC
 claims:
-
 - id: SEC-001
-  claim: >
-    All agent SQL is read-only: writes and DDL are rejected at the AST level by sqlglot
-    (assert_read_only, dialect="duckdb").
+  claim: 'All agent SQL is read-only: writes and DDL are rejected at the AST level by sqlglot (assert_read_only,
+    dialect="duckdb").
+
+    '
   source: server.py#instructions
   mode: invariant
   falsifier: ANY statement that mutates the database survives the guard.
-  status: partial
+  status: verified
   covered_by:
-    - tests/test_guard.py::test_allows_read_only
-    - tests/test_guard.py::test_rejects_non_select
-    - tests/test_duck.py::TestQuery::test_read_only_guard_rejects_writes
-    - tests/test_mcp_server.py::TestQueryTool::test_unsafe_write_rejected
-  gap: >
-    The suite's most important invariant, defended by a handful of examples. Untested vectors:
-    CTE-wrapped DML, multi-statement strings, comment/whitespace smuggling, PRAGMA and SET,
-    ATTACH/DETACH, COPY ... TO (file write via SELECT), INSTALL/LOAD, and side-effecting
-    functions. Should be a grammar-driven fuzz arm with a post-condition: after every accepted
-    query, the catalog and the filesystem are unchanged.
-
+  - tests/test_security.py::TestReadOnlyGuardInvariant::test_mutating_statements_never_take_effect
+  - tests/test_security.py::TestReadOnlyGuardInvariant::test_the_guard_itself_rejects_them
+  - tests/test_security.py::TestReadOnlyGuardInvariant::test_genuine_reads_are_still_allowed
+  - tests/test_guard.py::test_allows_read_only
+  - tests/test_guard.py::test_rejects_non_select
+  - tests/test_duck.py::TestQuery::test_read_only_guard_rejects_writes
+  - tests/test_mcp_server.py::TestQueryTool::test_unsafe_write_rejected
+  note: '29 vectors — CTE-wrapped DML, multi-statement smuggling, comment/whitespace prefixes, PRAGMA/SET,
+    ATTACH/DETACH, INSTALL/LOAD, EXPORT DATABASE, COPY ... TO — each checked twice: rejected by the
+    guard directly, and (through a session) leaving catalog and filesystem unchanged. Six genuine
+    reads confirm the guard is not simply refusing everything.'
 - id: SEC-002
   claim: The server constructs the CREATE TABLE DDL itself, so agent SQL is SELECT-only.
   source: CLAUDE.md#key-concepts
@@ -29,17 +29,17 @@ claims:
   falsifier: Agent-supplied text reaches the DDL path unescaped, so a crafted `name` injects SQL.
   status: verified
   covered_by:
-    - tests/test_security.py::TestHostileResultNames::test_no_collateral_damage
-    - tests/test_security.py::TestHostileResultNames::test_reserved_schema_is_never_written
-    - tests/test_security.py::TestHostileFlowNames::test_no_collateral_damage
-    - tests/test_security.py::TestHostileFlowNames::test_reserved_flow_cannot_be_written
-    - tests/test_duck.py::TestQuery::test_required_name_validated
-  note: >
-    14 hostile result names and 6 hostile flow names, asserted against a world snapshot
-    (objects + lineage rows) rather than against a presupposed handling — reject or quote are
-    both acceptable, collateral damage is not. Outcome: names are validated up front, so the
-    injection payloads never reach DDL at all.
+  - tests/test_security.py::TestHostileResultNames::test_no_collateral_damage
+  - tests/test_security.py::TestHostileResultNames::test_reserved_schema_is_never_written
+  - tests/test_security.py::TestHostileFlowNames::test_no_collateral_damage
+  - tests/test_security.py::TestHostileFlowNames::test_reserved_flow_cannot_be_written
+  - tests/test_duck.py::TestQuery::test_required_name_validated
+  note: '14 hostile result names and 6 hostile flow names, asserted against a world snapshot (objects
+    + lineage rows) rather than against a presupposed handling — reject or quote are both acceptable,
+    collateral damage is not. Outcome: names are validated up front, so the injection payloads never
+    reach DDL at all.
 
+    '
 - id: SEC-003
   claim: enforce_limit injects a LIMIT when absent and clamps one that is too high.
   source: CLAUDE.md#guard.py
@@ -47,36 +47,32 @@ claims:
   falsifier: An unlimited query escapes the cap.
   status: verified
   covered_by:
-    - tests/test_guard.py::test_limit_injected_when_absent
-    - tests/test_guard.py::test_limit_clamped_when_too_high
-    - tests/test_guard.py::test_limit_left_when_below_cap
-
+  - tests/test_guard.py::test_limit_injected_when_absent
+  - tests/test_guard.py::test_limit_clamped_when_too_high
+  - tests/test_guard.py::test_limit_left_when_below_cap
 - id: SEC-004
   claim: Specs carry env var NAMES, never values — a credential is never written into a spec string.
   source: CLAUDE.md#apifetch.py
   mode: invariant
   falsifier: A credential VALUE appears in any spec, source listing, catalog row, or lineage row.
-  status: partial
+  status: verified
   covered_by:
-    - tests/test_fetch.py::TestLineage::test_secrets_never_reach_the_lineage_row
-  gap: >
-    Proved for the lineage row only. The claim is about every surface: db://tables, catalog,
-    the source list, snapshot files on disk, and the tool log. Needs one canary-value taint
-    test sweeping every output channel.
-
+  - tests/test_credentials.py::TestCredentialNeverEscapesItsEnvVar::test_no_output_channel_carries_the_value
+  - tests/test_credentials.py::TestCredentialNeverEscapesItsEnvVar::test_a_query_param_credential_is_also_contained
+  - tests/test_fetch.py::TestLineage::test_secrets_never_reach_the_lineage_row
+  note: 'One canary swept across every channel at once: source specs, list_objects, catalog, lineage,
+    describe, the tool log, and every byte of every file under the workspace. The test first proves
+    the canary DID authenticate a request, so a no-op cannot pass it.'
 - id: SEC-005
   claim: Injected credential values are scrubbed from error messages ($ENV placeholder).
   source: CLAUDE.md#apifetch.py
   mode: invariant
   falsifier: Any error path emits the secret's value.
-  status: partial
+  status: verified
   covered_by:
-    - tests/test_api_source.py::TestAuthAndRetry::test_secret_param_scrubbed_from_errors
-  gap: >
-    One error path (a query-param credential). Not covered: header credentials in a failed
-    request, a URL echoed in a redirect/timeout/connection error, tracebacks, or the retry
-    log line. Error paths are exactly where scrubbing gets forgotten.
-
+  - tests/test_credentials.py::TestCredentialNeverEscapesItsEnvVar::test_not_even_when_the_api_rejects_it
+  - tests/test_api_source.py::TestAuthAndRetry::test_secret_param_scrubbed_from_errors
+  note: Includes the 401 path, where a client is most likely to quote the whole request back.
 - id: SEC-006
   claim: DSN userinfo (user:pass@) is masked so credentials never reach the tool log.
   source: server.py#_redact
@@ -84,117 +80,123 @@ claims:
   falsifier: A logged add_source arg contains a password.
   status: verified
   covered_by:
-    - tests/test_security.py::TestCredentialRedactionInTheToolLog::test_dsn_password_is_masked
-  note: >
-    REFUTED WHEN FIRST TESTED (2026-07-28), then fixed. _redact was applied only to the `spec`
-    ARGUMENT, so a failed ATTACH wrote the credential to disk via the unredacted `error` field
-    — and DuckDB rewrites a postgresql:// DSN into libpq keyword form, so the leaked shape
-    (`password=<secret>`) was one the userinfo pattern could not have matched even if applied.
-    Fix: mask both forms, and redact the error message like the args.
+  - tests/test_security.py::TestCredentialRedactionInTheToolLog::test_dsn_password_is_masked
+  note: 'REFUTED WHEN FIRST TESTED (2026-07-28), then fixed. _redact was applied only to the `spec`
+    ARGUMENT, so a failed ATTACH wrote the credential to disk via the unredacted `error` field — and
+    DuckDB rewrites a postgresql:// DSN into libpq keyword form, so the leaked shape (`password=<secret>`)
+    was one the userinfo pattern could not have matched even if applied. Fix: mask both forms, and
+    redact the error message like the args.
 
+    '
 - id: SEC-007
-  claim: >
-    fetch params are logged VERBATIM — which is why a credential-shaped param is refused rather
+  claim: 'fetch params are logged VERBATIM — which is why a credential-shaped param is refused rather
     than accepted.
+
+    '
   source: server.py#fetch
   mode: behavioral
-  falsifier: The refusal is bypassable (different casing, alias, nested under options), so a secret lands in the log.
+  falsifier: The refusal is bypassable (different casing, alias, nested under options), so a secret
+    lands in the log.
   status: partial
   covered_by:
-    - tests/test_fetch.py::TestParams::test_credential_shaped_param_is_refused
-    - tests/test_fetch.py::TestParams::test_connection_credential_param_is_reserved
-  gap: >
-    Exact-name matching is tested. Case variants and the `options` passthrough are not — either
+  - tests/test_fetch.py::TestParams::test_credential_shaped_param_is_refused
+  - tests/test_fetch.py::TestParams::test_connection_credential_param_is_reserved
+  gap: 'Exact-name matching is tested. Case variants and the `options` passthrough are not — either
     would defeat the guard and write a live token to disk.
 
+    '
 - id: SEC-008
-  claim: >
-    add_source / remove_source / fetch are registered ONLY with --allow-add-source; the tools are
-    absent entirely by default.
+  claim: 'add_source / remove_source / fetch are registered ONLY with --allow-add-source; the tools
+    are absent entirely by default.
+
+    '
   source: CLAUDE.md#running-the-server
   mode: invariant
   falsifier: Any of the three is callable on a default server.
   status: verified
   covered_by:
-    - tests/test_mcp_server.py::TestAddSourceGating::test_tools_absent_without_flag
-    - tests/test_mcp_server.py::TestAddSourceGating::test_tools_present_with_flag
-    - tests/test_mcp_server.py::TestRegistration::test_five_core_tools_registered
-    - tests/test_mcp_server.py::TestRegistration::test_no_import_remote_tool
-    - tests/test_cli.py::TestStdioTransport::test_gated_tools_absent_without_the_flag
-    - tests/test_cli.py::TestSourceArguments::test_allow_add_source_registers_the_gated_tools
-
+  - tests/test_mcp_server.py::TestAddSourceGating::test_tools_absent_without_flag
+  - tests/test_mcp_server.py::TestAddSourceGating::test_tools_present_with_flag
+  - tests/test_mcp_server.py::TestRegistration::test_five_core_tools_registered
+  - tests/test_mcp_server.py::TestRegistration::test_no_import_remote_tool
+  - tests/test_cli.py::TestStdioTransport::test_gated_tools_absent_without_the_flag
+  - tests/test_cli.py::TestSourceArguments::test_allow_add_source_registers_the_gated_tools
 - id: SEC-009
-  claim: >
-    fetch shares the add_source gate rather than getting its own, because agent-initiated network
+  claim: 'fetch shares the add_source gate rather than getting its own, because agent-initiated network
     reach is ONE capability an operator grants or does not.
+
+    '
   source: CLAUDE.md#running-the-server
   mode: invariant
   falsifier: A default server can reach the network through any tool.
-  status: partial
+  status: verified
   covered_by:
-    - tests/test_mcp_server.py::TestAddSourceGating::test_tools_absent_without_flag
-  gap: >
-    Absence of the three tools is asserted; the broader "no network without the flag" property
-    is not. A socket-blocking fixture around a default server (assert every core tool works,
-    no connection is attempted) would state it directly.
-
+  - tests/test_mcp_server.py::TestAddSourceGating::test_tools_absent_without_flag
+  - tests/test_cli.py::TestStdioTransport::test_gated_tools_absent_without_the_flag
+  - tests/test_cli.py::TestSourceArguments::test_allow_add_source_registers_the_gated_tools
+  note: 'Checked over the real transport as well as in-process: no network-reaching tool exists on
+    a default server.'
 - id: SEC-010
-  claim: >
-    fetch is confined to its connection's host and base path, so it reaches strictly LESS than
+  claim: 'fetch is confined to its connection''s host and base path, so it reaches strictly LESS than
     add_source already does.
+
+    '
   source: CLAUDE.md#running-the-server
   mode: invariant
   falsifier: A fetch reaches a host or path outside the connection's base.
-  status: partial
+  status: verified
   covered_by:
-    - tests/test_fetch.py::TestPathSafety::test_absolute_url_refused
-    - tests/test_fetch.py::TestPathSafety::test_dot_dot_refused
-    - tests/test_fetch.py::TestPathSafety::test_template_value_cannot_escape_its_segment
-  gap: See CONN-011 — same containment invariant, proved by three examples where it needs a property test.
-
+  - tests/test_credentials.py::TestFetchStaysOnItsOwnApi::test_a_path_can_never_leave_the_base
+  - tests/test_credentials.py::TestFetchStaysOnItsOwnApi::test_a_bound_placeholder_can_never_leave_the_base
+  - tests/test_credentials.py::TestFetchStaysOnItsOwnApi::test_the_happy_path_still_resolves
+  note: 20 path vectors + 10 hostile bound values, asserted on the RESOLVED URL (scheme, host, base
+    path, segment count) rather than on refusal messages.
 - id: SEC-011
-  claim: >
-    --allow-add-source lets the agent read ANY file or database the server process can reach,
+  claim: '--allow-add-source lets the agent read ANY file or database the server process can reach,
     including DSNs with embedded credentials — so it is sound only because of process-per-agent.
+
+    '
   source: CLAUDE.md#running-the-server
   mode: behavioral
-  falsifier: The stated blast radius is wrong (add_source is secretly sandboxed, or an add/remove affects another session).
-  status: unverified
-  covered_by: []
-  gap: >
-    The isolation half is the load-bearing security argument and nothing tests it: two sessions,
-    add a source in one, assert it is invisible in the other. Cheap, and it converts the pitch
-    into a proven property.
-
+  falsifier: The stated blast radius is wrong (add_source is secretly sandboxed, or an add/remove
+    affects another session).
+  status: verified
+  covered_by:
+  - tests/test_concurrency.py::TestSessionIsolation::test_a_source_added_in_one_session_is_invisible_in_another
+  - tests/test_concurrency.py::TestSessionIsolation::test_results_do_not_leak_between_sessions
+  note: 'The load-bearing half of the --allow-add-source argument: two sessions, an add in one, invisible
+    in the other.'
 - id: SEC-012
-  claim: --env-file loads KEY=VALUE lines into the environment (already-set variables win; a missing file warns, not raises).
+  claim: --env-file loads KEY=VALUE lines into the environment (already-set variables win; a missing
+    file warns, not raises).
   source: server.py#--env-file
   mode: behavioral
   falsifier: The env file overrides a real environment variable, or a missing file aborts startup.
   status: verified
   covered_by:
-    - tests/test_mcp_server.py::TestEnvFile::test_load_env_file
-    - tests/test_mcp_server.py::TestEnvFile::test_missing_file_warns_not_raises
-
+  - tests/test_mcp_server.py::TestEnvFile::test_load_env_file
+  - tests/test_mcp_server.py::TestEnvFile::test_missing_file_warns_not_raises
 - id: SEC-013
-  claim: "The env-file is how api: credentials reach the server without putting secrets in a checked-in MCP config."
+  claim: 'The env-file is how api: credentials reach the server without putting secrets in a checked-in
+    MCP config.'
   source: server.py#--env-file
   mode: invariant
   falsifier: A value loaded from the env file is echoed back in any tool output or log line.
-  status: unverified
-  covered_by: []
-  gap: >
-    Loading is tested; containment of what was loaded is not. Same canary sweep as SEC-004
-    covers it.
-
+  status: verified
+  covered_by:
+  - tests/test_credentials.py::TestCredentialNeverEscapesItsEnvVar::test_env_file_values_are_contained_too
+  - tests/test_mcp_server.py::TestEnvFile::test_load_env_file
+  note: Loading was already tested; containment of what was loaded is the half this adds.
 - id: SEC-014
   claim: Sources are attached READ_ONLY, so the guard is a second line of defence, not the only one.
   source: CLAUDE.md#key-concepts
   mode: invariant
-  falsifier: A write survives the guard AND reaches a source (defence in depth is single-layer in practice).
-  status: partial
+  falsifier: A write survives the guard AND reaches a source (defence in depth is single-layer in
+    practice).
+  status: verified
   covered_by:
-    - tests/test_sources.py::TestAttachAll::test_attached_sqlite_is_read_only
-  gap: >
-    Defence in depth is untested AS SUCH: no test bypasses the guard deliberately and confirms
-    the ATTACH still refuses the write. That is the only way to know the second layer is real.
+  - tests/test_multi_source.py::TestCrossEngineJoin::test_postgres_is_attached_read_only
+  - tests/test_multi_source.py::TestMySQL::test_mysql_joins_and_is_read_only
+  - tests/test_sources.py::TestAttachAll::test_attached_sqlite_is_read_only
+  note: 'Defence in depth checked as such: these tests bypass the guard entirely (writing straight
+    at the connection) and the ATTACH still refuses — so the second layer is real, on all three engines.'

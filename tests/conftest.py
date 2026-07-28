@@ -5,15 +5,19 @@ The ``api`` fixture is a local threaded mock HTTP server shared by the ``api:`` 
 and the ``fetch`` tests — no network anywhere in the suite.
 
 The ``postgres_dsn`` / ``mysql_dsn`` fixtures are the exception: they need a real server,
-because DuckDB's postgres/mysql extensions speak the wire protocol. Each reads a DSN from the
-environment and skips when there isn't one.
+because DuckDB's postgres/mysql extensions speak the wire protocol. Each resolves in order —
+an explicit DSN from the environment, else a throwaway Docker container, else skip.
 """
 from __future__ import annotations
 
 import json
 import os
+import shutil
+import socket
 import sqlite3
+import subprocess
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
@@ -142,14 +146,42 @@ def csv_file(tmp_path) -> str:
 # SQLite x a prior result) and QRY-019 (<source>.<schema>.<table> naming) cannot be falsified
 # without a live server: DuckDB's postgres/mysql extensions speak the real wire protocol.
 #
-# Point the suite at one you already have; without it these tests skip, which leaves those
-# claims honestly unverified rather than silently unexercised:
+# Resolution order, so the same tests run on a laptop and in CI without a second code path:
+#   1. SPELUNK_TEST_POSTGRES_DSN / SPELUNK_TEST_MYSQL_DSN — a server you already have.
+#   2. Docker, if the daemon answers — a throwaway container, killed on teardown.
+#   3. Skip, naming both options. A skip leaves the claim honestly unverified.
 #
 #   $env:SPELUNK_TEST_POSTGRES_DSN = "postgresql://postgres:pw@127.0.0.1:5432/spelunk"
-#   $env:SPELUNK_TEST_MYSQL_DSN    = "mysql://root:pw@127.0.0.1:3306/spelunk"
-#
-# Any throwaway server works, e.g.
-#   docker run -d --rm -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=spelunk -p 5432:5432 postgres:16-alpine
+
+_DOCKER_IMAGES = {"postgres": "postgres:16-alpine", "mysql": "mysql:8"}
+_INNER_PORT = {"postgres": 5432, "mysql": 3306}
+_CONTAINER_ENV = {
+    "postgres": ["-e", "POSTGRES_PASSWORD=spelunk", "-e", "POSTGRES_DB=spelunk"],
+    "mysql": ["-e", "MYSQL_ROOT_PASSWORD=spelunk", "-e", "MYSQL_DATABASE=spelunk"],
+}
+_CONTAINER_DSN = {
+    "postgres": "postgresql://postgres:spelunk@127.0.0.1:{port}/spelunk",
+    "mysql": "mysql://root:spelunk@127.0.0.1:{port}/spelunk",
+}
+
+
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _docker_available() -> bool:
+    if not shutil.which("docker"):
+        return False
+    try:
+        probe = subprocess.run(
+            ["docker", "info", "--format", "{{.ServerVersion}}"],
+            capture_output=True, text=True, timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return probe.returncode == 0
 
 
 def _seed_db(engine: str, dsn: str) -> None:
@@ -172,7 +204,9 @@ def _seed_db(engine: str, dsn: str) -> None:
         )
         if engine == "postgres":
             # QRY-019's <source>.<schema>.<table> form only exists off the default schema.
-            con.execute("CREATE SCHEMA IF NOT EXISTS hr")
+            # Must be qualified: an unqualified CREATE SCHEMA lands in DuckDB's own catalog,
+            # not in the attached server, and the table below then has nowhere to go.
+            con.execute("CREATE SCHEMA IF NOT EXISTS seed.hr")
             con.execute("DROP TABLE IF EXISTS seed.hr.salaries")
             con.execute("CREATE TABLE seed.hr.salaries (id INTEGER, salary INTEGER)")
             con.execute("INSERT INTO seed.hr.salaries VALUES (1,120000),(2,95000),(3,150000)")
@@ -180,22 +214,58 @@ def _seed_db(engine: str, dsn: str) -> None:
         con.close()
 
 
-def _live_db(engine: str, env_var: str) -> str:
+def _seed_with_retry(engine: str, dsn: str, timeout: float) -> None:
+    """A container's port opens before the server finishes initialising, so ATTACH-and-seed IS
+    the readiness probe. Retry it rather than sleeping a guessed interval."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            _seed_db(engine, dsn)
+            return
+        except Exception:
+            if time.monotonic() > deadline:
+                raise
+            time.sleep(1.0)
+
+
+def _live_db(engine: str, env_var: str, timeout: float):
     dsn = os.environ.get(env_var)
-    if not dsn:
-        pytest.skip(f"needs a live {engine} server — set {env_var} (see tests/conftest.py)")
-    _seed_db(engine, dsn)
-    return dsn
+    if dsn:
+        _seed_db(engine, dsn)
+        yield dsn
+        return
+
+    if not _docker_available():
+        pytest.skip(
+            f"needs a {engine} server: set {env_var}, or start Docker so the suite can run "
+            f"{_DOCKER_IMAGES[engine]} itself"
+        )
+
+    port = _free_port()
+    run = subprocess.run(
+        ["docker", "run", "-d", "--rm", "-p", f"{port}:{_INNER_PORT[engine]}",
+         *_CONTAINER_ENV[engine], _DOCKER_IMAGES[engine]],
+        capture_output=True, text=True, timeout=600,
+    )
+    if run.returncode != 0:
+        pytest.skip(f"could not start a {engine} container: {run.stderr.strip()}")
+    container = run.stdout.strip()
+    try:
+        dsn = _CONTAINER_DSN[engine].format(port=port)
+        _seed_with_retry(engine, dsn, timeout)
+        yield dsn
+    finally:
+        subprocess.run(["docker", "kill", container], capture_output=True, timeout=120)
 
 
 @pytest.fixture(scope="session")
-def postgres_dsn() -> str:
-    return _live_db("postgres", "SPELUNK_TEST_POSTGRES_DSN")
+def postgres_dsn():
+    yield from _live_db("postgres", "SPELUNK_TEST_POSTGRES_DSN", timeout=120)
 
 
 @pytest.fixture(scope="session")
-def mysql_dsn() -> str:
-    return _live_db("mysql", "SPELUNK_TEST_MYSQL_DSN")
+def mysql_dsn():
+    yield from _live_db("mysql", "SPELUNK_TEST_MYSQL_DSN", timeout=300)
 
 
 @pytest.fixture

@@ -15,10 +15,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 
 import pytest
 
 from spelunk.core.duck import DuckSession
+from spelunk.core.types import UnsafeSQLError
 from spelunk.mcp.server import build_server
 
 # Names that would be catastrophic if interpolated raw into DDL, plus the merely awkward ones
@@ -178,3 +180,100 @@ class TestCredentialRedactionInTheToolLog:
         assert "//***@" in record["args"]["spec"]
         assert record["outcome"] == "error"
         assert "password=***" in record["error"]
+
+
+# --------------------------------------------------------------------------- #
+# SEC-001: the read-only guard as an INVARIANT, not four examples
+# --------------------------------------------------------------------------- #
+MUTATING_SQL = [
+    # Plain DML/DDL
+    "DROP TABLE keep",
+    "DELETE FROM keep",
+    "UPDATE keep SET name = 'x'",
+    "INSERT INTO keep VALUES (9, 'x')",
+    "TRUNCATE keep",
+    "ALTER TABLE keep RENAME TO gone",
+    "CREATE TABLE evil AS SELECT 1",
+    "CREATE OR REPLACE VIEW keep AS SELECT 1",
+    "CREATE SCHEMA evil",
+    "DROP SCHEMA \"default\" CASCADE",
+    # CTE-wrapped DML — parses as a statement whose top level is not a SELECT
+    "WITH x AS (SELECT 1) DELETE FROM keep",
+    "WITH x AS (SELECT 1) INSERT INTO keep SELECT 1, 'x'",
+    # Multi-statement smuggling
+    "SELECT 1; DROP TABLE keep",
+    "SELECT 1;DROP TABLE keep;",
+    # Comment / whitespace smuggling
+    "/* comment */ DROP TABLE keep",
+    "-- lead\nDROP TABLE keep",
+    "\n\t  DROP TABLE keep",
+    # Session and catalog manipulation
+    "PRAGMA database_list",
+    "SET memory_limit = '1GB'",
+    "ATTACH 'evil.db' AS evil",
+    "DETACH shop",
+    "INSTALL httpfs",
+    "LOAD httpfs",
+    "CALL pragma_database_size()",
+    "CHECKPOINT",
+    "BEGIN TRANSACTION",
+    "EXPORT DATABASE 'leak'",
+    # Filesystem writes expressed as a SELECT
+    "COPY (SELECT 1) TO 'leaked.csv'",
+    "COPY keep TO 'leaked.parquet' (FORMAT PARQUET)",
+]
+
+
+class TestReadOnlyGuardInvariant:
+    """SEC-001: ANY statement that mutates the database must not survive the guard.
+
+    Previously defended by four examples. The post-condition here is what makes it an
+    invariant rather than a list: after every statement the guard ACCEPTS, the catalog and the
+    working directory must be byte-for-byte unchanged.
+    """
+
+    @pytest.mark.parametrize("sql", MUTATING_SQL)
+    def test_mutating_statements_never_take_effect(self, session, tmp_path, monkeypatch, sql):
+        monkeypatch.chdir(tmp_path)
+        before_objects, before_lineage = _world(session)
+        before_files = set(os.listdir(tmp_path))
+
+        try:
+            session.query(sql, "probe")
+        except Exception:
+            pass  # rejection is the expected path; the post-conditions below are the real test
+
+        after_objects, after_lineage = _world(session)
+        # `probe` may legitimately exist if the statement was a genuine SELECT; nothing else may
+        # have appeared, and nothing at all may have disappeared.
+        assert not (before_objects - after_objects), f"{sql!r} destroyed a catalog object"
+        assert all(name == "probe" for _, name in after_objects - before_objects), (
+            f"{sql!r} created unexpected objects: {after_objects - before_objects}"
+        )
+        assert after_lineage >= before_lineage
+        assert set(os.listdir(tmp_path)) == before_files, f"{sql!r} wrote to the filesystem"
+        assert session._con.execute(
+            "SELECT COUNT(*) FROM \"default\".keep"
+        ).fetchone()[0] == 3
+
+    @pytest.mark.parametrize("sql", MUTATING_SQL)
+    def test_the_guard_itself_rejects_them(self, sql):
+        """The first line of defence, checked directly rather than through a session."""
+        from spelunk.core import guard
+
+        with pytest.raises(UnsafeSQLError):
+            guard.assert_read_only(sql, "duckdb")
+
+    @pytest.mark.parametrize("sql", [
+        "SELECT 1",
+        "SELECT * FROM keep",
+        "WITH x AS (SELECT 1 AS a) SELECT a FROM x",
+        "SELECT a FROM (SELECT 1 AS a) t WHERE a > 0",
+        "(SELECT 1) UNION ALL (SELECT 2)",
+        "SELECT * FROM keep ORDER BY id LIMIT 1",
+    ])
+    def test_genuine_reads_are_still_allowed(self, sql):
+        """An invariant that rejects everything is useless — the read path must survive."""
+        from spelunk.core import guard
+
+        guard.assert_read_only(sql, "duckdb")

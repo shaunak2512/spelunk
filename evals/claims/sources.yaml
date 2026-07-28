@@ -1,71 +1,65 @@
 area: Source registry — spec grammar, detection, attach/scan, teardown
 prefix: SRC
 claims:
-
 - id: SRC-001
-  claim: Point it at CSV/Parquet/JSON/Excel files and they become queryable objects, scanned as views under a bare name.
+  claim: Point it at CSV/Parquet/JSON/Excel files and they become queryable objects, scanned as views
+    under a bare name.
   source: README.md#intro
   mode: behavioral
   falsifier: A .csv/.parquet/.json/.xlsx source attaches but is not queryable by its bare name.
   status: verified
   covered_by:
-    - tests/test_sources.py::TestAttachAll::test_attach_sqlite_and_file
-    - tests/test_sources.py::TestAttachAll::test_parquet_source
-    - tests/test_duck.py::TestSourceManagement::test_add_file_source_then_query
-
+  - tests/test_sources.py::TestAttachAll::test_attach_sqlite_and_file
+  - tests/test_sources.py::TestAttachAll::test_parquet_source
+  - tests/test_duck.py::TestSourceManagement::test_add_file_source_then_query
 - id: SRC-002
-  claim: A file source may be remote — https://, s3://, gs://, az:// — loaded via the httpfs/azure extensions.
+  claim: A file source may be remote — https://, s3://, gs://, az:// — loaded via the httpfs/azure
+    extensions.
   source: CLAUDE.md#sources.py
   mode: behavioral
   falsifier: A remote URL source fails to attach, or the URL is rewritten to a local path.
   status: partial
   covered_by:
-    - tests/test_sources.py::TestBuildNewKinds::test_remote_file_loads_httpfs_and_keeps_url
-    - tests/test_sources.py::TestBuildNewKinds::test_azure_url_loads_azure
-    - tests/test_sources.py::TestBuildNewKinds::test_s3_region_fallback_is_non_destructive
-  gap: >
-    Asserted at the SQL-generation level only. No test attaches and queries a real object store
+  - tests/test_sources.py::TestBuildNewKinds::test_remote_file_loads_httpfs_and_keeps_url
+  - tests/test_sources.py::TestBuildNewKinds::test_azure_url_loads_azure
+  - tests/test_sources.py::TestBuildNewKinds::test_s3_region_fallback_is_non_destructive
+  gap: 'Asserted at the SQL-generation level only. No test attaches and queries a real object store
     (MinIO would make s3:// end-to-end cheap and hermetic); gs:// is exercised nowhere.
 
+    '
 - id: SRC-003
   claim: Databases (SQLite/PostgreSQL/MySQL) are ATTACHed READ_ONLY.
   source: CLAUDE.md#sources.py
   mode: invariant
   falsifier: Any write (INSERT/UPDATE/DDL) reaching an attached database succeeds.
-  status: partial
+  status: verified
   covered_by:
-    - tests/test_multi_source.py::TestCrossEngineJoin::test_postgres_is_attached_read_only
-    - tests/test_multi_source.py::TestMySQL::test_mysql_joins_and_is_read_only
-    - tests/test_sources.py::TestAttachAll::test_attached_sqlite_is_read_only
-    - tests/test_sources.py::TestAttachTarget::test_postgres_dsn
-    - tests/test_sources.py::TestAttachTarget::test_mysql_uses_database_key
-  gap: >
-    Postgres and MySQL are now proved read-only against a LIVE server (an INSERT must raise),
-    not just at the ATTACH-string level — but those tests skip without
-    SPELUNK_TEST_POSTGRES_DSN / SPELUNK_TEST_MYSQL_DSN, so a default run still only proves it
-    for SQLite.
-
+  - tests/test_multi_source.py::TestCrossEngineJoin::test_postgres_is_attached_read_only
+  - tests/test_multi_source.py::TestMySQL::test_mysql_joins_and_is_read_only
+  - tests/test_sources.py::TestAttachAll::test_attached_sqlite_is_read_only
+  - tests/test_sources.py::TestAttachTarget::test_postgres_dsn
+  - tests/test_sources.py::TestAttachTarget::test_mysql_uses_database_key
+  note: Proved against LIVE Postgres and MySQL servers (an INSERT must raise), not just the ATTACH
+    string. The fixtures start throwaway Docker containers, so this runs by default.
 - id: SRC-004
-  claim: "delta:<path> and iceberg:<path> attach as delta_scan/iceberg_scan views."
+  claim: delta:<path> and iceberg:<path> attach as delta_scan/iceberg_scan views.
   source: CLAUDE.md#sources.py
   mode: behavioral
-  falsifier: "A delta:/iceberg: spec attaches as something other than a scan view over that table."
+  falsifier: 'A delta:/iceberg: spec attaches as something other than a scan view over that table.'
   status: partial
   covered_by:
-    - tests/test_sources.py::TestBuildNewKinds::test_delta_builds_scan_view
-    - tests/test_sources.py::TestBuildNewKinds::test_iceberg_remote_loads_httpfs_and_iceberg
+  - tests/test_sources.py::TestBuildNewKinds::test_delta_builds_scan_view
+  - tests/test_sources.py::TestBuildNewKinds::test_iceberg_remote_loads_httpfs_and_iceberg
   gap: No real Delta or Iceberg table is ever read. SQL-shape assertions only.
-
 - id: SRC-005
-  claim: "ducklake: DSNs are ATTACHed READ_ONLY."
+  claim: 'ducklake: DSNs are ATTACHed READ_ONLY.'
   source: CLAUDE.md#sources.py
   mode: behavioral
-  falsifier: "A ducklake: source attaches writable."
+  falsifier: 'A ducklake: source attaches writable.'
   status: partial
   covered_by:
-    - tests/test_sources.py::TestBuildNewKinds::test_ducklake_attaches_read_only
+  - tests/test_sources.py::TestBuildNewKinds::test_ducklake_attaches_read_only
   gap: Attach-string assertion only; no live DuckLake catalog is exercised.
-
 - id: SRC-006
   claim: DuckDB-only — a source DuckDB cannot attach (e.g. SQL Server) is rejected, not bridged.
   source: README.md#architecture
@@ -73,43 +67,42 @@ claims:
   falsifier: A mssql:// spec attaches through some other driver, or fails with an unhelpful error.
   status: verified
   covered_by:
-    - tests/test_sources.py::TestDetectKind::test_sql_server_unsupported
-    - tests/test_sources.py::TestDetectKind::test_unknown_raises
-
+  - tests/test_sources.py::TestDetectKind::test_sql_server_unsupported
+  - tests/test_sources.py::TestDetectKind::test_unknown_raises
 - id: SRC-007
   claim: DSNs are parsed with stdlib urllib (no SQLAlchemy) — including percent-encoded passwords.
   source: CLAUDE.md#sources.py
   mode: behavioral
-  falsifier: A DSN with a percent-encoded password attaches with the escaped literal, or SQLAlchemy is imported.
+  falsifier: A DSN with a percent-encoded password attaches with the escaped literal, or SQLAlchemy
+    is imported.
   status: partial
   covered_by:
-    - tests/test_sources.py::TestAttachTarget::test_percent_encoded_password_decoded
-  gap: >
-    The no-SQLAlchemy half is not asserted anywhere; a dependency could reappear silently.
-    An import-guard test (assert 'sqlalchemy' not in sys.modules after attach) closes it.
+  - tests/test_sources.py::TestAttachTarget::test_percent_encoded_password_decoded
+  gap: 'The no-SQLAlchemy half is not asserted anywhere; a dependency could reappear silently. An
+    import-guard test (assert ''sqlalchemy'' not in sys.modules after attach) closes it.
 
+    '
 - id: SRC-008
   claim: A `<your-name>=` prefix sets the catalog/view name — the word before the `=` IS the name.
   source: CLAUDE.md#running-the-server
   mode: behavioral
-  falsifier: "`sales=./f.parquet` produces a source named anything other than `sales`."
+  falsifier: '`sales=./f.parquet` produces a source named anything other than `sales`.'
   status: verified
   covered_by:
-    - tests/test_sources.py::TestParseSpec::test_name_prefix
-    - tests/test_sources.py::TestParseSpec::test_no_prefix
-
+  - tests/test_sources.py::TestParseSpec::test_name_prefix
+  - tests/test_sources.py::TestParseSpec::test_no_prefix
 - id: SRC-009
-  claim: >
-    Writing the placeholder literally (`name=sales <locator>`) parses as the name `name` plus an
-    unclassifiable locator, and detect_kind says so rather than blaming the locator.
+  claim: 'Writing the placeholder literally (`name=sales <locator>`) parses as the name `name` plus
+    an unclassifiable locator, and detect_kind says so rather than blaming the locator.
+
+    '
   source: CLAUDE.md#running-the-server
   mode: behavioral
   falsifier: The error for a literal `name=` spec does not name the mistake, or blames the locator.
   status: verified
   covered_by:
-    - tests/test_sources.py::TestDetectKind::test_literal_name_prefix_is_explained
-    - tests/test_sources.py::TestDetectKind::test_stripped_name_reported_on_unknown_locator
-
+  - tests/test_sources.py::TestDetectKind::test_literal_name_prefix_is_explained
+  - tests/test_sources.py::TestDetectKind::test_stripped_name_reported_on_unknown_locator
 - id: SRC-010
   claim: An `=` inside a DSN is not mistaken for a name prefix.
   source: CLAUDE.md#running-the-server
@@ -117,48 +110,46 @@ claims:
   falsifier: A DSN containing `=` (query params, passwords) loses its scheme to prefix-splitting.
   status: verified
   covered_by:
-    - tests/test_sources.py::TestParseSpec::test_dsn_equals_not_treated_as_prefix
-
+  - tests/test_sources.py::TestParseSpec::test_dsn_equals_not_treated_as_prefix
 - id: SRC-011
-  claim: With no name prefix, the source name is derived (file stem, DSN database name, remote URL stem, scheme stripped).
+  claim: With no name prefix, the source name is derived (file stem, DSN database name, remote URL
+    stem, scheme stripped).
   source: CLAUDE.md#running-the-server
   mode: behavioral
   falsifier: A derived name collides with the scheme prefix or retains it (e.g. a source named `delta:sales`).
   status: verified
   covered_by:
-    - tests/test_sources.py::TestDeriveName::test_file_stem
-    - tests/test_sources.py::TestDeriveName::test_dsn_uses_db_name
-    - tests/test_sources.py::TestDeriveName::test_remote_url_stem
-    - tests/test_sources.py::TestDeriveName::test_delta_scheme_stripped_from_name
-    - tests/test_sources.py::TestDeriveName::test_ducklake_scheme_stripped_from_name
-
+  - tests/test_sources.py::TestDeriveName::test_file_stem
+  - tests/test_sources.py::TestDeriveName::test_dsn_uses_db_name
+  - tests/test_sources.py::TestDeriveName::test_remote_url_stem
+  - tests/test_sources.py::TestDeriveName::test_delta_scheme_stripped_from_name
+  - tests/test_sources.py::TestDeriveName::test_ducklake_scheme_stripped_from_name
 - id: SRC-012
-  claim: >
-    For a file with an odd or absent extension, a format prefix (csv:/tsv:/json:/parquet:/excel:/avro:)
+  claim: 'For a file with an odd or absent extension, a format prefix (csv:/tsv:/json:/parquet:/excel:/avro:)
     forces the reader.
+
+    '
   source: server.py#--source
   mode: behavioral
   falsifier: A `csv:` prefix on a .dat URL still dispatches by extension.
   status: verified
   covered_by:
-    - tests/test_sources.py::TestFormatPrefix::test_csv_prefix_forces_reader_on_odd_extension
-    - tests/test_sources.py::TestFormatPrefix::test_parquet_prefix_overrides_bin_extension
-    - tests/test_sources.py::TestFormatPrefix::test_json_prefix_overrides_txt_extension
-    - tests/test_sources.py::TestFormatPrefix::test_excel_prefix_loads_extension
-    - tests/test_sources.py::TestFormatPrefix::test_prefix_is_case_insensitive
-    - tests/test_sources.py::TestFormatPrefix::test_unknown_prefix_falls_through_to_extension
-
+  - tests/test_sources.py::TestFormatPrefix::test_csv_prefix_forces_reader_on_odd_extension
+  - tests/test_sources.py::TestFormatPrefix::test_parquet_prefix_overrides_bin_extension
+  - tests/test_sources.py::TestFormatPrefix::test_json_prefix_overrides_txt_extension
+  - tests/test_sources.py::TestFormatPrefix::test_excel_prefix_loads_extension
+  - tests/test_sources.py::TestFormatPrefix::test_prefix_is_case_insensitive
+  - tests/test_sources.py::TestFormatPrefix::test_unknown_prefix_falls_through_to_extension
 - id: SRC-013
   claim: A Windows drive letter (C:\...) is not mistaken for a format prefix.
   source: server.py#--source
   mode: behavioral
-  falsifier: "`C:/data/x.parquet` is read as format `c`."
+  falsifier: '`C:/data/x.parquet` is read as format `c`.'
   status: verified
   covered_by:
-    - tests/test_sources.py::TestFormatPrefix::test_windows_drive_not_mistaken_for_prefix
-    - tests/test_sources.py::TestFormatPrefix::test_name_composes_with_format_prefix
-    - tests/test_sources.py::TestFormatPrefix::test_derived_name_strips_format_prefix
-
+  - tests/test_sources.py::TestFormatPrefix::test_windows_drive_not_mistaken_for_prefix
+  - tests/test_sources.py::TestFormatPrefix::test_name_composes_with_format_prefix
+  - tests/test_sources.py::TestFormatPrefix::test_derived_name_strips_format_prefix
 - id: SRC-014
   claim: An unknown extension errors in a way that teaches the format-prefix fix.
   source: server.py#--source
@@ -166,8 +157,7 @@ claims:
   falsifier: The error for an unrecognised extension does not mention the format prefix.
   status: verified
   covered_by:
-    - tests/test_sources.py::TestDetectKind::test_unknown_extension_error_teaches_format_prefix
-
+  - tests/test_sources.py::TestDetectKind::test_unknown_extension_error_teaches_format_prefix
 - id: SRC-015
   claim: Two sources cannot share a name.
   source: CLAUDE.md#tool-surface
@@ -175,110 +165,115 @@ claims:
   falsifier: A duplicate name silently shadows the first source.
   status: verified
   covered_by:
-    - tests/test_sources.py::TestAttachAll::test_duplicate_name_raises
-    - tests/test_duck.py::TestSourceManagement::test_add_duplicate_name_rejected
-
+  - tests/test_sources.py::TestAttachAll::test_duplicate_name_raises
+  - tests/test_duck.py::TestSourceManagement::test_add_duplicate_name_rejected
 - id: SRC-016
-  claim: remove_source detaches cleanly — file views dropped, databases DETACHed — and errors only on an unknown name.
+  claim: remove_source detaches cleanly — file views dropped, databases DETACHed — and errors only
+    on an unknown name.
   source: server.py#remove_source
   mode: behavioral
   falsifier: A removed source is still queryable, or removing an unknown name silently succeeds.
   status: verified
   covered_by:
-    - tests/test_sources.py::TestTeardownSql::test_file_drops_view
-    - tests/test_sources.py::TestTeardownSql::test_attached_db_detaches
-    - tests/test_sources.py::TestAttachTarget::test_teardown_undoes_attach
-    - tests/test_duck.py::TestSourceManagement::test_remove_source_detaches
-    - tests/test_duck.py::TestSourceManagement::test_remove_startup_source
-    - tests/test_duck.py::TestSourceManagement::test_remove_unknown_name_raises
-
+  - tests/test_sources.py::TestTeardownSql::test_file_drops_view
+  - tests/test_sources.py::TestTeardownSql::test_attached_db_detaches
+  - tests/test_sources.py::TestAttachTarget::test_teardown_undoes_attach
+  - tests/test_duck.py::TestSourceManagement::test_remove_source_detaches
+  - tests/test_duck.py::TestSourceManagement::test_remove_startup_source
+  - tests/test_duck.py::TestSourceManagement::test_remove_unknown_name_raises
 - id: SRC-017
   claim: A source added at runtime is visible in every flow, not scoped to one.
   source: CLAUDE.md#tool-surface
   mode: behavioral
   falsifier: A source added while working in flow A is invisible from flow B.
-  status: unverified
-  covered_by: []
-  gap: >
-    add_source-then-query is tested in one flow only. Nothing asserts cross-flow visibility,
-    which is the surprising half of the claim (and the reason isolation is process-level).
-
+  status: verified
+  covered_by:
+  - tests/test_concurrency.py::TestRuntimeSourceVisibility::test_a_source_added_while_working_in_one_flow_is_visible_from_another
+  - tests/test_concurrency.py::TestRuntimeSourceVisibility::test_removal_is_equally_global
+  note: Checked from a flow that did not exist when the source was added — the surprising half of
+    connection-global.
 - id: SRC-018
-  claim: An `api:` source is fetched ONCE at attach into an NDJSON snapshot; queries never re-fetch; refresh = re-attach.
+  claim: An `api:` source is fetched ONCE at attach into an NDJSON snapshot; queries never re-fetch;
+    refresh = re-attach.
   source: CLAUDE.md#sources.py
   mode: behavioral
-  falsifier: "A second query against an api: view issues another HTTP request."
+  falsifier: 'A second query against an api: view issues another HTTP request.'
   status: partial
   covered_by:
-    - tests/test_api_source.py::TestSessionIntegration::test_open_with_api_source
-    - tests/test_api_source.py::TestSessionIntegration::test_add_remove_refresh_at_runtime
-  gap: >
-    No test counts requests across repeated queries — the snapshot-once promise (the thing that
-    made 11 requests beat 253) is inferred, not measured. A request-counting fixture server
-    would make it a number.
+  - tests/test_api_source.py::TestSessionIntegration::test_open_with_api_source
+  - tests/test_api_source.py::TestSessionIntegration::test_add_remove_refresh_at_runtime
+  gap: 'No test counts requests across repeated queries — the snapshot-once promise (the thing that
+    made 11 requests beat 253) is inferred, not measured. A request-counting fixture server would
+    make it a number.
 
+    '
 - id: SRC-019
-  claim: "Snapshots live under <workspace>/snapshots/, and building an api:/openapi: source without a workspace is rejected."
+  claim: 'Snapshots live under <workspace>/snapshots/, and building an api:/openapi: source without
+    a workspace is rejected.'
   source: CLAUDE.md#sources.py
   mode: behavioral
   falsifier: A snapshot is written outside the workspace, or a workspace-less build silently no-ops.
   status: verified
   covered_by:
-    - tests/test_api_source.py::TestSessionIntegration::test_build_source_without_workspace_rejected
-    - tests/test_openapi_source.py::TestSessionIntegration::test_build_without_workspace_rejected
-
+  - tests/test_api_source.py::TestSessionIntegration::test_build_source_without_workspace_rejected
+  - tests/test_openapi_source.py::TestSessionIntegration::test_build_without_workspace_rejected
 - id: SRC-020
-  claim: >
-    Every JSON snapshot is read with sample_size=-1 and map_inference_threshold=-1, so a field
+  claim: 'Every JSON snapshot is read with sample_size=-1 and map_inference_threshold=-1, so a field
     first appearing after the first 20480 rows does not kill the scan with `unknown key`.
+
+    '
   source: CLAUDE.md#sources.py
   mode: behavioral
   falsifier: A snapshot whose 25000th record introduces a new key fails to scan, or drops the column.
   status: verified
   covered_by:
-    - tests/test_api_source.py::TestSnapshotTyping::test_field_first_appearing_past_the_inference_sample
-
+  - tests/test_api_source.py::TestSnapshotTyping::test_field_first_appearing_past_the_inference_sample
 - id: SRC-021
-  claim: >
-    A >200-key object is not typed as MAP(VARCHAR,<one type>) — so mixed values survive and
-    sibling snapshots union instead of raising `Could not convert string 'x@y.gov' to INT128`.
+  claim: 'A >200-key object is not typed as MAP(VARCHAR,<one type>) — so mixed values survive and
+    sibling snapshots union instead of raising `Could not convert string ''x@y.gov'' to INT128`.
+
+    '
   source: CLAUDE.md#sources.py
   mode: behavioral
-  falsifier: A wide object with mixed value types fails to query, or a union of two snapshots raises a conversion error.
+  falsifier: A wide object with mixed value types fails to query, or a union of two snapshots raises
+    a conversion error.
   status: verified
   covered_by:
-    - tests/test_api_source.py::TestSnapshotTyping::test_wide_object_with_mixed_value_types_is_queryable
-    - tests/test_api_source.py::TestSnapshotTyping::test_conversion_error_over_api_sources_explains_itself
-
+  - tests/test_api_source.py::TestSnapshotTyping::test_wide_object_with_mixed_value_types_is_queryable
+  - tests/test_api_source.py::TestSnapshotTyping::test_conversion_error_over_api_sources_explains_itself
 - id: SRC-022
-  claim: json=true opts a snapshot out of inference entirely — one raw JSON column — for genuinely polymorphic payloads.
+  claim: json=true opts a snapshot out of inference entirely — one raw JSON column — for genuinely
+    polymorphic payloads.
   source: CLAUDE.md#sources.py
   mode: behavioral
   falsifier: json=true still infers a struct, or a non-boolean value is silently accepted.
   status: verified
   covered_by:
-    - tests/test_api_source.py::TestSnapshotTyping::test_json_true_gives_one_raw_json_column
-    - tests/test_api_source.py::TestSnapshotTyping::test_json_option_must_be_boolean
-    - tests/test_api_source.py::TestSnapshotTyping::test_json_option_parsed
-
+  - tests/test_api_source.py::TestSnapshotTyping::test_json_true_gives_one_raw_json_column
+  - tests/test_api_source.py::TestSnapshotTyping::test_json_option_must_be_boolean
+  - tests/test_api_source.py::TestSnapshotTyping::test_json_option_parsed
 - id: SRC-023
   claim: These inference settings "cost nothing measurable on a local file".
   source: CLAUDE.md#sources.py
   mode: quantitative
-  falsifier: Scanning a representative snapshot with full inference is materially slower than with sampled defaults.
+  falsifier: Scanning a representative snapshot with full inference is materially slower than with
+    sampled defaults.
   status: unverified
   covered_by: []
-  gap: >
-    A performance claim with no measurement behind it. Needs a benchmark over a large snapshot
-    (say 1M records, 200 keys) comparing both settings, with a regression budget.
-
+  gap: 'Still unmeasured, now deliberately. ''Costs nothing measurable'' is a wall-clock claim, and
+    a timing assertion tight enough to be meaningful is flaky on shared CI while one loose enough
+    to be stable proves nothing. It needs a benchmark harness with a pinned machine and tracked baselines,
+    not a pytest assertion. Related and now measured: WSP-013 shows the out-of-core headroom is roughly
+    1:1, not orders of magnitude.'
 - id: SRC-024
   claim: A glob is a valid file source — one view over many matching files.
   source: undocumented (relied on in .mcp.json and the taxi experiment)
   mode: behavioral
   falsifier: A `*.parquet` spec attaches only one file, or fails to attach.
-  status: unverified
-  covered_by: []
-  gap: >
-    DOC GAP, not just a test gap: globs are used in practice and documented nowhere. Either
-    document and test, or stop relying on it.
+  status: verified
+  covered_by:
+  - tests/test_source_parity.py::TestGlobSource::test_a_glob_attaches_every_matching_file_as_one_view
+  - tests/test_source_parity.py::TestGlobSource::test_the_glob_view_is_queryable_like_any_file_source
+  - tests/test_source_parity.py::TestGlobSource::test_a_glob_matching_nothing_fails_loudly
+  note: 'Behaviour is now pinned. STILL A DOC GAP: globs remain undocumented in README/CLAUDE.md despite
+    being used in .mcp.json.'

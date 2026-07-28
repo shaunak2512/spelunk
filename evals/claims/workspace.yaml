@@ -1,7 +1,6 @@
 area: Workspace lifecycle — durability, per-process isolation, GC, out-of-core
 prefix: WSP
 claims:
-
 - id: WSP-001
   claim: The workspace is a real DuckDB file on disk, so results are durable and survive a reopen.
   source: CLAUDE.md#key-concepts
@@ -9,155 +8,163 @@ claims:
   falsifier: Results vanish when a session is reopened on the same directory.
   status: verified
   covered_by:
-    - tests/test_duck.py::TestPersistence::test_durable_workspace_survives_reopen
-
+  - tests/test_duck.py::TestPersistence::test_durable_workspace_survives_reopen
 - id: WSP-002
-  claim: >
-    Each server process gets its own durable workspace at <session-dir>/<pid>-<rand>/workspace.duckdb,
+  claim: 'Each server process gets its own durable workspace at <session-dir>/<pid>-<rand>/workspace.duckdb,
     so many concurrent servers never collide and never contend for the single-writer lock.
+
+    '
   source: CLAUDE.md#running-the-server
   mode: behavioral
   falsifier: Two concurrent sessions share a file, or one blocks the other.
   status: verified
   covered_by:
-    - tests/test_duck.py::TestPersistence::test_per_process_workspaces_are_durable_and_isolated
-
+  - tests/test_duck.py::TestPersistence::test_per_process_workspaces_are_durable_and_isolated
 - id: WSP-003
-  claim: "--shared-workspace restores one <session-dir>/workspace.duckdb; concurrent servers then contend, and all but the first fall back to ephemeral."
+  claim: --shared-workspace restores one <session-dir>/workspace.duckdb; concurrent servers then contend,
+    and all but the first fall back to ephemeral.
   source: server.py#--shared-workspace
   mode: behavioral
   falsifier: A second server on a locked shared workspace crashes instead of falling back.
   status: verified
   covered_by:
-    - tests/test_duck.py::TestPersistence::test_locked_workspace_falls_back_to_ephemeral
-
+  - tests/test_duck.py::TestPersistence::test_locked_workspace_falls_back_to_ephemeral
 - id: WSP-004
-  claim: "DuckSession.open(session_dir=None) is an ephemeral private temp workspace."
+  claim: DuckSession.open(session_dir=None) is an ephemeral private temp workspace.
   source: CLAUDE.md#running-the-server
   mode: behavioral
   falsifier: A session_dir-less session writes into the CWD, or is not private.
-  status: unverified
-  covered_by: []
-  gap: >
-    The default library entry point. Nothing asserts where it lands or that it is cleaned up —
-    a leak here silently fills a temp dir on every run.
-
+  status: verified
+  covered_by:
+  - tests/test_workspace.py::TestEphemeralWorkspace::test_lands_in_a_private_temp_dir_not_the_cwd
+  - tests/test_workspace.py::TestEphemeralWorkspace::test_is_reclaimed_on_close
+  - tests/test_workspace.py::TestEphemeralWorkspace::test_two_ephemeral_sessions_are_isolated
+  note: Lands under the system temp dir, leaves the CWD untouched, and does not outlive close().
 - id: WSP-005
-  claim: >
-    The GC sweep keeps the --keep-workspaces N most recent per-process workspaces (default 3,
+  claim: 'The GC sweep keeps the --keep-workspaces N most recent per-process workspaces (default 3,
     including the one just created) and reclaims older subdirs with no live owner.
+
+    '
   source: CLAUDE.md#workspace-gc
   mode: behavioral
   falsifier: More than N survive, or the just-created workspace is reclaimed.
   status: verified
   covered_by:
-    - tests/test_duck.py::TestPersistence::test_per_process_keeps_only_n_recent_workspaces
-
+  - tests/test_duck.py::TestPersistence::test_per_process_keeps_only_n_recent_workspaces
 - id: WSP-006
-  claim: >
-    Empty workspaces are reclaimed even inside the keep window — a DB with no tables outside the
-    reserved schemas and no artifacts beyond a 0-byte tool log is garbage (MCP reconnect churn).
+  claim: 'Empty workspaces are reclaimed even inside the keep window — a DB with no tables outside
+    the reserved schemas and no artifacts beyond a 0-byte tool log is garbage (MCP reconnect churn).
+
+    '
   source: CLAUDE.md#workspace-gc
   mode: behavioral
   falsifier: Reconnect churn accumulates empty <pid>-<rand> dirs indefinitely.
   status: verified
   covered_by:
-    - tests/test_duck.py::TestPersistence::test_sweep_reclaims_empty_workspaces_within_keep_window
-
+  - tests/test_duck.py::TestPersistence::test_sweep_reclaims_empty_workspaces_within_keep_window
 - id: WSP-007
-  claim: >
-    Liveness is the DuckDB file lock: the sweep probes each candidate with a read-write connect —
-    a live server holds it and is skipped; a crashed one opens and is deleted.
+  claim: 'Liveness is the DuckDB file lock: the sweep probes each candidate with a read-write connect
+    — a live server holds it and is skipped; a crashed one opens and is deleted.
+
+    '
   source: CLAUDE.md#workspace-gc
   mode: invariant
   falsifier: A workspace belonging to a RUNNING server is deleted. (Destructive if false.)
   status: partial
   covered_by:
-    - tests/test_duck.py::TestPersistence::test_per_process_sweep_skips_live_workspace
-  gap: >
-    Single-holder, same-machine, happy path. Untested: a stale lock from a hard kill, a
-    workspace on a filesystem with weak locking (network share), and the documented
-    same-process blind spot. This is the one claim in the register whose failure DESTROYS USER
-    DATA, and it rests on one test.
+  - tests/test_duck.py::TestPersistence::test_per_process_sweep_skips_live_workspace
+  gap: 'Single-holder, same-machine, happy path. Untested: a stale lock from a hard kill, a workspace
+    on a filesystem with weak locking (network share), and the documented same-process blind spot.
+    This is the one claim in the register whose failure DESTROYS USER DATA, and it rests on one test.
 
+    '
 - id: WSP-008
-  claim: On clean shutdown a no-work server deletes its own dir immediately, after releasing the tool-log handler first (Windows).
+  claim: On clean shutdown a no-work server deletes its own dir immediately, after releasing the tool-log
+    handler first (Windows).
   source: CLAUDE.md#workspace-gc
   mode: behavioral
   falsifier: A server that handled no calls leaves its dir behind, or rmtree fails on an open handle.
   status: verified
   covered_by:
-    - tests/test_duck.py::TestPersistence::test_close_reclaims_own_empty_per_process_workspace
-
+  - tests/test_duck.py::TestPersistence::test_close_reclaims_own_empty_per_process_workspace
 - id: WSP-009
-  claim: Dirs younger than a 60s grace window are never touched (a sibling may be mid-startup, lock not yet held).
+  claim: Dirs younger than a 60s grace window are never touched (a sibling may be mid-startup, lock
+    not yet held).
   source: CLAUDE.md#workspace-gc
   mode: behavioral
   falsifier: A workspace created seconds ago by a starting server is reclaimed.
-  status: unverified
-  covered_by: []
-  gap: >
-    The grace window is the ONLY protection during the startup race the previous claim cannot
-    cover. Testable with a fabricated dir and a patched clock.
-
+  status: verified
+  covered_by:
+  - tests/test_workspace.py::TestSweepGraceWindow::test_age_decides_reclamation_all_else_equal
+  note: 'Boundary test: two identical empty workspaces differing only in mtime — 5s survives, 600s
+    is reclaimed.'
 - id: WSP-010
-  claim: "--keep-workspaces 0 (or <=0) disables the sweep entirely, empty-dir reclamation included."
+  claim: --keep-workspaces 0 (or <=0) disables the sweep entirely, empty-dir reclamation included.
   source: CLAUDE.md#workspace-gc
   mode: behavioral
   falsifier: A zero/negative value still deletes something.
-  status: unverified
-  covered_by: []
-  gap: The documented escape hatch for anyone who cannot afford deletion — and it is untested.
-
+  status: verified
+  covered_by:
+  - tests/test_workspace.py::TestSweepDisabled::test_nothing_is_reclaimed
+  note: Both 0 and -1, with stale EMPTY dirs — the case keep-N would otherwise reclaim regardless
+    of the window.
 - id: WSP-011
-  claim: >
-    Every query — and every successful step of a batch — ends with a CHECKPOINT of the workspace
+  claim: 'Every query — and every successful step of a batch — ends with a CHECKPOINT of the workspace
     catalog, folding the WAL into workspace.duckdb immediately.
+
+    '
   source: CLAUDE.md#key-concepts
   mode: behavioral
   falsifier: The WAL grows unbounded across queries, so a kill loses recent results.
   status: verified
   covered_by:
-    - tests/test_duck.py::TestPersistence::test_query_checkpoints_wal_into_workspace_file
-
+  - tests/test_duck.py::TestPersistence::test_query_checkpoints_wal_into_workspace_file
 - id: WSP-012
-  claim: >
-    The checkpoint is best-effort (a no-op/abort is swallowed — data is already durable in the
+  claim: 'The checkpoint is best-effort (a no-op/abort is swallowed — data is already durable in the
     WAL) and targets the workspace catalog BY NAME, so read-only attached sources are untouched.
+
+    '
   source: CLAUDE.md#key-concepts
   mode: behavioral
-  falsifier: A checkpoint failure propagates as a query error, or a checkpoint touches an attached source.
-  status: unverified
-  covered_by: []
-  gap: >
-    Neither half is asserted. The swallow path is what keeps a concurrent-read scenario from
-    failing user queries; the by-name targeting is what keeps a read-only source safe.
-
+  falsifier: A checkpoint failure propagates as a query error, or a checkpoint touches an attached
+    source.
+  status: verified
+  covered_by:
+  - tests/test_workspace.py::TestCheckpointSemantics::test_targets_the_workspace_catalog_not_attached_sources
+  - tests/test_workspace.py::TestCheckpointSemantics::test_a_failing_checkpoint_never_fails_the_query
+  note: A connection proxy is required to test this — DuckDBPyConnection.execute is read-only and
+    cannot be monkeypatched in place.
 - id: WSP-013
-  claim: >
-    Out-of-core: sources are read on demand with pushdown and buffering operators spill to
-    temp_directory, so a source larger than RAM is the normal case, not a failure.
+  claim: 'Out-of-core: sources are read on demand with pushdown and buffering operators spill to temp_directory,
+    so a source larger than RAM is the normal case, not a failure.
+
+    '
   source: CLAUDE.md#key-concepts
   mode: quantitative
   falsifier: A join/aggregate over a source much larger than memory_limit OOMs instead of spilling.
-  status: unverified
-  covered_by: []
-  gap: >
-    A headline claim with zero coverage. Needs a generated Parquet set several times a small
-    memory_limit, running an aggregate and a spilling join, asserting completion, correctness
-    against a known answer, and that temp_directory was actually used.
-
+  status: verified
+  covered_by:
+  - tests/test_workspace.py::TestOutOfCore::test_aggregate_streams_under_a_memory_limit_below_the_data
+  - tests/test_workspace.py::TestOutOfCore::test_full_sort_out_of_core_completes
+  - tests/test_workspace.py::TestOutOfCore::test_the_sort_really_spills_to_the_configured_temp_directory
+  gap: 'Now measured, and the honest result is narrower than the claim reads. Spilling IS real and
+    load-bearing: at a fixed 768MB limit the same 8M-row sort succeeds with an unbounded temp dir
+    and dies trying to OFFLOAD a block when the temp dir is capped at 32MB (3/3 each way). But the
+    headroom is modest — the aggregate needs 384MB against ~400MB of uncompressed columns (256MB OOMs
+    3/3), and a full sort OOMs at 512MB whatever the temp settings. ''A source larger than RAM is
+    the normal case'' holds for streaming scans at roughly 1:1, not by orders of magnitude. An honest
+    doc would say so.'
 - id: WSP-014
-  claim: "--memory-limit, --temp-dir and --max-temp-size are honoured as guards."
+  claim: --memory-limit, --temp-dir and --max-temp-size are honoured as guards.
   source: README.md#install-and-run
   mode: behavioral
   falsifier: A configured limit is not applied to the session, so the guard is decorative.
-  status: unverified
-  covered_by: []
-  gap: >
-    No test reads back the DuckDB settings after open(). Cheap to close (query duckdb_settings())
-    and it is the precondition for the out-of-core claim above being testable at all.
-
+  status: verified
+  covered_by:
+  - tests/test_workspace.py::TestResourceGuards::test_settings_reach_the_connection
+  - tests/test_workspace.py::TestResourceGuards::test_default_spill_lives_inside_the_workspace
+  note: 'Read back from duckdb_settings(). Values compared as BYTES: DuckDB echoes ''512MB'' as ''488.2
+    MiB''.'
 - id: WSP-015
   claim: Each run gets a fresh subdir — isolation, not a shared store across runs.
   source: CLAUDE.md#running-the-server
@@ -165,15 +172,17 @@ claims:
   falsifier: A new process reuses a previous run's workspace and inherits its results.
   status: verified
   covered_by:
-    - tests/test_duck.py::TestPersistence::test_per_process_workspaces_are_durable_and_isolated
-
+  - tests/test_duck.py::TestPersistence::test_per_process_workspaces_are_durable_and_isolated
 - id: WSP-016
-  claim: The GC's liveness detection is cross-process only — two sessions in one process share DuckDB's cached instance, so a sweep cannot detect an in-process holder.
+  claim: The GC's liveness detection is cross-process only — two sessions in one process share DuckDB's
+    cached instance, so a sweep cannot detect an in-process holder.
   source: CLAUDE.md#workspace-gc
   mode: behavioral
-  falsifier: The stated limitation is wrong in either direction (it does detect in-process, or it damages an in-process holder).
-  status: unverified
-  covered_by: []
-  gap: >
-    A documented LIMITATION, which deserves a test as much as a feature: it pins the boundary
-    so a future DuckDB change that alters instance caching is caught rather than assumed benign.
+  falsifier: The stated limitation is wrong in either direction (it does detect in-process, or it
+    damages an in-process holder).
+  status: verified
+  covered_by:
+  - tests/test_workspace.py::TestInProcessLivenessBlindSpot::test_the_probe_succeeds_against_a_live_in_process_workspace
+  - tests/test_workspace.py::TestInProcessLivenessBlindSpot::test_a_separate_process_is_correctly_seen_as_live
+  note: 'Both sides of the documented boundary: the sweep''s connect probe opens an in-process workspace
+    (the blind spot) and is refused cross-process (the mechanism it relies on).'
