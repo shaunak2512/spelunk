@@ -791,6 +791,7 @@ class DuckSession:
             n = row_count if _full_sample_fits(row_count, len(columns)) else _SAMPLE_ROWS
             sample = self._head_sample(flow, name, n)
             self._record_lineage(flow, name, sql, "query", description)
+            self._checkpoint()
         out = {
             "name": name,
             "flow": flow,
@@ -804,6 +805,26 @@ class DuckSession:
         if hints:
             out["hints"] = hints
         return out
+
+    def _checkpoint(self) -> None:
+        """Fold the WAL into the workspace ``.duckdb`` file after a successful write.
+
+        DuckDB defers merging committed changes from the write-ahead log into the main database
+        file until the WAL crosses a size threshold, so freshly materialized results can linger
+        in ``workspace.duckdb.wal`` well after the ``query`` returns. We ``CHECKPOINT`` the workspace
+        catalog explicitly at the end of each materialization — so ``query`` commits after every
+        call, and ``query(steps=[...])`` after every step that succeeds. The catalog is named so
+        we only touch the workspace, never the read-only attached sources. Must be called while
+        holding ``_lock``.
+
+        Best-effort: a checkpoint can legitimately no-op or abort (e.g. a concurrent reader on the
+        WAL) and the data is already durably committed to the WAL regardless, so a failure here is
+        never fatal to the query — the next successful checkpoint folds it in.
+        """
+        try:
+            self._con.execute(f'CHECKPOINT "{self._catalog}"')
+        except duckdb.Error:
+            pass
 
     def _query_hints(self, sql: str, row_count: int) -> list[str]:
         hints: list[str] = []
