@@ -221,16 +221,32 @@ def _write_parquet(path, rows: int) -> tuple[str, int]:
     return str(path), rows
 
 
+def _parquet_fixture(tmp_path_factory, dirname: str, filename: str, rows: int):
+    """Build a large Parquet file, then DELETE it when the module is done with it.
+
+    tmp_path_factory alone would leave it behind: pytest retains the last three run
+    directories, so ~290MB of fixture data would become ~870MB of resident garbage. The size
+    itself is not negotiable — these tests mean something only while the data genuinely
+    exceeds memory_limit (see TestOutOfCore) — but nothing needs it after the module ends.
+    """
+    path, count = _write_parquet(tmp_path_factory.mktemp(dirname) / filename, rows)
+    yield path, count
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
 @pytest.fixture(scope="module")
 def big_parquet(tmp_path_factory) -> tuple[str, int]:
     """8M rows x (BIGINT, 40-char VARCHAR) — ~72MB on disk, ~400MB to sort in memory."""
-    return _write_parquet(tmp_path_factory.mktemp("bigdata") / "big.parquet", 8_000_000)
+    yield from _parquet_fixture(tmp_path_factory, "bigdata", "big.parquet", 8_000_000)
 
 
 @pytest.fixture(scope="module")
 def huge_parquet(tmp_path_factory) -> tuple[str, int]:
     """24M rows — ~217MB on disk, ~1.2GB of uncompressed columns to stream through."""
-    return _write_parquet(tmp_path_factory.mktemp("hugedata") / "huge.parquet", 24_000_000)
+    yield from _parquet_fixture(tmp_path_factory, "hugedata", "huge.parquet", 24_000_000)
 
 
 class TestOutOfCore:
