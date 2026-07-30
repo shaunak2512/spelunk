@@ -16,7 +16,9 @@ import functools
 import inspect
 import json
 import logging
+import os
 import re
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -61,7 +63,8 @@ _tool_logger.propagate = False
 # and row payloads are summarised, never dumped. `steps` is a batch of {sql, name} — full SQL kept.
 _LOGGED_ARGS = (
     "sql", "name", "flow", "target", "format", "path", "spec", "steps", "into", "dry_run",
-    "description",
+    "description", "source", "params", "rows_from", "records", "paginate", "max_pages",
+    "max_rows", "max_urls",
 )
 _LOGGED_RESULT_FIELDS = (
     "name", "flow", "row_count", "format", "path", "dropped_results", "kind",
@@ -74,12 +77,23 @@ _COUNTED_RESULT_FIELDS = ("columns", "nodes", "edges", "order", "missing", "rebu
 # add_source accepts DSNs that can embed credentials (postgresql://user:pw@host/db); strip the
 # userinfo (user:pass@) before the spec is written to the on-disk tool-call log.
 _DSN_CREDENTIALS_RE = re.compile(r"//[^/@\s]+@")
+# DuckDB rewrites a postgresql:// DSN into libpq keyword form before connecting, so a failed
+# ATTACH reports `password=<secret>` — a shape the userinfo pattern above cannot match. Both
+# forms have to be masked, or the error path leaks what the arg path redacts.
+_KEYWORD_PASSWORD_RE = re.compile(
+    r"""(?i)\b(password\s*=\s*)('[^']*'|"[^"]*"|[^\s'";]+)"""
+)
 
 
 def _redact(value: object) -> object:
-    """Mask userinfo (user:pass@) in DSN-like strings so credentials never reach the log."""
+    """Mask credentials in DSN-like strings so they never reach the log.
+
+    Handles both the URL form (``//user:pass@host``) and the keyword form
+    (``password=secret``) that database drivers produce in connection errors.
+    """
     if isinstance(value, str):
-        return _DSN_CREDENTIALS_RE.sub("//***@", value)
+        masked = _DSN_CREDENTIALS_RE.sub("//***@", value)
+        return _KEYWORD_PASSWORD_RE.sub(r"\1***", masked)
     return value
 
 
@@ -155,7 +169,9 @@ def _logged(fn):
             result = fn(*args, **kwargs)
         except Exception as exc:
             record["outcome"] = "error"
-            record["error"] = f"{type(exc).__name__}: {exc}"
+            # Redacted like the args are: a driver's connection error quotes the DSN back,
+            # so an unmasked message would write to disk exactly what _log_arg withheld.
+            record["error"] = _redact(f"{type(exc).__name__}: {exc}")
             record["duration_ms"] = round((time.perf_counter() - start) * 1000, 1)
             _tool_logger.info(json.dumps(record, default=str))
             raise
@@ -290,9 +306,27 @@ def build_server(
                 "\n## Manage sources\n"
                 "- `add_source(spec)` — attach a new data source at runtime. `spec` is a file path "
                 "(.csv/.parquet/.json/.xlsx), a SQLite file, or a sqlite:// / postgresql:// / "
-                "mysql:// DSN; prefix with `name=` to set the source name (e.g. "
-                "`sales=./sales.parquet`). The source becomes queryable in every flow.\n"
+                "mysql:// DSN. To name the source, put YOUR chosen name before an `=` at the "
+                "very front — `sales=./sales.parquet` names it `sales`. (The word before the "
+                "`=` IS the name: writing `name=sales ./sales.parquet` literally asks for a "
+                "source called `name` and fails to parse.) The source becomes queryable in "
+                "every flow.\n"
                 "- `remove_source(name)` — detach a source by its name. Affects this session only.\n"
+                "\n## Work with APIs — one API is ONE source\n"
+                "- `add_source('tmdb=openapi:<spec-url-or-path> auth_env=<ENV>')` attaches a whole "
+                "API: a queryable endpoint catalog AND a live connection. Do this ONCE. Never "
+                "attach a source per endpoint.\n"
+                "- Find the endpoint with SQL over the catalog — `path`, `response_fields` (the "
+                "fields it RETURNS, so you can search by the data you need), `records_hint`, "
+                "`pagination_hint`, `params`. `method` is lowercase ('get').\n"
+                "- `fetch(source, path, name, params?)` calls one endpoint and stores the response "
+                "as result `name`, exactly like `query` does. Responses are RESULTS, not sources: "
+                "droppable, in `lineage`, flow-scoped. Batch with `fetch(steps=[...])`.\n"
+                "- `fetch(source, path='/x/{id}', rows_from=<result>, name=...)` fetches ONE URL "
+                "PER ROW of that result — the list->detail fan-out (a list endpoint rarely carries "
+                "the detail fields you need). Rows are stamped `_key_<placeholder>` to join back.\n"
+                "- Credentials live on the connection. NEVER pass one in `params` — params are "
+                "logged verbatim, and the attempt is refused.\n"
                 if allow_add_source
                 else ""
             )
@@ -476,10 +510,34 @@ def build_server(
             name="add_source",
             description=(
                 "Attach a new data source at runtime, then query it like any configured source. "
-                "`spec` is a file path (.csv/.parquet/.json/.xlsx), a SQLite file, or a sqlite:// / "
-                "postgresql:// / mysql:// DSN; prefix with `name=` to set the source name "
-                "(e.g. `sales=./sales.parquet`). Returns the source name, kind, and the objects it "
-                "made queryable. The source is visible in every flow of this session."
+                "`spec` is a file path (.csv/.parquet/.json/.xlsx), a SQLite file, a sqlite:// / "
+                "postgresql:// / mysql:// DSN, or a REST/JSON API — `api:<url> [key=value ...]` "
+                "fetches the endpoint ONCE into a local snapshot (options: records=<dot.path>, "
+                "paginate=page|offset|cursor|keyset|link|odata, max_pages/max_rows. "
+                "EVERY PAGING PARAM NAME IS CONFIGURABLE — page_param=/offset_param=/size_param="
+                "/page_size=/start=/cursor_param=/cursor_path=/keyset_field= — so an API that "
+                "pages by its own vocabulary needs no special support: e.g. "
+                "`paginate=offset offset_param=startIndex size_param=resultsPerPage "
+                "page_size=2000`. The page/offset/limit defaults are only conventions, and some "
+                "APIs REJECT a paging param they don't recognize, so set these to the endpoint's "
+                "real names rather than letting the defaults ride — one paginating source beats "
+                "N hand-paged ones. json=true types the snapshot as one raw JSON column for "
+                "genuinely polymorphic payloads; OData sources also "
+                "take filter=\"<SQL predicate>\" and select=<cols>, translated to $filter/"
+                "$select and applied SERVER-side; auth via auth_env=<ENV> "
+                "Bearer, header=<Name>:<ENV>, or param=<name>:<ENV> — env var names, never "
+                "values; re-add to refresh). `openapi:<url-or-path>` attaches an OpenAPI 3.x "
+                "spec as a queryable endpoint CATALOG (one row per path+method — `method` is "
+                "LOWERCASE, e.g. 'get' — carrying `response_fields`, the fields each endpoint "
+                "returns, so you can find an endpoint by the data it exposes, plus a ready-made "
+                "`suggested_spec` column for GETs — query it, fill <SET_ME> with an env var "
+                "name, pass to add_source; a `pagination_hint` of `unknown; endpoint declares "
+                "...` lists the paging params found — set offset_param=/size_param= from them). "
+                "To name the source, put YOUR chosen name before an `=` at the very front — "
+                "`sales=./sales.parquet`, `nvd=api:https://...` (the word before `=` IS the "
+                "name; `name=nvd api:...` is wrong and fails to parse). "
+                "Returns the source name, kind, and the objects it made queryable. The source is "
+                "visible in every flow of this session."
             ),
         )
         @_logged
@@ -498,7 +556,85 @@ def build_server(
         def _remove_source(name: str) -> dict:
             return session.remove_source(name)
 
+        @mcp.tool(
+            name="fetch",
+            description=(
+                "Call ONE endpoint of an attached API connection (an `openapi:` source) and "
+                "materialize the response as result `name` — the same return shape as `query`. "
+                "One API is ONE source: attach it once with add_source, then fetch as many "
+                "endpoints as you like. Each response is a flow-scoped RESULT (droppable, in "
+                "`lineage`), not a new source. Find the endpoint first by SQL-querying the "
+                "catalog — `path`, `response_fields` (what it returns), `records_hint`, "
+                "`pagination_hint` — then pass that same `path` here. "
+                "`params` is a JSON object of query params ({\"sort_by\": \"revenue.desc\"}); a "
+                "`{placeholder}` in the path consumes the param of that name as a path segment. "
+                "NEVER put a credential in `params` (they are logged verbatim) — the connection "
+                "already carries it. Pagination params are managed for you; passing one errors. "
+                "`rows_from=<result>` binds the remaining {placeholders} to that result's "
+                "columns and fetches ONE URL PER ROW — the list->detail fan-out (movies -> "
+                "/movie/{movie_id}); rows are stamped with _key_<placeholder> so they join back. "
+                "`steps=[{source,path,name,...},...]` runs several fetches in one call. "
+                "Snapshot semantics: fetched once, queries never re-hit the API; fetch again to "
+                "refresh."
+            ),
+        )
+        @_logged
+        def _fetch(
+            source: str | None = None,
+            path: str | None = None,
+            name: str | None = None,
+            params: dict | None = None,
+            rows_from: str | None = None,
+            records: str | None = None,
+            paginate: str | None = None,
+            max_pages: int | None = None,
+            max_rows: int | None = None,
+            max_urls: int | None = None,
+            concurrency: int | None = None,
+            options: dict | None = None,
+            steps: list[dict] | None = None,
+            description: str | None = None,
+            flow: str = "default",
+        ) -> dict:
+            if steps is not None:
+                if source is not None or path is not None or name is not None:
+                    raise ValueError(
+                        "Pass either source+path+name (one fetch) or steps (batch), not both."
+                    )
+                return session.fetch_steps(steps, flow=flow)
+            if not source or not path or not name:
+                raise ValueError("fetch needs source, path and name (or steps=[...]).")
+            return session.fetch(
+                source=source, path=path, name=name, params=params, flow=flow,
+                description=description, rows_from=rows_from, records=records,
+                paginate=paginate, max_pages=max_pages, max_rows=max_rows,
+                max_urls=max_urls, concurrency=concurrency, options=options,
+            )
+
     return mcp
+
+
+def _load_env_file(path: str) -> None:
+    """Export KEY=VALUE lines from *path* into ``os.environ`` (existing variables win).
+
+    Quotes around values are stripped; blank lines and ``#`` comments are ignored. A missing
+    or unreadable file warns on stderr rather than failing startup — the server is still
+    useful without the credentials, and api: sources name the missing variable on use.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except OSError as exc:
+        print(f"[spelunk] --env-file {path!r} not loaded: {exc}", file=sys.stderr)
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip().strip("'\"")
+        if key:
+            os.environ.setdefault(key, value)
 
 
 def main() -> None:
@@ -514,9 +650,17 @@ def main() -> None:
         help=(
             "A data source, repeatable. A file path (.csv/.parquet/.json/.xlsx/.avro) — local or a "
             "remote https:// / s3:// / gs:// / az:// URL — a SQLite file, a delta:<path> / "
-            "iceberg:<path> lakehouse table, or a sqlite:// / postgresql:// / mysql:// / ducklake: "
-            "DSN. Prefix with name= to set the source name, e.g. sales=./sales.parquet. For a file "
-            "with an odd/absent extension, force the reader with a format prefix "
+            "iceberg:<path> lakehouse table, a sqlite:// / postgresql:// / mysql:// / ducklake: "
+            "DSN, or a REST/JSON API: 'api:<url> [key=value ...]' is fetched once at startup into "
+            "a local snapshot (options incl. records=<dot.path>, "
+            "paginate=page|offset|cursor|keyset|link|odata plus the paging param names the API "
+            "actually uses — offset_param=/size_param=/page_param=/cursor_param=/page_size=; "
+            "auth via auth_env=<ENV>, "
+            "header=<Name>:<ENV>, param=<name>:<ENV>); or 'openapi:<url-or-path>' for an "
+            "OpenAPI 3.x spec as a queryable endpoint catalog. Prefix with your chosen name "
+            "and '=' to set the source name, e.g. sales=./sales.parquet (the word before '=' "
+            "is the name itself, not the literal token 'name'). "
+            "For a file with an odd/absent extension, force the reader with a format prefix "
             "(csv:/tsv:/json:/parquet:/excel:/avro:), e.g. routes=csv:https://host/routes.dat."
         ),
     )
@@ -556,10 +700,10 @@ def main() -> None:
         "--allow-add-source",
         action="store_true",
         help=(
-            "Register the add_source / remove_source tools so the agent can attach and detach "
-            "data sources at runtime. This lets the agent read any file/database the server "
-            "process can reach — only enable it for a trusted, process-per-agent setup. Off by "
-            "default."
+            "Register the add_source / remove_source / fetch tools so the agent can attach and "
+            "detach data sources at runtime and call endpoints of an attached API connection. "
+            "This lets the agent read any file/database the server process can reach — only "
+            "enable it for a trusted, process-per-agent setup. Off by default."
         ),
     )
     parser.add_argument(
@@ -585,7 +729,21 @@ def main() -> None:
             "when --session-dir is set, otherwise stderr."
         ),
     )
+    parser.add_argument(
+        "--env-file",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Load KEY=VALUE lines from this file into the server's environment before opening "
+            "sources (already-set variables win; missing file is a warning, not an error). This "
+            "is how api: source credentials (auth_env=/header=/param=) reach the server without "
+            "putting secrets in a checked-in MCP config — point it at a gitignored .env."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.env_file:
+        _load_env_file(args.env_file)
 
     specs = list(args.source)
     if args.dsn:

@@ -1,0 +1,196 @@
+area: "openapi: source — the endpoint catalog as guidance-as-data"
+prefix: OAS
+claims:
+
+- id: OAS-001
+  claim: "An openapi: source becomes a queryable endpoint catalog — one row per path+method."
+  source: CLAUDE.md#openapi.py
+  mode: behavioral
+  falsifier: A spec attaches with rows missing for declared operations, or one row per path.
+  status: verified
+  covered_by:
+    - tests/test_openapi_source.py::TestEndpointRows::test_row_inventory
+    - tests/test_openapi_source.py::TestSessionIntegration::test_attach_query_remove
+
+- id: OAS-002
+  claim: "`method` is LOWERCASE, matching the document's own keys ('get', not 'GET')."
+  source: CLAUDE.md#openapi.py
+  mode: behavioral
+  falsifier: The catalog reports 'GET', so an agent's `WHERE method = 'get'` returns nothing.
+  status: partial
+  covered_by:
+    - tests/test_openapi_source.py::TestEndpointRows::test_row_inventory
+  gap: >
+    Covered incidentally by an inventory assertion. Worth its own claim-named test: this exact
+    casing mismatch cost an agent a wasted round trip in a recorded run.
+
+- id: OAS-003
+  claim: >
+    Each row carries params with the EFFECTIVE style/explode — which is what decides list-param
+    serialisation — defaulting to form/explode and overridden by a declared style.
+  source: CLAUDE.md#openapi.py
+  mode: behavioral
+  falsifier: A declared style is dropped, so a list param goes on the wire in the wrong shape.
+  status: verified
+  covered_by:
+    - tests/test_openapi_source.py::TestEndpointRows::test_query_param_style_defaults_to_form_explode
+    - tests/test_openapi_source.py::TestEndpointRows::test_declared_style_overrides_the_default
+
+- id: OAS-004
+  claim: "Auth shape is mapped onto the api: vocabulary — auth_env= / header= / param= — including per-operation public overrides."
+  source: CLAUDE.md#openapi.py
+  mode: behavioral
+  falsifier: A bearer/header/query-key scheme maps to the wrong option, or a public endpoint still demands auth.
+  status: verified
+  covered_by:
+    - tests/test_openapi_source.py::TestEndpointRows::test_bearer_page_records_suggestion
+    - tests/test_openapi_source.py::TestEndpointRows::test_query_key_auth_and_root_array
+    - tests/test_openapi_source.py::TestEndpointRows::test_header_key_auth_and_offset
+    - tests/test_openapi_source.py::TestEndpointRows::test_public_override_and_path_params
+    - tests/test_openapi_source.py::TestEndpointRows::test_tmdb_auth_quirk_cursor_hint_nested_records
+
+- id: OAS-005
+  claim: >
+    records_hint uses an ENVELOPE test — a conventional wrapper key, else a small object with one
+    array beside scalars — because first-array-wins called TMDB's /movie/{id} a list of genres.
+  source: CLAUDE.md#openapi.py
+  mode: behavioral
+  falsifier: A detail endpoint gets a records_hint, or a non-standard wrapper is missed.
+  status: verified
+  covered_by:
+    - tests/test_openapi_source.py::TestResponseFields::test_detail_endpoint_has_no_records_hint_but_full_fields
+    - tests/test_openapi_source.py::TestResponseFields::test_nonstandard_wrapper_still_reads_as_an_envelope
+    - tests/test_openapi_source.py::TestResponseFields::test_fat_object_with_one_array_is_a_record
+    - tests/test_openapi_source.py::TestResponseFields::test_list_endpoint_describes_the_record_not_the_envelope
+
+- id: OAS-006
+  claim: >
+    When no paging CONVENTION matches, pagination_hint still NAMES the paging-shaped params the
+    endpoint declares ("unknown; endpoint declares startIndex, resultsPerPage — set ..."),
+    because the vocabulary list can never be complete and going silent pushes an agent into hand-paging.
+  source: CLAUDE.md#openapi.py
+  mode: behavioral
+  falsifier: An endpoint with unrecognised paging params reports no hint at all.
+  status: verified
+  covered_by:
+    - tests/test_openapi_source.py::TestEndpointRows::test_unrecognized_paging_vocabulary_names_the_candidates
+    - tests/test_openapi_source.py::TestEndpointRows::test_no_paging_params_hints_nothing
+    - tests/test_openapi_source.py::TestEndpointRows::test_odata_style_params_hint_offset
+
+- id: OAS-007
+  claim: A guessed vocabulary is named as a HINT and never promoted into suggested_spec.
+  source: CLAUDE.md#openapi.py
+  mode: invariant
+  falsifier: suggested_spec contains paging params that were inferred rather than conventional.
+  status: partial
+  covered_by:
+    - tests/test_openapi_source.py::TestEndpointRows::test_unrecognized_paging_vocabulary_names_the_candidates
+  gap: >
+    The separation is asserted for one spec. This is the "never guess into a paste-ready string"
+    invariant — worth checking across the whole doc zoo, since a bad suggested_spec is executed
+    verbatim by an agent.
+
+- id: OAS-008
+  claim: >
+    response_fields describes what the endpoint RETURNS as {name,type} structs, flattened two
+    levels — a.b for nested objects, a[].b for arrays of objects — so an agent can find an
+    endpoint by the data it carries, not just its URL.
+  source: CLAUDE.md#openapi.py
+  mode: behavioral
+  falsifier: Nested fields are absent or flattened with the wrong notation, so a search by field name misses.
+  status: verified
+  covered_by:
+    - tests/test_openapi_source.py::TestResponseFields::test_nested_object_flattens_with_dots
+    - tests/test_openapi_source.py::TestResponseFields::test_array_of_objects_flattens_with_bracket_notation
+    - tests/test_openapi_source.py::TestResponseFields::test_array_of_scalars_keeps_one_row
+    - tests/test_openapi_source.py::TestResponseFields::test_depth_cap_stops_without_recursing
+    - tests/test_openapi_source.py::TestResponseFields::test_allof_branches_are_merged
+    - tests/test_openapi_source.py::TestSessionIntegration::test_response_fields_are_queryable_as_a_list_of_structs
+
+- id: OAS-009
+  claim: Degenerate schemas degrade gracefully — empty schema, array without items, root array of scalars, $ref cycles.
+  source: CLAUDE.md#openapi.py
+  mode: behavioral
+  falsifier: A malformed or self-referential schema hangs or raises during attach.
+  status: verified
+  covered_by:
+    - tests/test_openapi_source.py::TestResponseFields::test_empty_schema_degrades_to_null_type
+    - tests/test_openapi_source.py::TestResponseFields::test_array_without_items_is_array_any
+    - tests/test_openapi_source.py::TestResponseFields::test_root_array_of_scalars_has_no_fields
+    - tests/test_openapi_source.py::TestEndpointRows::test_ref_cycle_is_safe
+
+- id: OAS-010
+  claim: >
+    Guidance-as-data: the agent SQL-queries the catalog, fills <SET_ME> with an env var name, and
+    feeds suggested_spec straight to add_source. suggested_spec is produced for GETs.
+  source: CLAUDE.md#openapi.py
+  mode: behavioral
+  falsifier: "A suggested_spec, with <SET_ME> filled, is not a valid api: spec for that endpoint."
+  status: partial
+  covered_by:
+    - tests/test_openapi_source.py::TestEndpointRows::test_bearer_page_records_suggestion
+  gap: >
+    suggested_spec's TEXT is asserted; nothing round-trips it. The high-value test is
+    generative: for every GET in the doc zoo, fill <SET_ME>, pass to add_source against a
+    fixture server, and assert it attaches and returns records. That makes the paste-ready
+    promise real instead of textual.
+
+- id: OAS-011
+  claim: OpenAPI 3.x JSON only — YAML and Swagger 2.0 are rejected with conversion pointers.
+  source: CLAUDE.md#openapi.py
+  mode: behavioral
+  falsifier: A YAML or Swagger 2.0 doc half-parses, or is rejected without telling the user how to convert.
+  status: verified
+  covered_by:
+    - tests/test_openapi_source.py::TestLoadSpec::test_yaml_rejected_actionably
+    - tests/test_openapi_source.py::TestLoadSpec::test_swagger2_rejected
+    - tests/test_openapi_source.py::TestLoadSpec::test_not_a_spec
+    - tests/test_openapi_source.py::TestLoadSpec::test_missing_file
+
+- id: OAS-012
+  claim: A spec may be a URL or a local path.
+  source: CLAUDE.md#openapi.py
+  mode: behavioral
+  falsifier: A remote spec URL is treated as a file path.
+  status: verified
+  covered_by:
+    - tests/test_openapi_source.py::TestLoadSpec::test_remote_spec
+
+- id: OAS-013
+  claim: The catalog is a queryable view whose columns support finding an endpoint by SQL over path, response_fields, hints, and params.
+  source: server.py#instructions
+  mode: behavioral
+  falsifier: A documented column is absent from the view, so the documented query fails.
+  status: partial
+  covered_by:
+    - tests/test_openapi_source.py::TestSessionIntegration::test_attach_query_remove
+    - tests/test_openapi_source.py::TestSessionIntegration::test_response_fields_are_queryable_as_a_list_of_structs
+  gap: >
+    No test pins the catalog's column set against the columns the server instructions tell the
+    agent to query. A renamed column would break every agent while the suite stays green — a
+    schema-contract test (documented names ⊆ view columns) is cheap and closes it.
+
+- id: OAS-014
+  claim: >
+    A relative servers[0].url resolves against the spec's own URL when the document was fetched over
+    http(s); read off disk there is no host to resolve against, so the source refuses to attach and
+    names base_url= as the fix.
+  source: CLAUDE.md#openapi.py
+  mode: behavioral
+  falsifier: >
+    A local spec with servers[0].url = "/api/v3" attaches, and its connection's base_url has no
+    scheme — every fetch then fails inside urlopen with "unknown url type".
+  status: verified
+  covered_by:
+  - tests/test_openapi_source.py::TestBaseUrl::test_relative_server_resolves_against_a_remote_locator
+  - tests/test_openapi_source.py::TestBaseUrl::test_relative_server_on_a_local_file_falls_back_to_the_placeholder
+  - tests/test_openapi_source.py::TestBaseUrl::test_attaching_a_local_spec_with_no_host_names_the_fix
+- id: OAS-015
+  claim: "base_url=<url> on an openapi: source overrides the spec's declared server."
+  source: CLAUDE.md#openapi.py
+  mode: behavioral
+  falsifier: base_url= is rejected as an unknown option, or is ignored in favour of servers[0].url.
+  status: verified
+  covered_by:
+  - tests/test_openapi_source.py::TestBaseUrl::test_base_url_option_supplies_the_missing_host
+  - tests/test_openapi_source.py::TestBaseUrl::test_base_url_option_overrides_a_declared_server

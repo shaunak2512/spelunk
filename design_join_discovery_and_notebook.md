@@ -290,6 +290,13 @@ rebuilds from a stale snapshot with no way to refresh or even notice staleness.
 
 ### 3.3 Layer 2 — an `api:` source kind: snapshot-on-attach (the one to build)
 
+> **Status: implemented** (feat/api-source-snapshot) — `spelunk/core/apifetch.py` + the `api`
+> kind in `sources.py`. Five pagination styles (page/offset/cursor/keyset/link); all but
+> keyset live-verified against public APIs incl. authenticated TMDB (`tests/live_api_check.py`);
+> keyset (Stripe-style seek) is mock-tested — no public no-auth keyset API to verify against.
+> Refresh is re-attach (remove_source + add_source); a dedicated `refresh_source` tool remains
+> future work.
+
 Materialize-by-default, applied to the network boundary: an API source is **fetched into a
 local snapshot at attach time, then registered as a view over the snapshot**.
 
@@ -303,7 +310,8 @@ local snapshot at attach time, then registered as a view over the snapshot**.
   `{url, params, fetched_at, row_count}`, recorded like any source leaf — lineage shows *when*
   data was pulled, and the notebook's freshness verdicts (§2.5) extend naturally to
   "snapshot is 6 days old".
-- **Refresh is explicit** — `refresh_source(name)` or re-attach, never implicit. This resolves
+- **Refresh is explicit** — re-attach (`remove_source` then `add_source`), never implicit; a
+  dedicated `refresh_source(name)` tool remains future work. This resolves
   the reproducibility tension cleanly: `query` and `replay` run against a *pinned* snapshot
   (deterministic, no rate-limit surprises mid-pipeline); going stale is a visible, deliberate
   choice. Same "recipes vs data" split as §2.1.
@@ -316,12 +324,102 @@ Considered and rejected middle path: the community `http_client` extension (`htt
 fetching *inside* queries — exactly the re-fetch-per-query behaviour the snapshot design
 avoids.
 
-### 3.4 Layer 3 — generic connectors: don't build
+### 3.4 OpenAPI endpoint catalogs (implemented)
+
+> **Status: implemented** — `spelunk/core/openapi.py`. `openapi:<url-or-path>` materializes an
+> OpenAPI 3.x JSON spec as a queryable catalog: one row per (path, method) with params, auth
+> shape (securitySchemes mapped onto `auth_env=`/`header=`/`param=`, incl. the
+> apiKey-named-Authorization bearer quirk), heuristic pagination/records hints, and a
+> paste-ready `suggested_spec` `api:` string for GETs (`<SET_ME>` marks the credential env
+> var). Guidance-as-data: the agent finds endpoints with SQL and feeds `suggested_spec` to
+> `add_source`. Verified end-to-end against TMDB's 148-path spec (catalog → suggested_spec →
+> live fetch). YAML and Swagger 2.0 are rejected with conversion pointers; spec discovery
+> (probing /openapi.json) remains future work.
+
+### 3.5 Layer 3 — generic connectors: don't build
 
 Manifest-driven API configs (auth flows, incremental sync, schema evolution) is the
 Airbyte/Singer/dlt product — a swamp. The right move is a documented recipe: **dlt** already
 loads REST APIs into DuckDB natively, and spelunk attaches the resulting `.duckdb` (or Parquet)
 as a source. One paragraph of docs buys the whole connector ecosystem.
+
+### 3.6 Entity fan-out — `fetch(rows_from=...)` (implemented)
+
+> **Status: implemented** (feat/api-source-snapshot) — but *not* as the `api:` source option
+> this section originally designed. The shipped contract is connection-scoped:
+> `fetch(source, path, name, rows_from=<[flow.]result>)` on an attached `openapi:` connection.
+> The rest of this section is kept as the record of why it exists; where the design and the
+> shipped surface differ, the deltas below are authoritative.
+
+**Motivating evidence.** A/B eval on the TMDB API (2026-07-25): a spelunk-only agent vs a
+curl+Python agent, same brief. Quality was comparable, but the script agent's insight was
+*richer* (genre ROI economics) for one structural reason: budget/revenue live only in the
+per-movie `/movie/{id}` **detail endpoint**, and the script agent fan-out-fetched 240 of them
+in a threaded loop. Spelunk had no primitive for per-entity detail fetches — attaching 240
+`api:` sources is absurd — so the spelunk agent's analysis was silently *shaped by what list
+endpoints expose*. This was the highest-value `api:` follow-up: list→detail is the canonical
+two-step of nearly every REST API (movies→credits, repos→contributors, orders→line items).
+
+**What shipped: URL templates bound to a result's columns, on the `fetch` tool.**
+
+```python
+add_source("tmdb=openapi:https://developer.themoviedb.org/openapi/... auth_env=TMDB_TOKEN")
+query(sql="SELECT id AS movie_id FROM top_rated ORDER BY vote_count DESC LIMIT 200",
+      name="ids", description="The 200 most-voted chart movies to fetch details for")
+fetch(source="tmdb", path="/3/movie/{movie_id}", rows_from="ids", name="details")
+```
+
+- **`rows_from` is a `fetch` argument, not an `api:` source option.** The API is attached once
+  as an `openapi:` connection; every endpoint of it — list, detail, fan-out — is a `fetch`
+  call against that one source. A fan-out produces a flow-scoped **result**, not a source, so
+  it is droppable, appears in `lineage`, and never multiplies the source list.
+- Each `{placeholder}` in `path` binds to the column of that name in the referenced result.
+  One URL per *distinct* row of the bound columns (nulls dropped), ordered deterministically
+  (ORDER BY the columns) so the snapshot is reproducible. The prep `query` IS the fan-out
+  spec — selecting/aliasing/limiting rows is plain SQL, which composes with everything
+  (filter to top-N, anti-join against already-fetched, etc.).
+- Multi-placeholder templates fall out for free: `path="/repos/{owner}/{repo}"` binds two
+  columns. The single-id case is the 1-column special case.
+- **Continuity with the `openapi:` catalog:** the catalog row for `/3/movie/{movie_id}`
+  already carries the `{movie_id}` template — the agent aliases a column to the placeholder
+  name and passes `rows_from=`. Catalog → prep query → fan-out is a 3-call pipeline.
+
+**Fetch semantics (as shipped).**
+
+- Each response contributes its records (same `records=`/auto-detect per response; a detail
+  endpoint's single object → one row), each row stamped `_key_<placeholder>` so joining back
+  to the prep result is trivial even when the response omits the id. `paginate` must be
+  `none` with `rows_from` (error otherwise) — the two axes (many-URLs vs many-pages) do not
+  multiply.
+- **Caps & courtesy:** `max_urls` — exceeding it is an ERROR telling the agent to LIMIT the
+  prep query, never a silent truncation. A thread pool shares one `HostLimiter`, so a 429
+  backs off every worker together (honouring Retry-After).
+- **Partial failure policy:** a per-entity **404 is data, not an error** (deleted entity) —
+  skipped and reported. 401/403 aborts the whole fetch (credentials are wrong for
+  everything). Other failures: retry per URL, then abort — a half-fetched detail table is a
+  footgun for aggregate queries.
+
+**Provenance — v2 shipped, not v1.** The design hedged that the fan-out would be a leaf; it
+isn't. A fetch result gets a `kind='fetch'` lineage node whose deps are passed explicitly
+(there is no SQL to parse them out of), so `top_rated → ids → details → roi` renders
+end-to-end. `replay` **preserves** fetch results rather than re-fetching them: they are pinned
+inputs, like a source, and re-issuing N requests inside a deterministic rebuild would import
+network latency, rate limits, and a changed upstream. They are reported under `preserved`
+(and copied when rebuilding `into` a fresh flow). Refresh = `fetch` again.
+
+**Safety.** Template values are percent-encoded as single path segments at substitution (a
+value containing `/`, `?`, or `#` cannot redirect the request), and `fetch` is confined to its
+connection's host + base path — absolute URLs, `..`, and traversal through a bound placeholder
+are all refused. Same `--allow-add-source` trust boundary as `add_source`, amplified by N —
+another reason `max_urls` is a hard error, not a soft cap.
+
+**Non-goals (still):** pagination inside each detail fetch; POST bodies; recursive fan-out
+(details-of-details) — chain two fan-outs instead; incremental append (the
+anti-join-in-prep-query pattern covers "only fetch new ids" well enough).
+
+**Minor UX fix, same eval — done:** the catalog's `method` column tripped the agent
+(`WHERE method='get'` → 0 rows against `'GET'`). Catalog rows now store the method
+**lowercase**, matching the OpenAPI document's own keys.
 
 ---
 

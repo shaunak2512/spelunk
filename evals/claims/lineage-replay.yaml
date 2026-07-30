@@ -1,0 +1,257 @@
+area: Provenance and replay — the audit trail and reproducible rebuild
+prefix: LIN
+claims:
+- id: LIN-001
+  claim: Every query result upserts a lineage row recording its SQL, kind, and dependency edges.
+  source: CLAUDE.md#key-concepts
+  mode: behavioral
+  falsifier: A result exists with no lineage row, so the audit trail has a hole.
+  status: partial
+  covered_by:
+  - tests/test_lineage.py::TestLineageRecording::test_deps_and_sources_classified
+  - tests/test_duck.py::TestQuerySteps::test_steps_record_lineage_like_sequential_calls
+  gap: '"EVERY result" is proved for query and fetch paths individually. No test asserts the invariant
+    globally — that after an arbitrary sequence of operations, the set of results in a flow equals
+    the set of lineage nodes. That equality is the audit-trail promise.
+
+    '
+- id: LIN-002
+  claim: 'Deps are found by parsing the SQL and intersecting table refs with the live (flow, name)
+    result set — a ref naming an existing result is a dep, anything else is an external source leaf.
+
+    '
+  source: CLAUDE.md#key-concepts
+  mode: behavioral
+  falsifier: A source is recorded as a dep, or a CTE name is recorded as a source leaf.
+  status: verified
+  covered_by:
+  - tests/test_lineage.py::TestLineageRecording::test_deps_and_sources_classified
+  - tests/test_lineage.py::TestLineageRecording::test_cte_not_recorded_as_source_leaf
+- id: LIN-003
+  claim: lineage(name) returns the upstream closure — transitive, and across flows.
+  source: CLAUDE.md#tool-surface
+  mode: behavioral
+  falsifier: A grandparent node is omitted, or a cross-flow dependency is not followed.
+  status: verified
+  covered_by:
+  - tests/test_lineage.py::TestLineageRecording::test_closure_is_transitive_and_ordered
+  - tests/test_lineage.py::TestLineageRecording::test_cross_flow_dependency_followed
+  - tests/test_lineage.py::TestLineageRecording::test_whole_flow_without_name
+- id: LIN-004
+  claim: lineage returns nodes (name, kind, description, sql, deps, sources, created_at), edges, a
+    dependency-first `order`, and `missing`.
+  source: server.py#lineage
+  mode: behavioral
+  falsifier: A documented key is absent, or `order` is not dependency-first.
+  status: verified
+  covered_by:
+  - tests/test_lineage.py::TestLineageRecording::test_closure_is_transitive_and_ordered
+  - tests/test_lineage.py::TestLineageRecording::test_missing_dependency_reported
+- id: LIN-005
+  claim: CREATE OR REPLACE re-derives the lineage row, so the store always reflects the CURRENT definition.
+  source: CLAUDE.md#key-concepts
+  mode: behavioral
+  falsifier: Re-running a result under the same name leaves stale SQL or stale edges recorded.
+  status: verified
+  covered_by:
+  - tests/test_lineage.py::TestLineageRecording::test_replace_updates_lineage
+  - tests/test_lineage.py::TestDescriptions::test_replace_updates_description
+- id: LIN-006
+  claim: Dropping a flow clears its lineage; an unknown result and a reserved flow both raise.
+  source: CLAUDE.md#key-concepts
+  mode: behavioral
+  falsifier: Lineage rows outlive their flow, or _spelunk_meta is addressable as a flow.
+  status: verified
+  covered_by:
+  - tests/test_lineage.py::TestLineageRecording::test_drop_flow_clears_lineage
+  - tests/test_lineage.py::TestLineageErrors::test_unknown_result_raises
+  - tests/test_lineage.py::TestLineageErrors::test_reserved_flow_rejected
+- id: LIN-007
+  claim: _spelunk_meta is a reserved schema, hidden from catalog and drop.
+  source: CLAUDE.md#key-concepts
+  mode: invariant
+  falsifier: The meta schema appears as a flow, or its lineage table is queryable/droppable as a result.
+  status: partial
+  covered_by:
+  - tests/test_duck.py::TestFlows::test_cannot_drop_reserved
+  - tests/test_lineage.py::TestLineageErrors::test_reserved_flow_rejected
+  gap: 'Hidden-from-catalog is not asserted, and nothing prevents a user SELECTing the lineage table
+    directly (arguably fine — but undecided, therefore untested).
+
+    '
+- id: LIN-008
+  claim: Lineage is durable — it survives a --shared-workspace reopen.
+  source: CLAUDE.md#key-concepts
+  mode: behavioral
+  falsifier: Reopening a workspace loses the DAG, so replay is impossible after a restart.
+  status: partial
+  covered_by:
+  - tests/test_duck.py::TestPersistence::test_durable_workspace_survives_reopen
+  gap: 'The reopen test checks results survive; it does not check LINEAGE survives, which is the stated
+    claim and the harder one.
+
+    '
+- id: LIN-009
+  claim: 'render="mermaid" (or "dot") adds a deterministic, ready-to-display diagram built server-side
+    from the same nodes/edges — no agent parsing.
+
+    '
+  source: CLAUDE.md#tool-surface
+  mode: behavioral
+  falsifier: The same graph renders differently across calls, or the diagram disagrees with nodes/edges.
+  status: verified
+  covered_by:
+  - tests/test_lineage.py::TestMermaidRender::test_render_returns_deterministic_flowchart
+  - tests/test_lineage.py::TestMermaidRender::test_dot_render_is_valid_digraph
+  - tests/test_lineage.py::TestMermaidRender::test_dot_and_mermaid_share_node_ids
+  - tests/test_lineage.py::TestMermaidRender::test_source_leaves_have_no_dangling_edges
+  - tests/test_lineage.py::TestMermaidRender::test_dropped_dep_edge_is_not_drawn_twice
+  - tests/test_lineage.py::TestMermaidRender::test_name_and_description_are_styled_differently
+- id: LIN-010
+  claim: Rendering is opt-in and writes nothing by default; `path` writes the diagram, implies mermaid,
+    and echoes rendered_to.
+  source: CLAUDE.md#tool-surface
+  mode: behavioral
+  falsifier: A plain lineage() call writes a file, or `path` with render="dot" silently writes mermaid.
+  status: verified
+  covered_by:
+  - tests/test_lineage.py::TestMermaidRender::test_render_is_opt_in_and_writes_nothing_by_default
+  - tests/test_lineage.py::TestMermaidRender::test_path_writes_file_and_reports_absolute_path
+  - tests/test_lineage.py::TestMermaidRender::test_path_defaults_to_mermaid_not_dot
+  - tests/test_lineage.py::TestMermaidRender::test_unknown_render_rejected
+  - tests/test_mcp_server.py::TestOtherTools::test_lineage_tool_renders_nothing_by_default
+  - tests/test_mcp_server.py::TestOtherTools::test_lineage_render_mermaid_passthrough
+- id: LIN-011
+  claim: Markup in a description is escaped in the rendered diagram.
+  source: lineage render behaviour
+  mode: invariant
+  falsifier: A description containing diagram syntax breaks or injects into the rendered output.
+  status: verified
+  covered_by:
+  - tests/test_replay_fidelity.py::TestRenderEscaping::test_hostile_text_cannot_change_the_diagram_structure
+  - tests/test_replay_fidelity.py::TestRenderEscaping::test_markup_metacharacters_are_escaped
+  - tests/test_replay_fidelity.py::TestRenderEscaping::test_no_description_can_start_a_mermaid_directive
+  - tests/test_lineage.py::TestMermaidRender::test_markup_in_description_is_escaped
+  note: 12 hostile descriptions x both grammars. The load-bearing assertion is structural (identical
+    line/node counts vs a benign description), so it holds without the test knowing either escape
+    syntax.
+- id: LIN-012
+  claim: lineage is read-only.
+  source: server.py#lineage
+  mode: invariant
+  falsifier: Calling lineage mutates any result, lineage row, or file.
+  status: partial
+  covered_by:
+  - tests/test_lineage.py::TestMermaidRender::test_render_is_opt_in_and_writes_nothing_by_default
+  gap: Only the file-writing side is checked; nothing snapshots catalog+lineage state around the call.
+- id: LIN-013
+  claim: replay rebuilds a flow from its recorded SQL in dependency order, re-running each query.
+  source: CLAUDE.md#tool-surface
+  mode: behavioral
+  falsifier: Replay executes in insertion order, so a dependent rebuilds before its parent.
+  status: verified
+  covered_by:
+  - tests/test_lineage.py::TestReplay::test_replay_in_place_refreshes
+  - tests/test_lineage.py::TestReplay::test_dry_run_plans_without_executing
+  - tests/test_mcp_server.py::TestOtherTools::test_lineage_then_replay_roundtrip
+- id: LIN-014
+  claim: replay(into=...) is a non-destructive rebuild into a fresh flow; omitted, it refreshes in
+    place; dry_run plans only.
+  source: CLAUDE.md#tool-surface
+  mode: behavioral
+  falsifier: An `into` replay mutates the source flow, or dry_run creates tables.
+  status: verified
+  covered_by:
+  - tests/test_lineage.py::TestReplay::test_replay_into_new_flow_is_nondestructive
+  - tests/test_lineage.py::TestReplay::test_dry_run_plans_without_executing
+  - tests/test_lineage.py::TestReplay::test_replayed_flow_has_lineage
+  - tests/test_lineage.py::TestDescriptions::test_replay_preserves_descriptions
+- id: LIN-015
+  claim: replay errors on a dependency cycle, and on an empty flow.
+  source: CLAUDE.md#tool-surface
+  mode: behavioral
+  falsifier: A cyclic flow loops forever or partially rebuilds.
+  status: verified
+  covered_by:
+  - tests/test_lineage.py::TestReplay::test_dependency_cycle_detected
+  - tests/test_lineage.py::TestReplay::test_empty_flow_raises
+- id: LIN-016
+  claim: Sources and cross-flow results are READ by replay, not rebuilt.
+  source: CLAUDE.md#tool-surface
+  mode: behavioral
+  falsifier: Replay attempts to rebuild an external leaf, or fails because one is not in the flow.
+  status: verified
+  covered_by:
+  - tests/test_replay_fidelity.py::TestExternalInputsAreReadNotRebuilt::test_a_source_leaf_is_not_rebuilt
+  - tests/test_replay_fidelity.py::TestExternalInputsAreReadNotRebuilt::test_a_cross_flow_dependency_is_read_not_rebuilt
+  note: A flow depending on another flow's result rebuilds only its own nodes, and the external result
+    is byte-identical afterwards.
+- id: LIN-017
+  claim: 'replay PRESERVES fetch results instead of re-fetching — they are pinned snapshots, reported
+    under `preserved`, and copied when rebuilding into a fresh flow.
+
+    '
+  source: CLAUDE.md#key-concepts
+  mode: behavioral
+  falsifier: A replay issues network requests, or an `into` replay loses the fetched rows or the
+    edges around them.
+  status: verified
+  covered_by:
+  - tests/test_fetch.py::TestLineage::test_replay_preserves_fetch_results_instead_of_refetching
+  - tests/test_fetch.py::TestLineage::test_replay_into_a_fresh_flow_copies_the_snapshot
+  - tests/test_fetch.py::TestLineage::test_a_copied_fetch_node_keeps_its_edges
+  note: >
+    "Copied" has to mean the node AND its edges. A fetch node has no SQL to re-derive deps from,
+    so the copy passes them across explicitly and remaps the ones rebuilt alongside it — the
+    query branch gets the same result for free by re-parsing against the target search_path.
+- id: LIN-018
+  claim: 'A fetch result gets a kind=''fetch'' lineage node whose SQL is `FETCH <json>` (source/path/
+    params/rows_from — no secrets), with deps/sources passed explicitly.
+
+    '
+  source: CLAUDE.md#core/duck.py
+  mode: behavioral
+  falsifier: A fetch node is indistinguishable from a query node, or its edges are missing so the
+    DAG breaks at the fetch.
+  status: verified
+  covered_by:
+  - tests/test_fetch.py::TestLineage::test_fetch_node_records_the_request_and_its_edges
+- id: LIN-019
+  claim: 'A replayed flow is bit-identical to the original when sources are unchanged — the reproducibility
+    promise.
+
+    '
+  source: CLAUDE.md#key-concepts (replay as reproducible rebuild)
+  mode: behavioral
+  falsifier: A non-trivial multi-node flow, replayed into a fresh flow, differs from the original.
+  status: verified
+  covered_by:
+  - tests/test_replay_fidelity.py::TestReplayIsBitIdentical::test_every_node_rebuilds_identically
+  - tests/test_replay_fidelity.py::TestReplayIsBitIdentical::test_the_rebuild_is_non_destructive
+  - tests/test_replay_fidelity.py::TestReplayIsBitIdentical::test_replayed_flow_carries_the_same_dag
+  - tests/test_replay_fidelity.py::TestReplayIsBitIdentical::test_in_place_replay_also_reproduces
+  note: 'The acid test: an 8-node DAG (filters, joins, aggregates, window functions, a float aggregate)
+    replayed into a fresh flow and EXCEPT-diffed both directions on every node. Zero difference —
+    no FP jitter appeared at this scale.'
+- id: LIN-020
+  claim: --require-descriptions makes a one-line description mandatory on every query and batch step,
+    stored and surfaced in lineage/catalog.
+  source: server.py#--require-descriptions
+  mode: behavioral
+  falsifier: A description is accepted as blank, or the parameter exists when the flag is off.
+  status: verified
+  covered_by:
+  - tests/test_mcp_server.py::TestDescriptionGating::test_param_absent_without_flag
+  - tests/test_mcp_server.py::TestDescriptionGating::test_param_present_with_flag
+  - tests/test_mcp_server.py::TestDescriptionGating::test_single_query_stores_description
+  - tests/test_mcp_server.py::TestDescriptionGating::test_single_query_without_description_rejected
+  - tests/test_mcp_server.py::TestDescriptionGating::test_batch_step_missing_description_rejected
+  - tests/test_mcp_server.py::TestDescriptionGating::test_batch_step_blank_description_rejected
+  - tests/test_mcp_server.py::TestDescriptionGating::test_top_level_description_with_steps_rejected
+  - tests/test_lineage.py::TestDescriptions::test_description_optional_defaults_to_none
+  - tests/test_lineage.py::TestDescriptions::test_blank_description_normalised_to_none
+  - tests/test_lineage.py::TestDescriptions::test_batch_step_descriptions
+  gap: 'DOC GAP: --require-descriptions is fully implemented and tested but appears nowhere in CLAUDE.md
+    or README.md. A capability no operator knows about.
+
+    '

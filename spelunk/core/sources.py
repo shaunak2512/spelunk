@@ -9,13 +9,28 @@ The unified engine is a single DuckDB connection. Every source is reached throug
     matching filesystem extension (``httpfs`` / ``azure``) is loaded automatically;
   * **lakehouse tables** (Delta / Iceberg) are scanned via ``delta_scan`` / ``iceberg_scan`` and
     likewise registered as VIEWs — write ``delta:<path>`` / ``iceberg:<path>``;
-  * **SQLite / PostgreSQL / MySQL / DuckLake** are ``ATTACH``ed read-only, each as its own catalog.
+  * **SQLite / PostgreSQL / MySQL / DuckLake** are ``ATTACH``ed read-only, each as its own catalog;
+  * **REST/JSON APIs** (``api:<url> [key=value ...]``) are fetched ONCE at attach time — with
+    pagination, retries, and rate-limit backoff — into an NDJSON snapshot under the workspace,
+    and registered as a VIEW over that local file. Queries run against the pinned snapshot
+    (deterministic, no re-fetch per query); refresh by re-attaching. See ``apifetch.py`` for
+    the option grammar (paginate=page/offset/cursor/keyset/link, records=<dot.path>,
+    auth_env=/header=/param=);
+  * **OpenAPI specs** (``openapi:<url-or-path> [auth_env=ENV] [header=N:ENV] [param=n:ENV]
+    [default_param=n:v] [records=…] [paginate=…]``) attach an API *connection* plus its
+    queryable *endpoint catalog* — one row per (path, method) with params, auth shape,
+    pagination/records hints, ``response_fields`` (what the endpoint returns), and a
+    paste-ready ``suggested_spec``. **One API is one source:** the connection holds the base
+    URL and credentials, and ``fetch`` calls any endpoint under it — so exploring 20 endpoints
+    costs 20 flow-scoped *results*, not 20 permanent sources. See ``openapi.py`` for the
+    catalog and ``apifetch.py`` for the connection/request split.
 
 Everything reachable is reached through the one DuckDB connection — there is no out-of-engine
 fallback. A source DuckDB can't attach (e.g. SQL Server) is not supported; export it to a file
 (Parquet/CSV) and point a ``--source`` at that instead.
 
-A spec is a string, optionally prefixed ``name=``::
+A spec is a string, optionally prefixed with ``<your-chosen-name>=`` (the word before the ``=``
+is the name itself — ``nvd=api:…``, never the literal token ``name=``)::
 
     sales=./data/sales.parquet
     remote=https://example.com/data/sales.parquet
@@ -24,6 +39,8 @@ A spec is a string, optionally prefixed ``name=``::
     events=delta:./warehouse/events            # a Delta Lake table directory
     catalog=iceberg:./warehouse/catalog/table  # an Iceberg table
     lake=ducklake:./catalog.ducklake           # a DuckLake catalog
+    gh=api:https://api.github.com/repos/o/r/issues paginate=link   # ONE endpoint -> snapshot
+    tmdb=openapi:./tmdb-api.json auth_env=TMDB_TOKEN  # the WHOLE API -> catalog + connection
     sqlite:///C:/data/app.db
     postgresql://user:pw@host/dbname
     ./reports/q1.csv               # name derived from the filename -> q1
@@ -37,8 +54,10 @@ lakehouse-scan sources by their bare view name.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
+import shlex
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Iterable, Literal
 from urllib.parse import parse_qsl, unquote, urlsplit
@@ -46,7 +65,11 @@ from urllib.parse import parse_qsl, unquote, urlsplit
 if TYPE_CHECKING:
     import duckdb
 
-SourceKind = Literal["file", "sqlite", "postgres", "mysql", "delta", "iceberg", "ducklake"]
+    from .apifetch import ApiConnection
+
+SourceKind = Literal[
+    "file", "sqlite", "postgres", "mysql", "delta", "iceberg", "ducklake", "api", "openapi"
+]
 
 # File extension -> DuckDB table function used to scan it (readers in the core/statically-linked
 # build, no extension load needed).
@@ -84,6 +107,21 @@ _FORMAT_PREFIX: dict[str, str] = {
     "excel": ".xlsx",
     "avro": ".avro",
 }
+
+# Read options for a JSON snapshot we wrote ourselves (an ``api:`` fetch, the ``openapi:``
+# catalog). Both DuckDB defaults being overridden here are *sampling* heuristics that turn into
+# hard cast errors later, far from the attach that caused them:
+#   * ``sample_size`` caps type inference at the first 20480 rows, so a field whose type first
+#     varies past that point breaks the scan mid-query.
+#   * ``map_inference_threshold`` silently types a wide object as MAP(VARCHAR, <one value type>).
+#     A MAP has ONE value type, so a key holding a string in a record whose siblings hold numbers
+#     is unrepresentable, and two snapshots that infer different value types cannot be reconciled
+#     at all — this is the source of the notorious
+#     ``Could not convert string 'x@y.gov' to INT128`` on a UNION of two API snapshots. A STRUCT
+#     reconciles by field name and keeps each field's own type, so we always prefer one.
+# Both are cheap to disable on a local file we just wrote (no measurable cost on a 28MB/6k-row
+# snapshot) and buy correctness that the sampled defaults only approximate.
+_JSON_SNAPSHOT_OPTS = "format='newline_delimited', sample_size=-1, map_inference_threshold=-1"
 
 # Remote-path schemes reachable through a DuckDB filesystem extension, mapped to the extension
 # that provides them. httpfs covers http(s)/S3/GCS/R2; azure covers Azure Blob / ADLS.
@@ -124,13 +162,21 @@ class Source:
     """One registered data source.
 
     ``setup_sql`` are the statements to run on the DuckDB connection to make the source
-    queryable (extension loads + ATTACH/CREATE VIEW).
+    queryable (extension loads + ATTACH/CREATE VIEW). ``info`` carries kind-specific
+    provenance — for an ``api`` source, the fetch fingerprint (url, fetched_at, pages,
+    row_count, snapshot path) — and is ``None`` for kinds that have none.
+
+    ``connection`` is set only for an ``openapi:`` source, which is not just a catalog but a
+    live *connection*: base URL plus credentials, reusable by ``fetch`` for any endpoint of
+    that API. It is what makes one API one source instead of one source per endpoint.
     """
 
     name: str
     kind: SourceKind
     locator: str
     setup_sql: list[str] = field(default_factory=list)
+    info: dict | None = None
+    connection: "ApiConnection | None" = None
 
 
 def parse_spec(spec: str) -> tuple[str | None, str]:
@@ -160,11 +206,37 @@ def _split_format_prefix(locator: str) -> tuple[str | None, str]:
     return None, locator
 
 
-def detect_kind(locator: str, forced_ext: str | None = None) -> SourceKind:
+def _prefix_help(stripped_name: str | None, locator: str) -> str:
+    """Explain a consumed ``<name>=`` prefix when the rest of the spec won't classify.
+
+    The common miss is writing the placeholder literally — ``name=nvd api:<url>`` — which parses
+    as the name ``name`` and the locator ``nvd api:<url>``. That is worth naming outright, since
+    the resulting error otherwise points at the URL, which was never the problem.
+    """
+    if stripped_name is None:
+        return ""
+    head, sep, rest = locator.partition(" ")
+    if sep and _NAME_RE.match(head) and rest.strip():
+        return (
+            f"The spec was read as source name {stripped_name!r} plus locator {locator!r} — the "
+            f"prefix is the name YOU choose, not the literal word 'name': write "
+            f"'{head}={rest.strip()}'. "
+        )
+    return f"({stripped_name!r} was taken as the source name, from its '=' prefix.) "
+
+
+def detect_kind(
+    locator: str, forced_ext: str | None = None, *, stripped_name: str | None = None
+) -> SourceKind:
     """Classify a locator into a :data:`SourceKind` by scheme/extension.
 
     ``forced_ext`` (the canonical extension from a ``csv:``/``json:``/... format prefix) pins the
     locator to a ``file`` source regardless of its own extension.
+
+    ``stripped_name`` is the ``<name>=`` prefix the caller already removed; it is used only to
+    explain the split when detection fails. Without it, writing the prefix literally
+    (``name=nvd api:https://…``) reports an unclassifiable locator of ``nvd api:https://…`` and
+    never reveals that a name was consumed — which reads as "the API URL is unsupported".
     """
     if forced_ext is not None:
         return "file"
@@ -184,6 +256,10 @@ def detect_kind(locator: str, forced_ext: str | None = None) -> SourceKind:
         return "delta"
     if low.startswith("iceberg:"):
         return "iceberg"
+    if low.startswith("api:"):
+        return "api"
+    if low.startswith("openapi:"):
+        return "openapi"
     if low.startswith("sqlite://"):
         return "sqlite"
     ext = _path_ext(locator)
@@ -192,7 +268,9 @@ def detect_kind(locator: str, forced_ext: str | None = None) -> SourceKind:
     if ext in _SQLITE_EXTS:
         return "sqlite"
     raise ValueError(
-        f"Could not determine the source type of {locator!r}. If it is a data file with an "
+        f"Could not determine the source type of {locator!r}. "
+        + _prefix_help(stripped_name, locator)
+        + "If it is a data file with an "
         "unrecognized or absent extension (a .dat dump, an extensionless API URL), force the "
         f"reader with a format prefix — csv:/tsv:/json:/parquet:/excel:/avro: — e.g. csv:{locator}. "
         "Recognized extensions: "
@@ -202,11 +280,16 @@ def detect_kind(locator: str, forced_ext: str | None = None) -> SourceKind:
     )
 
 
-def build_source(spec: str) -> Source:
-    """Parse a single spec into a :class:`Source` (no DuckDB connection touched yet)."""
+def build_source(spec: str, *, snapshot_dir: str | None = None) -> Source:
+    """Parse a single spec into a :class:`Source` (no DuckDB connection touched yet).
+
+    ``snapshot_dir`` is where an ``api:`` source writes its NDJSON snapshot (the session's
+    workspace snapshot dir); building an ``api:`` source performs the fetch here — network
+    I/O, deliberately *before* any connection lock is taken. Other kinds ignore it.
+    """
     explicit, locator = parse_spec(spec)
     forced_ext, locator = _split_format_prefix(locator)
-    kind = detect_kind(locator, forced_ext=forced_ext)
+    kind = detect_kind(locator, forced_ext=forced_ext, stripped_name=explicit)
     name = explicit or _derive_name(locator, kind)
     if not _NAME_RE.match(name):
         raise ValueError(
@@ -220,31 +303,43 @@ def build_source(spec: str) -> Source:
         return _build_scan_source(name, kind, locator)
     if kind == "ducklake":
         return _build_ducklake_source(name, locator)
+    if kind == "api":
+        return _build_api_source(name, locator, snapshot_dir)
+    if kind == "openapi":
+        return _build_openapi_source(name, locator, snapshot_dir)
     return _build_attach_source(name, kind, locator)
 
 
 def teardown_sql(src: Source) -> list[str]:
     """Statements that undo a source's :attr:`Source.setup_sql` — the inverse of attaching.
 
-    A view-backed source (``file`` / ``delta`` / ``iceberg``) drops its ``main`` view; an attached
-    database (SQLite/Postgres/MySQL/DuckLake) is ``DETACH``ed. Used by ``DuckSession.remove_source``.
+    A view-backed source (``file`` / ``delta`` / ``iceberg`` / ``api``) drops its ``main`` view; an
+    attached database (SQLite/Postgres/MySQL/DuckLake) is ``DETACH``ed. Used by
+    ``DuckSession.remove_source``. An ``api`` source's snapshot file is left on disk — it lives
+    under the workspace dir, so workspace cleanup reclaims it.
     """
-    if src.kind == "file" or src.kind in _SCAN_KINDS:
+    if src.kind in ("file", "api", "openapi") or src.kind in _SCAN_KINDS:
         return [f'DROP VIEW IF EXISTS main."{src.name}"']
     if src.kind in _ATTACH_EXT or src.kind == "ducklake":
         return [f'DETACH "{src.name}"']
     return []
 
 
-def attach_all(con: "duckdb.DuckDBPyConnection", specs: Iterable[str]) -> list[Source]:
+def attach_all(
+    con: "duckdb.DuckDBPyConnection",
+    specs: Iterable[str],
+    *,
+    snapshot_dir: str | None = None,
+) -> list[Source]:
     """Build every source and run its ``setup_sql`` on *con*; return the registered sources.
 
     Raises on duplicate source names so two sources never collide on one catalog/view name.
+    ``snapshot_dir`` is forwarded to :func:`build_source` for ``api:`` sources.
     """
     sources: list[Source] = []
     seen: set[str] = set()
     for spec in specs:
-        src = build_source(spec)
+        src = build_source(spec, snapshot_dir=snapshot_dir)
         if src.name in seen:
             raise ValueError(
                 f"Duplicate source name {src.name!r}. Give one an explicit prefix, "
@@ -297,6 +392,136 @@ def _build_scan_source(name: str, kind: SourceKind, locator: str) -> Source:
         f'CREATE OR REPLACE VIEW main."{name}" AS SELECT * FROM {scan_fn}(\'{path}\'{extra_args})'
     )
     return Source(name=name, kind=kind, locator=locator, setup_sql=setup)
+
+
+def _build_api_source(name: str, locator: str, snapshot_dir: str | None) -> Source:
+    """An ``api:`` source: fetch the endpoint into an NDJSON snapshot, view over the snapshot.
+
+    The fetch (pagination, retries, auth — see ``apifetch``) happens here, at build time, so
+    the network I/O is done before the session lock is ever taken. The view reads the local
+    snapshot file — queries never re-fetch the API. ``Source.info`` carries the fetch
+    fingerprint (url, fetched_at, pages, row_count, snapshot path).
+    """
+    from . import apifetch
+
+    if snapshot_dir is None:
+        raise ValueError(
+            "api: sources need a workspace to store their snapshot — open the session with a "
+            "workspace (DuckSession.open) rather than calling build_source directly."
+        )
+    spec = apifetch.parse_api_spec(_strip_scheme(locator, "api"))
+    os.makedirs(snapshot_dir, exist_ok=True)
+    dest = os.path.join(snapshot_dir, f"{name}.ndjson")
+    info = apifetch.fetch_snapshot(spec, dest)
+    setup = [
+        f'CREATE OR REPLACE VIEW main."{name}" AS SELECT * FROM {_snapshot_scan(dest, spec.json)}'
+    ]
+    if spec.json:
+        info = {**info, "typing": "json"}
+    return Source(name=name, kind="api", locator=locator, setup_sql=setup, info=info)
+
+
+def _snapshot_scan(dest: str, as_json: bool = False) -> str:
+    """The scan expression for an NDJSON snapshot — inferred columns, or one raw JSON column.
+
+    ``as_json`` (the ``json=true`` spec option) is the escape hatch for an API whose records are
+    genuinely polymorphic — a field that is an object in some records and an array in others has
+    no single inferred type, and no inference setting can conjure one. The view then has a single
+    ``json`` column to pick apart with ``json_extract`` / ``->>``, which is exactly what a caller
+    would otherwise hand-roll with ``to_json(...)::VARCHAR`` after the scan has already failed.
+    """
+    path = _duck_path(dest)
+    if as_json:
+        return f"read_ndjson_objects('{path}')"
+    return f"read_json_auto('{path}', {_JSON_SNAPSHOT_OPTS})"
+
+
+def _build_openapi_source(name: str, locator: str, snapshot_dir: str | None) -> Source:
+    """An ``openapi:`` source: an API *connection* plus its queryable endpoint catalog.
+
+    Two things in one attach, because the spec describes both. The catalog is one row per
+    (path, method) with params, auth shape, pagination/records hints, ``response_fields``, and
+    a paste-ready ``suggested_spec`` — guidance-as-data the agent queries with SQL. The
+    connection is the spec's ``servers[0].url`` plus whatever credentials the locator's options
+    supply, and it is what ``fetch`` calls to reach ANY endpoint of the API without attaching
+    another source.
+
+    Grammar: ``openapi:<url-or-path> [auth_env=ENV] [header=N:ENV] [param=n:ENV]
+    [default_param=n:value] [records=…] [paginate=…] …`` — the trailing options are the
+    connection's, and the fetch options among them become defaults every request inherits.
+    """
+    from . import apifetch, openapi as openapi_mod
+
+    if snapshot_dir is None:
+        raise ValueError(
+            "openapi: sources need a workspace to store their catalog — open the session with "
+            "a workspace (DuckSession.open) rather than calling build_source directly."
+        )
+    inner, option_tokens = _split_locator_options(_strip_scheme(locator, "openapi"))
+    spec = openapi_mod.load_spec(inner)
+    rows = openapi_mod.endpoint_rows(spec, inner)
+    if not rows:
+        raise ValueError(f"OpenAPI spec {inner!r} declares no operations under 'paths'.")
+    os.makedirs(snapshot_dir, exist_ok=True)
+    dest = os.path.join(snapshot_dir, f"{name}.ndjson")
+    tmp = dest + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        for row in rows:
+            fh.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+    os.replace(tmp, dest)
+    setup = [f'CREATE OR REPLACE VIEW main."{name}" AS SELECT * FROM {_snapshot_scan(dest)}']
+    base_url = openapi_mod.base_url_of(spec, inner)
+    connection = apifetch.parse_connection(base_url, option_tokens)
+    if not connection.base_url.lower().startswith(("http://", "https://")):
+        # A local spec whose servers[0].url is relative (or absent) leaves nothing to build
+        # requests from. Say so here, where the fix is one token, rather than letting every
+        # fetch die inside urlopen with "unknown url type".
+        servers = spec.get("servers") or [{}]
+        declared = servers[0].get("url") if isinstance(servers[0], dict) else None
+        raise ValueError(
+            f"OpenAPI spec {inner!r} does not give an absolute server URL "
+            f"(servers[0].url is {declared or '<missing>'!r}), so its endpoints have no host "
+            f"to call. Supply one on the source spec: openapi:{inner} "
+            "base_url=https://api.example.com"
+        )
+    info = openapi_mod.catalog_info(inner, rows)
+    info["base_url"] = connection.base_url
+    info["auth"] = connection.auth_env or (
+        connection.extra_headers[0][0] if connection.extra_headers else None
+    )
+    return Source(
+        name=name,
+        kind="openapi",
+        locator=locator,
+        setup_sql=setup,
+        info=info,
+        connection=connection,
+    )
+
+
+_QUOTED_HEAD_RE = re.compile(r'^\s*(["\'])(.+?)\1\s*(.*)$', re.DOTALL)
+
+
+def _split_locator_options(body: str) -> tuple[str, list[str]]:
+    """Split ``<locator> [key=value ...]`` into its locator and shell-tokenized options.
+
+    The locator is taken off *before* ``shlex`` sees the string: an ``openapi:`` locator is
+    routinely a Windows path, and ``shlex`` in POSIX mode would eat every backslash in
+    ``C:\\specs\\api.json``. Quote the locator if it contains spaces.
+    """
+    match = _QUOTED_HEAD_RE.match(body)
+    if match:
+        locator, rest = match.group(2), match.group(3)
+    else:
+        parts = body.strip().split(None, 1)
+        if not parts:
+            raise ValueError("openapi: source needs a spec URL or path.")
+        locator, rest = parts[0], (parts[1] if len(parts) > 1 else "")
+    try:
+        tokens = shlex.split(rest)
+    except ValueError:
+        tokens = rest.split()
+    return locator, tokens
 
 
 def _build_ducklake_source(name: str, locator: str) -> Source:
@@ -373,6 +598,12 @@ def _derive_name(locator: str, kind: SourceKind) -> str:
         locator = _strip_scheme(locator, kind)
     elif kind == "ducklake":
         locator = _strip_scheme(locator, "ducklake")
+    elif kind == "api":
+        # Name from the URL's last path segment; drop the whitespace-separated options first.
+        locator = _strip_scheme(locator, "api").split()[0]
+    elif kind == "openapi":
+        # Name from the spec locator; drop the whitespace-separated connection options first.
+        locator = _strip_scheme(locator, "openapi").split()[0]
     if "://" in locator:
         try:
             url = urlsplit(locator)

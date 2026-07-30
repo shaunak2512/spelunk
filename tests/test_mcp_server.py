@@ -301,12 +301,36 @@ class TestAddSourceGating:
     def test_tools_absent_without_flag(self, mcp_server):
         names = {t.name for t in _run(mcp_server.list_tools())}
         assert "add_source" not in names and "remove_source" not in names
+        # fetch reaches the network on the agent's behalf, so it shares the same gate
+        assert "fetch" not in names
 
     def test_tools_present_with_flag(self, sqlite_file):
         session = DuckSession.open([f"shop={sqlite_file}"])
         try:
             names = {t.name for t in _run(build_server(session, allow_add_source=True).list_tools())}
-            assert {"add_source", "remove_source"} <= names
+            assert {"add_source", "remove_source", "fetch"} <= names
+        finally:
+            session.close()
+
+    def test_fetch_rejects_mixing_single_and_batch(self, sqlite_file):
+        session = DuckSession.open([f"shop={sqlite_file}"])
+        server = build_server(session, allow_add_source=True)
+        try:
+            with pytest.raises(Exception, match="not both"):
+                _run(server.call_tool("fetch", {
+                    "source": "x", "path": "/a", "name": "n", "steps": [{"path": "/b"}],
+                }))
+        finally:
+            session.close()
+
+    def test_fetch_needs_a_connection_source(self, sqlite_file):
+        session = DuckSession.open([f"shop={sqlite_file}"])
+        server = build_server(session, allow_add_source=True)
+        try:
+            with pytest.raises(Exception, match="No API connection"):
+                _run(server.call_tool(
+                    "fetch", {"source": "shop", "path": "/movies", "name": "m"}
+                ))
         finally:
             session.close()
 
@@ -322,3 +346,27 @@ class TestAddSourceGating:
             assert removed["removed"] is True
         finally:
             session.close()
+
+
+class TestEnvFile:
+    def test_load_env_file(self, tmp_path, monkeypatch):
+        from spelunk.mcp.server import _load_env_file
+
+        monkeypatch.delenv("SPELUNK_EF_NEW", raising=False)
+        monkeypatch.setenv("SPELUNK_EF_KEPT", "original")
+        p = tmp_path / ".env"
+        p.write_text(
+            "# comment\n\nSPELUNK_EF_NEW='v-1'\nSPELUNK_EF_KEPT=overridden\nBAD LINE\n",
+            encoding="utf-8",
+        )
+        _load_env_file(str(p))
+        import os
+
+        assert os.environ["SPELUNK_EF_NEW"] == "v-1"  # quotes stripped
+        assert os.environ["SPELUNK_EF_KEPT"] == "original"  # existing env wins
+
+    def test_missing_file_warns_not_raises(self, tmp_path, capsys):
+        from spelunk.mcp.server import _load_env_file
+
+        _load_env_file(str(tmp_path / "absent.env"))
+        assert "--env-file" in capsys.readouterr().err

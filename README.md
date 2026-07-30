@@ -1,7 +1,8 @@
 # Spelunk
 
 A **multi-source DuckDB query + transformation-pipeline MCP server.** Point it at files
-(CSV/Parquet/JSON/Excel) and databases (SQLite/PostgreSQL/MySQL), and an agent like Claude Code
+(CSV/Parquet/JSON/Excel), databases (SQLite/PostgreSQL/MySQL), and REST/JSON APIs
+(`api:<url>`, snapshotted at attach with pagination + auth), and an agent like Claude Code
 can query across all of them — and build step-by-step pipelines — through one DuckDB engine.
 
 ## Architecture in one line
@@ -71,10 +72,14 @@ Either way, wire it into Claude Code with a `.mcp.json`:
 Prefer a local checkout? `python -m spelunk.mcp.server --source ...` is equivalent to the `spelunk`
 command.
 
-Sources auto-detect by extension/scheme; prefix with `name=` to set the catalog/view name.
+Sources auto-detect by extension/scheme; prefix with `name=` to set the catalog/view name. A file
+path may be a **glob** — `--source trips=./data/yellow_*.parquet` attaches every matching file as
+one view, so a partitioned dump is one source, not N. A glob that matches nothing fails loudly.
 Optional resource guards: `--memory-limit 4GB`, `--temp-dir <dir>`, `--max-temp-size 50GB`.
-DuckDB is out-of-core, so a source larger than RAM is the normal case — scans read on demand and
-buffering operators spill to the temp directory.
+DuckDB is out-of-core, so a source larger than `--memory-limit` is the normal case — scans read on
+demand and buffering operators spill to the temp directory. Budget roughly 1:1 rather than orders of
+magnitude: a streaming aggregate needs a limit near the size of the columns it touches, and a full
+sort needs more than that.
 
 ## Dev
 

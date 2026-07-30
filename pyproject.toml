@@ -34,7 +34,9 @@ Issues = "https://github.com/shaunak2512/spelunk/issues"
 spelunk = "spelunk.mcp.server:main"
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "pytest-cov", "ruff", "pyarrow>=15.0"]
+# PyYAML is for evals/coverage.py — the claim register lives in YAML and the script is part of
+# the documented dev workflow, so a clean `--extra dev` install must be able to run it.
+dev = ["pytest>=8.0", "pytest-cov", "ruff", "pyarrow>=15.0", "PyYAML>=6.0"]
 
 [build-system]
 requires = ["hatchling"]
