@@ -310,7 +310,8 @@ local snapshot at attach time, then registered as a view over the snapshot**.
   `{url, params, fetched_at, row_count}`, recorded like any source leaf — lineage shows *when*
   data was pulled, and the notebook's freshness verdicts (§2.5) extend naturally to
   "snapshot is 6 days old".
-- **Refresh is explicit** — `refresh_source(name)` or re-attach, never implicit. This resolves
+- **Refresh is explicit** — re-attach (`remove_source` then `add_source`), never implicit; a
+  dedicated `refresh_source(name)` tool remains future work. This resolves
   the reproducibility tension cleanly: `query` and `replay` run against a *pinned* snapshot
   (deterministic, no rate-limit surprises mid-pipeline); going stale is a visible, deliberate
   choice. Same "recipes vs data" split as §2.1.
@@ -361,7 +362,7 @@ two-step of nearly every REST API (movies→credits, repos→contributors, order
 
 **What shipped: URL templates bound to a result's columns, on the `fetch` tool.**
 
-```
+```python
 add_source("tmdb=openapi:https://developer.themoviedb.org/openapi/... auth_env=TMDB_TOKEN")
 query(sql="SELECT id AS movie_id FROM top_rated ORDER BY vote_count DESC LIMIT 200",
       name="ids", description="The 200 most-voted chart movies to fetch details for")

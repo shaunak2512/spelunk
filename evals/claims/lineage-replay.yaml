@@ -193,11 +193,17 @@ claims:
     '
   source: CLAUDE.md#key-concepts
   mode: behavioral
-  falsifier: A replay issues network requests, or an `into` replay loses the fetched rows.
+  falsifier: A replay issues network requests, or an `into` replay loses the fetched rows or the
+    edges around them.
   status: verified
   covered_by:
   - tests/test_fetch.py::TestLineage::test_replay_preserves_fetch_results_instead_of_refetching
   - tests/test_fetch.py::TestLineage::test_replay_into_a_fresh_flow_copies_the_snapshot
+  - tests/test_fetch.py::TestLineage::test_a_copied_fetch_node_keeps_its_edges
+  note: >
+    "Copied" has to mean the node AND its edges. A fetch node has no SQL to re-derive deps from,
+    so the copy passes them across explicitly and remaps the ones rebuilt alongside it — the
+    query branch gets the same result for free by re-parsing against the target search_path.
 - id: LIN-018
   claim: 'A fetch result gets a kind=''fetch'' lineage node whose SQL is `FETCH <json>` (source/path/
     params/rows_from — no secrets), with deps/sources passed explicitly.

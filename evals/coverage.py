@@ -86,6 +86,9 @@ def load_register() -> tuple[list[dict], list[str]]:
                 f"{path.name}: 'claims' is {type(raw_claims).__name__}, expected a list"
             )
             continue
+        if not raw_claims:
+            problems.append(f"{path.name}: 'claims' is empty — a file contributing no claims")
+            continue
 
         area = doc.get("area", path.stem)
         prefix = doc.get("prefix")
@@ -155,6 +158,15 @@ def report(claims: list[dict], test_ids: set[str], unverified_only: bool) -> Non
     by_status = Counter(c.get("status") for c in claims)
     verified = by_status["verified"]
     partial = by_status["partial"]
+
+    if not total:
+        # Every percentage below divides by the denominator. An empty register is exactly the
+        # case where load_register already has something worth saying (no claim files, an
+        # unparseable one, a `claims: {}`), so bail to the problem list rather than dying on
+        # the way to it.
+        print("Spelunk claim register\n" + "=" * 72)
+        print(f"No claims loaded (resolved against {len(test_ids)} tests).")
+        return
 
     if unverified_only:
         print("Claims with no falsifier\n" + "=" * 60)

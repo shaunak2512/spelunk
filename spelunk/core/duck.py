@@ -1736,9 +1736,24 @@ class DuckSession:
                             f'CREATE OR REPLACE TABLE "{target}"."{nm}" AS '
                             f'SELECT * FROM "{flow}"."{nm}"'
                         )
+                        # Carry the recorded edges over. A fetch node has no SQL to re-derive
+                        # them from (that is why `fetch` passes them explicitly), so dropping
+                        # them here would orphan the copy: `ids -> details -> roi` would render
+                        # end-to-end in the original flow and as a bare leaf in the rebuild.
+                        # Deps that are themselves being rebuilt now live in `target`, so they
+                        # are remapped — the query branch gets this for free by re-parsing its
+                        # SQL against the target search_path.
                         self._record_lineage(
                             target, nm, node["sql"], "fetch", node.get("description"),
-                            deps=[], sources=[],
+                            deps=[
+                                {
+                                    "flow": target if (d["flow"], d["name"]) in selected
+                                    else d["flow"],
+                                    "name": d["name"],
+                                }
+                                for d in node["deps"]
+                            ],
+                            sources=list(node["sources"]),
                         )
                     rc = self._con.execute(f'SELECT COUNT(*) FROM "{target}"."{nm}"').fetchone()[0]
                     preserved.append({"name": nm, "kind": "fetch", "row_count": int(rc)})

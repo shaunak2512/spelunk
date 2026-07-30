@@ -540,6 +540,34 @@ class TestLineage:
         session.replay(into="v2")
         assert session.query('SELECT * FROM "v2"."m"', name="t")["row_count"] == 2
 
+    def test_a_copied_fetch_node_keeps_its_edges(self, session, api):  # noqa: F811
+        """A rebuilt flow must render the same DAG as the one it was rebuilt from.
+
+        A fetch node has no SQL to re-derive edges from — that is why `fetch` passes them
+        explicitly — so copying it into a fresh flow has to carry them over, and remap the
+        deps that were rebuilt alongside it. Otherwise `ids -> details -> roi` renders end to
+        end in the original flow and as a bare orphan in the copy.
+        """
+        api.handlers["/movies"] = _movies
+        api.handlers["/movies/1"] = lambda n, q: (200, {"id": 1, "budget": 5}, {})
+        _attach(session)
+        session.query("SELECT 1 AS movie_id", name="ids")
+        session.fetch(source="mock", path="/movies/{movie_id}", name="d", rows_from="ids")
+        session.query("SELECT budget FROM d", name="roi")
+
+        session.replay(into="v2")
+        graph = session.lineage(flow="v2")
+        nodes = {n["name"]: n for n in graph["nodes"]}
+        assert nodes["d"]["kind"] == "fetch"
+        # The API source leaf survives the copy...
+        assert "mock" in nodes["d"]["sources"]
+        # ...and the dep points at the REBUILT ids, not back at the flow it came from.
+        assert nodes["d"]["deps"] == [{"flow": "v2", "name": "ids"}]
+        assert {"from": "v2.ids", "to": "v2.d"} in graph["edges"]
+        assert {"from": "v2.d", "to": "v2.roi"} in graph["edges"]
+        assert graph["order"] == ["v2.ids", "v2.d", "v2.roi"]
+        assert graph["missing"] == []
+
 
 # --------------------------------------------------------------------------- #
 # Unit-level checks that need no session
