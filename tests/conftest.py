@@ -60,19 +60,35 @@ class _Handler(BaseHTTPRequestHandler):
         pass
 
 
-@pytest.fixture()
-def api():
-    """A local mock API: set ``api.handlers[path] = fn(nth_call, query) -> (status, payload,
-    extra_headers)``; requests are logged to ``api.calls``. ``api.base`` is the URL root."""
+def _serve_mock_api():
     srv = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
     srv.calls = []
     srv.handlers = {}
     srv.base = f"http://127.0.0.1:{srv.server_address[1]}"
     thread = threading.Thread(target=srv.serve_forever, daemon=True)
     thread.start()
-    yield srv
-    srv.shutdown()
-    srv.server_close()
+    try:
+        yield srv
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+@pytest.fixture()
+def api():
+    """A local mock API: set ``api.handlers[path] = fn(nth_call, query) -> (status, payload,
+    extra_headers)``; requests are logged to ``api.calls``. ``api.base`` is the URL root."""
+    yield from _serve_mock_api()
+
+
+@pytest.fixture()
+def other_api():
+    """A SECOND mock API, on a second port — a different ORIGIN from the ``api`` fixture.
+
+    What the cross-origin tests need: somewhere a hostile ``next`` link or ``Link:`` header can
+    try to send a credentialed fetch, whose ``calls`` list then proves it never arrived.
+    """
+    yield from _serve_mock_api()
 
 
 @pytest.fixture

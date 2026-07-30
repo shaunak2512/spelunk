@@ -1036,6 +1036,11 @@ class DuckSession:
             )
         dep_flow, _, dep_name = rows_from.rpartition(".")
         dep_flow = dep_flow or flow
+        # Both halves are interpolated into quoted identifiers below, so they go through the
+        # same gate as every other flow/name entry point — a `"` in either would otherwise
+        # close the identifier and run the remainder on the read-WRITE workspace connection.
+        _validate_name(dep_flow, "rows_from flow name")
+        _validate_name(dep_name, "rows_from result name")
         cols = ", ".join(f'"{p}"' for p in placeholders)
         limit = max_urls if max_urls is not None else apifetch.DEFAULT_MAX_URLS
         with self._lock:

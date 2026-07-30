@@ -10,6 +10,8 @@ into a fresh flow, and EXCEPT-diff every node in both directions expecting zero.
 """
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from spelunk.core.duck import DuckSession
@@ -160,6 +162,9 @@ class TestRenderEscaping:
     """
 
     BENIGN = "a plain description"
+    # A REAL mermaid edge line is exactly `<id> --> <id>`. Anything else carrying a raw arrow
+    # came out of a label. (DOT edges use `->`, so a `-->` there is a label escape by itself.)
+    EDGE_RE = re.compile(r"^\s*\w+ --> \w+\s*$")
 
     def _render(self, sqlite_file, tmp_path, text, render):
         session = DuckSession.open([f"shop={sqlite_file}"], session_dir=str(tmp_path / "ws"))
@@ -200,8 +205,17 @@ class TestRenderEscaping:
         label_area = diagram
         if "<" in text:
             assert "&lt;" in label_area, f"raw '<' survived from {text!r}"
-        if ">" in text and "-->" not in text:
+        if ">" in text:
             assert "&gt;" in label_area, f"raw '>' survived from {text!r}"
+        if "-->" in text:
+            # The input designed to inject a Mermaid edge must not be the one the escaping
+            # check skips: an unescaped `-->` inside a LABEL adds an edge without adding a
+            # line, so the structural line-count test cannot see it. The arrow must arrive
+            # entity-escaped, and every raw arrow left in the diagram must be a real edge.
+            assert "--&gt;" in diagram, f"raw '-->' survived from {text!r}"
+            for line in diagram.splitlines():
+                if "-->" in line.replace("--&gt;", ""):
+                    assert self.EDGE_RE.search(line), f"{text!r} injected an edge: {line!r}"
         if "&" in text:
             assert "&amp;" in label_area, f"raw '&' survived from {text!r}"
 

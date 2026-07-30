@@ -466,6 +466,29 @@ class TestFanOut:
         with pytest.raises(ValueError, match="needs at least one"):
             session.fetch(source="mock", path="/movies", name="d", rows_from="ids")
 
+    @pytest.mark.parametrize(
+        "hostile",
+        [
+            'ids" AS SELECT 1; CREATE TABLE pwned AS SELECT 1; --',
+            'x"."y',
+            'default"."ids',
+            "ids; DROP TABLE ids",
+            "ids-with-dashes",
+        ],
+    )
+    def test_rows_from_cannot_break_out_of_its_quoted_identifier(  # noqa: F811
+        self, session, api, hostile
+    ):
+        """SEC-016: rows_from is split on '.' straight into two double-quoted identifiers, and
+        the workspace connection those run on is NOT read-only — so it goes through the same
+        name gate as every other flow/name entry point."""
+        self._prep(session, api, ids=(1,))
+        with pytest.raises(ValueError, match="Invalid rows_from (flow|result) name"):
+            session.fetch(
+                source="mock", path="/movies/{movie_id}", name="d", rows_from=hostile
+            )
+        assert "pwned" not in {o.name for o in session.list_objects()}
+
 
 # --------------------------------------------------------------------------- #
 # Provenance

@@ -416,12 +416,21 @@ def base_url_of(spec: dict, locator: str) -> str:
 
 
 def _base_url(spec: dict, locator: str) -> str:
-    """The first server URL, resolved against the spec's own URL when relative."""
+    """The first server URL, resolved against the spec's own URL when relative.
+
+    A relative ``servers[0].url`` (Petstore's ``"/api/v3"``) only resolves when the document
+    was fetched over http(s) — a spec read off disk carries no host to resolve against. In
+    that case fall back to the same ``<BASE_URL>`` placeholder a *missing* server gets: an
+    unsubstituted marker surfaces the gap in ``suggested_spec`` and is refused by
+    ``parse_api_spec``, whereas returning ``/api/v3`` verbatim builds an ``ApiConnection``
+    with no scheme that fails much later, inside ``urlopen``, as "unknown url type".
+    """
     servers = spec.get("servers") or []
     url = servers[0].get("url", "") if servers and isinstance(servers[0], dict) else ""
     if url and not url.lower().startswith(("http://", "https://")):
         if locator.lower().startswith(("http://", "https://")):
             return urljoin(locator, url)
+        return "<BASE_URL>"
     return url or "<BASE_URL>"
 
 

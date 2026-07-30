@@ -136,13 +136,15 @@ claims:
     cannot be monkeypatched in place.
 - id: WSP-013
   claim: 'Out-of-core: sources are read on demand with pushdown and buffering operators spill to temp_directory,
-    so a source larger than RAM is the normal case, not a failure.
+    so a scan/aggregate over a source somewhat larger than memory_limit completes instead of failing.
+    The headroom is roughly 1:1, not orders of magnitude.
 
     '
   source: CLAUDE.md#key-concepts
   mode: quantitative
-  falsifier: A join/aggregate over a source much larger than memory_limit OOMs instead of spilling.
-  status: verified
+  falsifier: A streaming aggregate over a source larger than memory_limit OOMs instead of spilling,
+    or a sort does not spill to the configured temp directory.
+  status: partial
   covered_by:
   - tests/test_workspace.py::TestOutOfCore::test_aggregate_streams_under_a_memory_limit_below_the_data
   - tests/test_workspace.py::TestOutOfCore::test_full_sort_out_of_core_completes

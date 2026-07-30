@@ -21,7 +21,7 @@ import pytest
 
 from spelunk.core.duck import DuckSession
 from spelunk.core.types import UnsafeSQLError
-from spelunk.mcp.server import build_server
+from spelunk.mcp.server import _redact, build_server
 
 # Names that would be catastrophic if interpolated raw into DDL, plus the merely awkward ones
 # an agent produces by accident (unicode, whitespace, absurd length).
@@ -175,11 +175,22 @@ class TestCredentialRedactionInTheToolLog:
         record = json.loads(written.splitlines()[-1])
         assert record["tool"] == "add_source"
         assert secret not in json.dumps(record)
-        # Both shapes must be masked: the arg carries the URL form the caller wrote, while the
-        # driver quotes the DSN back in libpq keyword form on the error.
         assert "//***@" in record["args"]["spec"]
         assert record["outcome"] == "error"
-        assert "password=***" in record["error"]
+        # The keyword form only appears when DuckDB got as far as the libpq scanner and quoted
+        # the rewritten DSN back; whether it does depends on the postgres extension being
+        # present, so assert on it only when it is there. `secret not in written` above is the
+        # invariant either way, and test_keyword_password_form_is_masked pins the masking.
+        if "password" in record["error"]:
+            assert "password=***" in record["error"]
+
+    def test_keyword_password_form_is_masked(self):
+        """The libpq shape directly, with no dependency on how DuckDB words its failure."""
+        masked = _redact("connection to server failed: dbname=x user=admin password=hunter2")
+        assert "hunter2" not in masked
+        assert "password=***" in masked
+        assert _redact("password='quoted secret'") == "password=***"
+        assert _redact('password="dq secret"') == "password=***"
 
 
 # --------------------------------------------------------------------------- #

@@ -472,6 +472,18 @@ def _build_openapi_source(name: str, locator: str, snapshot_dir: str | None) -> 
     setup = [f'CREATE OR REPLACE VIEW main."{name}" AS SELECT * FROM {_snapshot_scan(dest)}']
     base_url = openapi_mod.base_url_of(spec, inner)
     connection = apifetch.parse_connection(base_url, option_tokens)
+    if not connection.base_url.lower().startswith(("http://", "https://")):
+        # A local spec whose servers[0].url is relative (or absent) leaves nothing to build
+        # requests from. Say so here, where the fix is one token, rather than letting every
+        # fetch die inside urlopen with "unknown url type".
+        servers = spec.get("servers") or [{}]
+        declared = servers[0].get("url") if isinstance(servers[0], dict) else None
+        raise ValueError(
+            f"OpenAPI spec {inner!r} does not give an absolute server URL "
+            f"(servers[0].url is {declared or '<missing>'!r}), so its endpoints have no host "
+            f"to call. Supply one on the source spec: openapi:{inner} "
+            "base_url=https://api.example.com"
+        )
     info = openapi_mod.catalog_info(inner, rows)
     info["base_url"] = connection.base_url
     info["auth"] = connection.auth_env or (

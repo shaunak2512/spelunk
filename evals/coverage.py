@@ -37,7 +37,7 @@ def collect_test_ids(tests_dir: Path) -> set[str]:
     collection errors, and it works even when the suite is red.
     """
     found: set[str] = set()
-    for path in sorted(tests_dir.glob("test_*.py")):
+    for path in sorted(tests_dir.rglob("test_*.py")):
         rel = path.relative_to(ROOT).as_posix()
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in tree.body:
@@ -61,10 +61,40 @@ def load_register() -> tuple[list[dict], list[str]]:
         problems.append(f"no claim files found under {CLAIMS_DIR}")
 
     for path in files:
-        doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        try:
+            doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except yaml.YAMLError as exc:
+            # A parse error is a register problem like any other — reporting it beside the
+            # rest beats a traceback that hides whatever the other nine files say.
+            problems.append(f"{path.name}: not valid YAML ({' '.join(str(exc).split())})")
+            continue
+        # Shape checks first: the register is the eval's denominator, so a file that silently
+        # contributes zero claims (`claims: {}`, a scalar root, a typo'd key) would understate
+        # the denominator and inflate every percentage in the report. Say so instead.
+        if doc is None:
+            problems.append(f"{path.name}: file is empty")
+            continue
+        if not isinstance(doc, dict):
+            problems.append(f"{path.name}: top level is {type(doc).__name__}, expected a mapping")
+            continue
+        raw_claims = doc.get("claims")
+        if raw_claims is None:
+            problems.append(f"{path.name}: no 'claims' key")
+            continue
+        if not isinstance(raw_claims, list):
+            problems.append(
+                f"{path.name}: 'claims' is {type(raw_claims).__name__}, expected a list"
+            )
+            continue
+
         area = doc.get("area", path.stem)
         prefix = doc.get("prefix")
-        for claim in doc.get("claims", []):
+        for index, claim in enumerate(raw_claims):
+            if not isinstance(claim, dict):
+                problems.append(
+                    f"{path.name}: claims[{index}] is {type(claim).__name__}, expected a mapping"
+                )
+                continue
             claim["_file"] = path.name
             claim["_area"] = area
             claims.append(claim)
@@ -93,6 +123,14 @@ def check_coverage(claims: list[dict], test_ids: set[str]) -> list[str]:
         cid = claim.get("id", "<no id>")
         covered = claim.get("covered_by") or []
         status = claim.get("status")
+
+        if not isinstance(covered, list):
+            # A bare string is the tempting typo, and iterating it would "resolve" one
+            # character at a time — nonsense problems instead of the real one.
+            problems.append(
+                f"{cid}: covered_by is {type(covered).__name__}, expected a list of node ids"
+            )
+            continue
 
         for node_id in covered:
             if node_id not in test_ids:
@@ -128,8 +166,9 @@ def report(claims: list[dict], test_ids: set[str], unverified_only: bool) -> Non
         print(f"\n{by_status['unverified']} of {total} claims have no falsifier.")
         return
 
+    areas = sorted({c["_area"] for c in claims})
     print("Spelunk claim register\n" + "=" * 72)
-    print(f"{total} claims across {len(set(c['_file'] for c in claims))} areas, "
+    print(f"{total} claims across {len(areas)} areas, "
           f"resolved against {len(test_ids)} tests\n")
 
     print("By status")
@@ -137,11 +176,16 @@ def report(claims: list[dict], test_ids: set[str], unverified_only: bool) -> Non
         n = by_status[status]
         print(f"  {status:<12} {n:>3}  {bar(n, total)}  {n / total:>5.0%}")
 
+    # Grouped by the DECLARED area, not the filename: two files may share one area, and a
+    # file's name need not match the area it declares. Areas are prose, so the label is
+    # collapsed and clipped to keep the columns aligned.
     print("\nBy area" + " " * 26 + "verified  partial  unverified")
-    for name in sorted(set(c["_file"] for c in claims)):
-        rows = [c for c in claims if c["_file"] == name]
+    for name in areas:
+        rows = [c for c in claims if c["_area"] == name]
         s = Counter(c.get("status") for c in rows)
-        print(f"  {name:<28} {len(rows):>3} claims  "
+        label = " ".join(str(name).split())
+        label = label[:27] + "…" if len(label) > 28 else label
+        print(f"  {label:<28} {len(rows):>3} claims  "
               f"{s['verified']:>5}  {s['partial']:>7}  {s['unverified']:>10}")
 
     print("\nBy falsification mode" + " " * 12 + "verified  partial  unverified")

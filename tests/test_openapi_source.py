@@ -493,6 +493,58 @@ class TestLoadSpec:
         assert spec["openapi"] == "3.0.0"
 
 
+class TestBaseUrl:
+    """OAS-014: a relative ``servers[0].url`` (Petstore's ``/api/v3``) only resolves when the
+    document itself was fetched over http(s). Off disk there is no host to resolve against,
+    and returning the relative path verbatim builds a scheme-less connection that fails much
+    later, inside urlopen, as "unknown url type"."""
+
+    RELATIVE = {**SPEC, "servers": [{"url": "/api/v3"}]}
+
+    def test_relative_server_resolves_against_a_remote_locator(self):
+        assert (
+            openapi.base_url_of(self.RELATIVE, "https://petstore.test/openapi.json")
+            == "https://petstore.test/api/v3"
+        )
+
+    def test_relative_server_on_a_local_file_falls_back_to_the_placeholder(self):
+        # Same marker a MISSING server gets: visible in suggested_spec, refused by parse_api_spec.
+        assert openapi.base_url_of(self.RELATIVE, "./petstore.json") == "<BASE_URL>"
+
+    def test_attaching_a_local_spec_with_no_host_names_the_fix(self, tmp_path):
+        spec_file = tmp_path / "petstore.json"
+        spec_file.write_text(json.dumps(self.RELATIVE), encoding="utf-8")
+        session = DuckSession.open([], session_dir=str(tmp_path / "sess"))
+        try:
+            with pytest.raises(ValueError, match="base_url=https://"):
+                session.add_source(f"openapi:{spec_file}")
+        finally:
+            session.close()
+
+    def test_base_url_option_supplies_the_missing_host(self, tmp_path):
+        spec_file = tmp_path / "petstore.json"
+        spec_file.write_text(json.dumps(self.RELATIVE), encoding="utf-8")
+        session = DuckSession.open([], session_dir=str(tmp_path / "sess"))
+        try:
+            out = session.add_source(
+                f"openapi:{spec_file} base_url=https://petstore.test/api/v3/"
+            )
+            assert out["info"]["base_url"] == "https://petstore.test/api/v3"
+        finally:
+            session.close()
+
+    def test_base_url_option_overrides_a_declared_server(self, tmp_path):
+        """A spec whose servers[0] points at production, pointed at a staging host instead."""
+        spec_file = tmp_path / "api.json"
+        spec_file.write_text(json.dumps(SPEC), encoding="utf-8")
+        session = DuckSession.open([], session_dir=str(tmp_path / "sess"))
+        try:
+            out = session.add_source(f"openapi:{spec_file} base_url=https://staging.x.test/v1")
+            assert out["info"]["base_url"] == "https://staging.x.test/v1"
+        finally:
+            session.close()
+
+
 class TestSessionIntegration:
     def test_attach_query_remove(self, tmp_path):
         spec_file = tmp_path / "my-api.json"

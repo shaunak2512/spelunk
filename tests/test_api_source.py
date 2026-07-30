@@ -482,6 +482,108 @@ class TestPagination:
 
 
 # --------------------------------------------------------------------------- #
+# Pagination stays on the API's own origin
+# --------------------------------------------------------------------------- #
+class TestPaginationStaysOnItsOwnOrigin:
+    """API-030: a next-page URL taken from a response body or a ``Link:`` header is
+    SERVER-SUPPLIED DATA, but the credential headers are resolved once and reused for every
+    page. Following one off-origin would hand this source's token to whatever host it names.
+    """
+
+    TOKEN = "sekret-token-value"
+
+    @pytest.fixture(autouse=True)
+    def _token(self, monkeypatch):
+        monkeypatch.setenv("SPELUNK_TEST_TOKEN", self.TOKEN)
+
+    def test_cursor_to_another_host_is_refused(self, api, other_api, tmp_path):
+        other_api.handlers["/steal"] = lambda n, q: (200, {"results": _rows(1)}, {})
+        api.handlers["/c"] = lambda n, q: (
+            200, {"results": _rows(2), "next": f"{other_api.base}/steal"}, {}
+        )
+        spec = ApiSpec(
+            url=f"{api.base}/c",
+            paginate="cursor",
+            cursor_path="next",
+            auth_env="SPELUNK_TEST_TOKEN",
+        )
+        with pytest.raises(ValueError, match="off this API's own origin"):
+            fetch_snapshot(spec, str(tmp_path / "s.ndjson"))
+        assert other_api.calls == [], "the credentialed fetch reached the other host"
+
+    def test_scheme_relative_cursor_cannot_smuggle_a_host(self, api, other_api, tmp_path):
+        # urljoin honours `//host/path` as scheme-relative, so a cursor with no scheme is
+        # still able to name a different host — checking the RESOLVED url is what catches it.
+        host = other_api.base.split("//", 1)[1]
+        api.handlers["/c"] = lambda n, q: (
+            200, {"value": _rows(2), "@odata.nextLink": f"//{host}/steal"}, {}
+        )
+        other_api.handlers["/steal"] = lambda n, q: (200, {"value": _rows(1)}, {})
+        spec = parse_api_spec(f"{api.base}/c paginate=odata auth_env=SPELUNK_TEST_TOKEN")
+        with pytest.raises(ValueError, match="off this API's own origin"):
+            fetch_snapshot(spec, str(tmp_path / "s.ndjson"))
+        assert other_api.calls == []
+
+    def test_link_header_to_another_host_is_refused(self, api, other_api, tmp_path):
+        other_api.handlers["/steal"] = lambda n, q: (200, _rows(1), {})
+        api.handlers["/l"] = lambda n, q: (
+            200, _rows(2), {"Link": f'<{other_api.base}/steal>; rel="next"'}
+        )
+        spec = ApiSpec(url=f"{api.base}/l", paginate="link", auth_env="SPELUNK_TEST_TOKEN")
+        with pytest.raises(ValueError, match="off this API's own origin"):
+            fetch_snapshot(spec, str(tmp_path / "s.ndjson"))
+        assert other_api.calls == []
+
+    def test_a_relative_link_header_still_works(self, api, tmp_path):
+        # The confinement must not break RFC 8288's relative URI-references.
+        def handler(n, q):
+            if q.get("p") is None:
+                return (200, _rows(2, 0), {"Link": '</l?p=2>; rel="next"'})
+            return (200, _rows(2, 2), {})
+
+        api.handlers["/l"] = handler
+        info = fetch_snapshot(
+            ApiSpec(url=f"{api.base}/l", paginate="link"), str(tmp_path / "s.ndjson")
+        )
+        assert info["row_count"] == 4 and info["pages"] == 2
+
+    def test_the_refusal_never_echoes_the_token(self, api, other_api, tmp_path):
+        api.handlers["/c"] = lambda n, q: (
+            200, {"results": _rows(1), "next": f"{other_api.base}/steal"}, {}
+        )
+        spec = ApiSpec(
+            url=f"{api.base}/c",
+            paginate="cursor",
+            cursor_path="next",
+            url_params=[("api_key", "SPELUNK_TEST_TOKEN")],
+        )
+        with pytest.raises(ValueError) as exc:
+            fetch_snapshot(spec, str(tmp_path / "s.ndjson"))
+        assert self.TOKEN not in str(exc.value)
+
+    def test_a_cross_origin_redirect_is_refused(self, api, other_api, tmp_path):
+        # urllib follows 3xx and re-sends the original headers, so the redirect handler has to
+        # apply the same rule one layer down.
+        other_api.handlers["/steal"] = lambda n, q: (200, _rows(1), {})
+        api.handlers["/r"] = lambda n, q: (
+            302, {}, {"Location": f"{other_api.base}/steal"}
+        )
+        spec = ApiSpec(url=f"{api.base}/r", auth_env="SPELUNK_TEST_TOKEN")
+        with pytest.raises(ValueError, match="off this API's own origin"):
+            fetch_snapshot(spec, str(tmp_path / "s.ndjson"))
+        assert other_api.calls == []
+
+    def test_a_same_origin_redirect_is_followed(self, api, tmp_path):
+        api.handlers["/r"] = lambda n, q: (302, {}, {"Location": f"{api.base}/real"})
+        api.handlers["/real"] = lambda n, q: (200, _rows(3), {})
+        info = fetch_snapshot(
+            ApiSpec(url=f"{api.base}/r", auth_env="SPELUNK_TEST_TOKEN"),
+            str(tmp_path / "s.ndjson"),
+        )
+        assert info["row_count"] == 3
+
+
+# --------------------------------------------------------------------------- #
 # Auth, retries, failure modes
 # --------------------------------------------------------------------------- #
 class TestAuthAndRetry:

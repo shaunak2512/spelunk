@@ -298,3 +298,35 @@ claims:
   status: verified
   covered_by:
   - tests/test_api_source.py::TestParseApiSpec::test_bad_paginate_style
+- id: API-027
+  claim: >
+    A next-page URL supplied by the server — a cursor_path value, an OData @odata.nextLink, or a
+    Link: rel="next" header — is only followed while it stays on the API's own origin. The same
+    rule applies to HTTP redirects.
+  source: CLAUDE.md#apifetch.py
+  mode: invariant
+  falsifier: >
+    A response body or Link header naming another host causes a request to that host carrying the
+    Authorization/api-key header the spec resolved for this source.
+  status: verified
+  covered_by:
+  - tests/test_api_source.py::TestPaginationStaysOnItsOwnOrigin::test_cursor_to_another_host_is_refused
+  - tests/test_api_source.py::TestPaginationStaysOnItsOwnOrigin::test_scheme_relative_cursor_cannot_smuggle_a_host
+  - tests/test_api_source.py::TestPaginationStaysOnItsOwnOrigin::test_link_header_to_another_host_is_refused
+  - tests/test_api_source.py::TestPaginationStaysOnItsOwnOrigin::test_the_refusal_never_echoes_the_token
+  - tests/test_api_source.py::TestPaginationStaysOnItsOwnOrigin::test_a_cross_origin_redirect_is_refused
+  note: >
+    Each test asserts on the OTHER host's call log, not just on the raised error — the falsifier is
+    "a request arrived there", and an error that fires after the request would still be a leak.
+- id: API-028
+  claim: >
+    Confining pagination to one origin does not break relative next-page references — a relative
+    Link header or @odata.nextLink still resolves against the request URL and is followed.
+  source: CLAUDE.md#apifetch.py
+  mode: behavioral
+  falsifier: A relative next-URL is refused as cross-origin, so a conforming API paginates once and stops.
+  status: verified
+  covered_by:
+  - tests/test_api_source.py::TestPaginationStaysOnItsOwnOrigin::test_a_relative_link_header_still_works
+  - tests/test_api_source.py::TestPaginationStaysOnItsOwnOrigin::test_a_same_origin_redirect_is_followed
+  - tests/test_api_source.py::TestPagination::test_odata_relative_nextlink_resolved

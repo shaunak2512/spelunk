@@ -342,82 +342,83 @@ Airbyte/Singer/dlt product — a swamp. The right move is a documented recipe: *
 loads REST APIs into DuckDB natively, and spelunk attaches the resulting `.duckdb` (or Parquet)
 as a source. One paragraph of docs buys the whole connector ecosystem.
 
-### 3.6 Entity fan-out — `rows_from=` (designed 2026-07-25, NOT implemented)
+### 3.6 Entity fan-out — `fetch(rows_from=...)` (implemented)
+
+> **Status: implemented** (feat/api-source-snapshot) — but *not* as the `api:` source option
+> this section originally designed. The shipped contract is connection-scoped:
+> `fetch(source, path, name, rows_from=<[flow.]result>)` on an attached `openapi:` connection.
+> The rest of this section is kept as the record of why it exists; where the design and the
+> shipped surface differ, the deltas below are authoritative.
 
 **Motivating evidence.** A/B eval on the TMDB API (2026-07-25): a spelunk-only agent vs a
 curl+Python agent, same brief. Quality was comparable, but the script agent's insight was
 *richer* (genre ROI economics) for one structural reason: budget/revenue live only in the
 per-movie `/movie/{id}` **detail endpoint**, and the script agent fan-out-fetched 240 of them
-in a threaded loop. Spelunk has no primitive for per-entity detail fetches — attaching 240
+in a threaded loop. Spelunk had no primitive for per-entity detail fetches — attaching 240
 `api:` sources is absurd — so the spelunk agent's analysis was silently *shaped by what list
-endpoints expose*. This is the highest-value `api:` follow-up: list→detail is the canonical
+endpoints expose*. This was the highest-value `api:` follow-up: list→detail is the canonical
 two-step of nearly every REST API (movies→credits, repos→contributors, orders→line items).
 
-**Design: URL templates bound to a result's columns.**
+**What shipped: URL templates bound to a result's columns, on the `fetch` tool.**
 
 ```
+add_source("tmdb=openapi:https://developer.themoviedb.org/openapi/... auth_env=TMDB_TOKEN")
 query(sql="SELECT id AS movie_id FROM top_rated ORDER BY vote_count DESC LIMIT 200",
       name="ids", description="The 200 most-voted chart movies to fetch details for")
-add_source("details=api:https://api.themoviedb.org/3/movie/{movie_id} rows_from=ids "
-           "auth_env=TMDB_TOKEN")
+fetch(source="tmdb", path="/3/movie/{movie_id}", rows_from="ids", name="details")
 ```
 
-- New `api:` option `rows_from=<[flow.]result>`. When present, the URL may contain
-  `{placeholder}`s; **each placeholder binds to the column of that name** in the referenced
-  result. One URL per *distinct* row of the referenced columns (nulls dropped), ordered
-  deterministically (ORDER BY the columns) so the snapshot is reproducible. The prep `query`
-  IS the fan-out spec — selecting/aliasing/limiting rows is plain SQL, which composes with
-  everything (filter to top-N, anti-join against already-fetched, etc.).
-- Multi-placeholder templates fall out for free: `api:https://host/repos/{owner}/{repo}
-  rows_from=repo_list` binds two columns. The single-id case is just the 1-column special case.
-- **Continuity with the `openapi:` catalog:** `suggested_spec` for `/3/movie/{movie_id}`
-  already emits the `{movie_id}` template — the agent aliases a column to the placeholder name
-  and appends `rows_from=`. Catalog → prep query → fan-out is a 3-call pipeline.
+- **`rows_from` is a `fetch` argument, not an `api:` source option.** The API is attached once
+  as an `openapi:` connection; every endpoint of it — list, detail, fan-out — is a `fetch`
+  call against that one source. A fan-out produces a flow-scoped **result**, not a source, so
+  it is droppable, appears in `lineage`, and never multiplies the source list.
+- Each `{placeholder}` in `path` binds to the column of that name in the referenced result.
+  One URL per *distinct* row of the bound columns (nulls dropped), ordered deterministically
+  (ORDER BY the columns) so the snapshot is reproducible. The prep `query` IS the fan-out
+  spec — selecting/aliasing/limiting rows is plain SQL, which composes with everything
+  (filter to top-N, anti-join against already-fetched, etc.).
+- Multi-placeholder templates fall out for free: `path="/repos/{owner}/{repo}"` binds two
+  columns. The single-id case is the 1-column special case.
+- **Continuity with the `openapi:` catalog:** the catalog row for `/3/movie/{movie_id}`
+  already carries the `{movie_id}` template — the agent aliases a column to the placeholder
+  name and passes `rows_from=`. Catalog → prep query → fan-out is a 3-call pipeline.
 
-**Fetch semantics.**
+**Fetch semantics (as shipped).**
 
 - Each response contributes its records (same `records=`/auto-detect per response; a detail
-  endpoint's single object → one row), each row stamped with the template values as columns
-  (`_key_movie_id`, ...) so joining back to the source result is trivial even when the
-  response omits the id. `paginate` must be `none` with `rows_from` (error otherwise) — keep
-  the two axes (many-URLs vs many-pages) from multiplying in v1.
-- **Caps & courtesy:** `max_urls` (default ~500) — exceeding it is an ERROR telling the agent
-  to LIMIT the prep query, never a silent truncation. Optional small thread pool
-  (`concurrency`, default ~4) reusing `_get_json` retries; on any 429, all workers back off
-  together (honouring Retry-After). Fetch count and elapsed recorded in `Source.info`.
+  endpoint's single object → one row), each row stamped `_key_<placeholder>` so joining back
+  to the prep result is trivial even when the response omits the id. `paginate` must be
+  `none` with `rows_from` (error otherwise) — the two axes (many-URLs vs many-pages) do not
+  multiply.
+- **Caps & courtesy:** `max_urls` — exceeding it is an ERROR telling the agent to LIMIT the
+  prep query, never a silent truncation. A thread pool shares one `HostLimiter`, so a 429
+  backs off every worker together (honouring Retry-After).
 - **Partial failure policy:** a per-entity **404 is data, not an error** (deleted entity) —
-  skip it and report `skipped: [values...]` in `info` (no-silent-caps). 401/403 aborts the
-  whole fetch (credentials are wrong for everything). Other 5xx: retry per URL, then abort —
-  a half-fetched detail table is a footgun for aggregate queries.
+  skipped and reported. 401/403 aborts the whole fetch (credentials are wrong for
+  everything). Other failures: retry per URL, then abort — a half-fetched detail table is a
+  footgun for aggregate queries.
 
-**Provenance.** This is spelunk's first *source that depends on a result* — the lineage
-model today only has results-depend-on-sources. v1: record `rows_from` (flow.result), the
-template, URL count, and skipped keys in `Source.info` (surfaced by `add_source` and
-`db://tables`); accept that the `lineage()` graph shows the fan-out source as a leaf. v2
-(open question): a lineage node of a new kind (`fetch`) so the DAG shows
-`top_rated → ids → details → roi_table` end-to-end and `replay` can warn when the upstream
-result changed after the snapshot was taken. Staleness/refresh stays re-attach, like every
-`api:` source.
+**Provenance — v2 shipped, not v1.** The design hedged that the fan-out would be a leaf; it
+isn't. A fetch result gets a `kind='fetch'` lineage node whose deps are passed explicitly
+(there is no SQL to parse them out of), so `top_rated → ids → details → roi` renders
+end-to-end. `replay` **preserves** fetch results rather than re-fetching them: they are pinned
+inputs, like a source, and re-issuing N requests inside a deterministic rebuild would import
+network latency, rate limits, and a changed upstream. They are reported under `preserved`
+(and copied when rebuilding `into` a fresh flow). Refresh = `fetch` again.
 
-**Safety.** Template values are percent-encoded as single path segments at substitution
-(a value containing `/`, `?`, or `#` must not be able to redirect the request to a different
-endpoint or add query params). Same `--allow-add-source` SSRF trust boundary as `api:`,
-amplified by N — another reason `max_urls` is a hard error, not a soft cap.
+**Safety.** Template values are percent-encoded as single path segments at substitution (a
+value containing `/`, `?`, or `#` cannot redirect the request), and `fetch` is confined to its
+connection's host + base path — absolute URLs, `..`, and traversal through a bound placeholder
+are all refused. Same `--allow-add-source` trust boundary as `add_source`, amplified by N —
+another reason `max_urls` is a hard error, not a soft cap.
 
-**Non-goals (v1):** pagination inside each detail fetch; POST bodies; recursive fan-out
-(details-of-details) — chain two `rows_from` sources instead; incremental append (re-attach
-refetches everything — the anti-join-in-prep-query pattern covers "only fetch new ids" well
-enough).
+**Non-goals (still):** pagination inside each detail fetch; POST bodies; recursive fan-out
+(details-of-details) — chain two fan-outs instead; incremental append (the
+anti-join-in-prep-query pattern covers "only fetch new ids" well enough).
 
-**Effort estimate:** moderate — grammar + binding/validation (~error messages listing the
-result's columns vs the template's placeholders), the capped/concurrent fetch loop, tests
-(mock server: multi-placeholder, 404-skip, 429 global backoff, max_urls error,
-determinism), and a live TMDB rerun of the eval task to confirm the ROI insight becomes
-reachable through spelunk in ~4 tool calls / ~240 logged requests.
-
-**Minor UX fix, same eval:** the catalog's `method` column tripped the agent
-(`WHERE method='get'` → 0 rows; values are `'GET'`). Either store lowercase, or note the
-casing in the `openapi:` docstring + tool description.
+**Minor UX fix, same eval — done:** the catalog's `method` column tripped the agent
+(`WHERE method='get'` → 0 rows against `'GET'`). Catalog rows now store the method
+**lowercase**, matching the OpenAPI document's own keys.
 
 ---
 

@@ -82,7 +82,13 @@ spelunk/core/
                  #   (any header, e.g. X-Api-Key), param=<name>:<ENV> (query-param keys) — specs
                  #   carry env var NAMES, never values; injected values are scrubbed from error
                  #   messages ($ENV placeholder). Retries 429/5xx with
-                 #   backoff + Retry-After; repeat-page guard stops APIs that ignore page params;
+                 #   backoff + Retry-After; a SERVER-SUPPLIED next-page URL (a cursor_path value,
+                 #   @odata.nextLink, or Link: rel="next") is followed only while it stays on the
+                 #   API's OWN ORIGIN — the credential headers resolve once and are reused for every
+                 #   page, so an off-origin `next` would hand the token to whatever host the response
+                 #   names; relative refs still resolve normally, and cross-origin HTTP redirects are
+                 #   refused the same way (urllib re-sends headers across them).
+                 #   Repeat-page guard stops APIs that ignore page params;
                  #   a 404 mid-pagination = end-of-data (TVMaze-style), on page 1 = error;
                  #   fetch fingerprint (url/fetched_at/pages/row_count) returned as Source.info.
                  #   ALSO the connection layer: ApiConnection (base URL + creds + shared
@@ -118,6 +124,11 @@ spelunk/core/
                  #   TMDB's /movie/{id} a list of genres. Guidance-as-data: the agent SQL-queries
                  #   the catalog, fills <SET_ME>, feeds suggested_spec to add_source.
                  #   OpenAPI 3.x JSON only (YAML/Swagger2 rejected with conversion pointers).
+                 #   The connection's base is servers[0].url, resolved against the spec's own URL
+                 #   when relative — which only works for a spec fetched over http(s). A LOCAL spec
+                 #   with a relative server (Petstore's "/api/v3") has no host to resolve against, so
+                 #   the source refuses to attach and names the fix: `base_url=<url>`, an option that
+                 #   overrides the declared server (also how you point a spec at staging).
   guard.py       # sqlglot AST safety: assert_read_only(), enforce_limit() — called dialect="duckdb"
   types.py       # FROZEN contracts: TableInfo, TableDescription, ColumnInfo, errors
 
@@ -183,7 +194,10 @@ views named bare) and `db://{table}` (columns, PK, sample, row count).
   `fetch` again.
 - **Disk-backed always + out-of-core:** the workspace is a real DuckDB file (under `--session-dir`,
   else a temp dir). Sources are read on demand with pushdown; buffering operators spill to
-  `temp_directory`. A source larger than RAM is the normal case, not a failure.
+  `temp_directory`, so a source larger than `memory_limit` is the normal case, not a failure.
+  Measured headroom is roughly 1:1, not orders of magnitude (see WSP-013): a streaming
+  aggregate over ~400MB of columns needs ~384MB, and a full sort of the same data still OOMs
+  at 512MB whatever the temp settings.
 - **Read-only** = `ATTACH (READ_ONLY)` + the sqlglot guard on every query; the server constructs the
   `CREATE TABLE` DDL itself, so agent SQL is SELECT-only.
 
@@ -206,7 +220,9 @@ python -m spelunk.mcp.server --source sales=./data/sales.parquet --source sqlite
 `--source` is repeatable and auto-detects by extension/scheme (a `<your-name>=` prefix sets the
 catalog/view name — the word before the `=` IS the name, e.g. `sales=`; writing the placeholder
 literally as `name=sales <locator>` parses as the name `name` plus an unclassifiable locator, and
-`detect_kind` says so rather than blaming the locator). Optional guards: `--memory-limit`, `--temp-dir`, `--max-temp-size`. `--dsn` is a back-compat
+`detect_kind` says so rather than blaming the locator). A file locator may be a **glob** —
+`trips=./data/yellow_*.parquet` is one view over every match, so a partitioned dump is one source
+rather than N; a glob matching nothing is an error, not an empty view. Optional guards: `--memory-limit`, `--temp-dir`, `--max-temp-size`. `--dsn` is a back-compat
 alias for one `--source`. A `.mcp.json` wires Claude Code to a local source (paths are
 machine-specific; edit before use).
 

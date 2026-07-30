@@ -131,7 +131,8 @@ claims:
   gap: >
     Testable adversarially and deterministically: seed a run whose report overstates its
     filtering, then check a mechanical lineage-vs-report comparison catches it. This is the
-    strongest positioning claim spelunk makes and has no falsifier.
+    strongest positioning claim spelunk makes and it has no agent-tier verification — the
+    falsifier above is stated, but nothing exercises it.
 
 - id: AFF-011
   claim: >

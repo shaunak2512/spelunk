@@ -200,3 +200,18 @@ claims:
   - tests/test_sources.py::TestAttachAll::test_attached_sqlite_is_read_only
   note: 'Defence in depth checked as such: these tests bypass the guard entirely (writing straight
     at the connection) and the ATTACH still refuses — so the second layer is real, on all three engines.'
+- id: SEC-015
+  claim: >
+    rows_from goes through the same identifier gate as every other flow/name entry point, so it
+    cannot break out of the double-quoted identifiers it is interpolated into.
+  source: CLAUDE.md#tool-surface
+  mode: invariant
+  falsifier: >
+    A rows_from value containing a double quote closes the identifier and executes the remainder on
+    the workspace connection — which, unlike the sources, is not read-only.
+  status: verified
+  covered_by:
+  - tests/test_fetch.py::TestFanOut::test_rows_from_cannot_break_out_of_its_quoted_identifier
+  note: >
+    The one entry point that bypassed _validate_name. The test asserts the injected object does not
+    exist afterwards, not merely that an error was raised.

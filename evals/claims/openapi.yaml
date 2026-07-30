@@ -169,3 +169,28 @@ claims:
     No test pins the catalog's column set against the columns the server instructions tell the
     agent to query. A renamed column would break every agent while the suite stays green — a
     schema-contract test (documented names ⊆ view columns) is cheap and closes it.
+
+- id: OAS-014
+  claim: >
+    A relative servers[0].url resolves against the spec's own URL when the document was fetched over
+    http(s); read off disk there is no host to resolve against, so the source refuses to attach and
+    names base_url= as the fix.
+  source: CLAUDE.md#openapi.py
+  mode: behavioral
+  falsifier: >
+    A local spec with servers[0].url = "/api/v3" attaches, and its connection's base_url has no
+    scheme — every fetch then fails inside urlopen with "unknown url type".
+  status: verified
+  covered_by:
+  - tests/test_openapi_source.py::TestBaseUrl::test_relative_server_resolves_against_a_remote_locator
+  - tests/test_openapi_source.py::TestBaseUrl::test_relative_server_on_a_local_file_falls_back_to_the_placeholder
+  - tests/test_openapi_source.py::TestBaseUrl::test_attaching_a_local_spec_with_no_host_names_the_fix
+- id: OAS-015
+  claim: "base_url=<url> on an openapi: source overrides the spec's declared server."
+  source: CLAUDE.md#openapi.py
+  mode: behavioral
+  falsifier: base_url= is rejected as an unknown option, or is ignored in favour of servers[0].url.
+  status: verified
+  covered_by:
+  - tests/test_openapi_source.py::TestBaseUrl::test_base_url_option_supplies_the_missing_host
+  - tests/test_openapi_source.py::TestBaseUrl::test_base_url_option_overrides_a_declared_server

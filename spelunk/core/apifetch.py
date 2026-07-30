@@ -390,6 +390,10 @@ def parse_connection(base_url: str, tokens: list[str]) -> ApiConnection:
     ``param=<name>:<ENV>``, and any fetch option (``records=``, ``paginate=``, …) which becomes
     a *default* every request inherits — plus ``default_param=<name>:<value>`` for a plain
     query param that every request should carry (``default_param=language:en-US``).
+
+    ``base_url=<url>`` overrides *base_url*. A spec read off disk whose ``servers[0].url`` is
+    relative (Petstore's ``/api/v3``) carries no host to resolve against, and this is how the
+    caller supplies it.
     """
     conn = ApiConnection(base_url=base_url.rstrip("/"))
     for tok in tokens:
@@ -417,10 +421,13 @@ def parse_connection(base_url: str, tokens: list[str]) -> ApiConnection:
         if key == "auth_env":
             conn.auth_env = value
             continue
+        if key == "base_url":
+            conn.base_url = value.rstrip("/")
+            continue
         if key not in _OPTION_NAMES:
             raise ValueError(
                 f"Unknown connection option {key!r}. Valid options: {_VALID_OPTION_HELP}, "
-                "default_param."
+                "default_param, base_url."
             )
         conn.defaults[key] = _coerce_option(key, value)
     # Fail at attach time on a nonsense default rather than on the first fetch that inherits it.
@@ -887,6 +894,47 @@ def fetch_fanout(
 # --------------------------------------------------------------------------- #
 # HTTP
 # --------------------------------------------------------------------------- #
+def _origin(url: str) -> tuple[str, str]:
+    """The (scheme, host:port) a URL addresses, lowercased for comparison."""
+    parts = urlsplit(url)
+    return parts.scheme.lower(), parts.netloc.lower()
+
+
+def _same_origin(base: str, candidate: str, what: str) -> str:
+    """Return *candidate*, or refuse it when it leaves *base*'s origin.
+
+    The request headers — ``Authorization: Bearer …`` and any ``header=<Name>:<ENV>`` value —
+    are resolved once and reused for every page of a fetch. A next-page URL taken from a
+    response body (``cursor_path``) or a ``Link:`` header is *server-supplied data*, so
+    following one off-origin would hand this source's credentials to whatever host that data
+    names. An API paginates within itself; anything else is a different source.
+    """
+    if _origin(base) != _origin(candidate):
+        raise ValueError(
+            f"{what} points off this API's own origin "
+            f"({urlsplit(base).netloc} -> {urlsplit(candidate).netloc or candidate!r}). "
+            "Refusing to follow it: the request carries this source's credentials. Attach "
+            "the other host as its own source if you meant to read it."
+        )
+    return candidate
+
+
+class _SameOriginRedirectHandler(_urlrequest.HTTPRedirectHandler):
+    """Refuse a cross-origin HTTP redirect.
+
+    urllib follows 3xx by default and re-sends the original request's headers, so a redirect
+    to another host leaks the credential header just as a cross-host next-page URL would.
+    Same rule as :func:`_same_origin`, one layer down.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _same_origin(req.full_url, newurl, f"HTTP {code} redirect")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = _urlrequest.build_opener(_SameOriginRedirectHandler)
+
+
 def _get_json(
     url: str, headers: dict[str, str], limiter: "HostLimiter | None" = None
 ) -> tuple[Any, dict[str, str]]:
@@ -902,7 +950,7 @@ def _get_json(
             if limiter is not None:
                 limiter.acquire()
             req = _urlrequest.Request(url, headers=headers)
-            with _urlrequest.urlopen(req, timeout=_TIMEOUT_SECONDS) as resp:
+            with _OPENER.open(req, timeout=_TIMEOUT_SECONDS) as resp:
                 body = resp.read()
                 resp_headers = {k.lower(): v for k, v in resp.headers.items()}
             try:
@@ -1174,13 +1222,18 @@ def _next_url(
         if cursor in (None, "", False):
             return None
         if isinstance(cursor, str) and cursor.lower().startswith(("http://", "https://")):
-            return cursor  # PokeAPI-style: the cursor IS the next-page URL
+            # PokeAPI-style: the cursor IS the next-page URL — but it came out of the response
+            # body, so it only gets followed if it stays on this API.
+            return _same_origin(spec.url, cursor, f"cursor_path {spec.cursor_path!r}")
         if spec.cursor_param:
             return _with_param(spec.url, spec.cursor_param, cursor)
         if isinstance(cursor, str) and ("/" in cursor or "?" in cursor):
             # A path-like cursor with no cursor_param is a RELATIVE next-page URL (OData
             # permits relative @odata.nextLink values); resolve it against the request URL.
-            return urljoin(spec.url, cursor)
+            # urljoin still honours a scheme-relative `//other.host/x`, so check the result.
+            return _same_origin(
+                spec.url, urljoin(spec.url, cursor), f"cursor_path {spec.cursor_path!r}"
+            )
         raise ValueError(
             f"cursor_path {spec.cursor_path!r} yielded {cursor!r}, which is not a URL — "
             "set cursor_param=<query-param-name> so the cursor can be sent back."
@@ -1194,7 +1247,12 @@ def _next_url(
         return _with_param(_first_url(spec), spec.cursor_param or "", key)
     if spec.paginate == "link":
         match = _LINK_NEXT_RE.search(resp_headers.get("link", ""))
-        return match.group(1) if match else None
+        if not match:
+            return None
+        # RFC 8288 permits a relative URI-reference in a Link header; resolve, then confine.
+        return _same_origin(
+            spec.url, urljoin(spec.url, match.group(1)), 'Link header rel="next"'
+        )
     return None
 
 

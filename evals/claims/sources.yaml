@@ -267,7 +267,7 @@ claims:
     1:1, not orders of magnitude.'
 - id: SRC-024
   claim: A glob is a valid file source — one view over many matching files.
-  source: undocumented (relied on in .mcp.json and the taxi experiment)
+  source: README.md#install-and-run
   mode: behavioral
   falsifier: A `*.parquet` spec attaches only one file, or fails to attach.
   status: verified
@@ -275,5 +275,6 @@ claims:
   - tests/test_source_parity.py::TestGlobSource::test_a_glob_attaches_every_matching_file_as_one_view
   - tests/test_source_parity.py::TestGlobSource::test_the_glob_view_is_queryable_like_any_file_source
   - tests/test_source_parity.py::TestGlobSource::test_a_glob_matching_nothing_fails_loudly
-  note: 'Behaviour is now pinned. STILL A DOC GAP: globs remain undocumented in README/CLAUDE.md despite
-    being used in .mcp.json.'
+  note: Behaviour is pinned and the affordance is now documented in README.md#install-and-run and
+    CLAUDE.md#running-the-server, so the register measures a documented contract rather than an
+    incidental one.
