@@ -5,8 +5,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What Spelunk is
 
 A **multi-source DuckDB query + transformation-pipeline MCP server.** Point it at files
-(CSV/Parquet/JSON/Excel/YAML) and databases (SQLite/PostgreSQL/MySQL), and an agent (Claude Code) can
-query across all of them and build step-by-step pipelines through one DuckDB engine.
+(CSV/Parquet/JSON/Excel/Avro/YAML) and databases (SQLite/PostgreSQL/MySQL), and an agent (Claude
+Code) can query across all of them and build step-by-step pipelines through one DuckDB engine.
 
 **Core idea:** a *single DuckDB session* is both the query engine and the workspace. Every source
 is `ATTACH`ed (databases) or scanned (files) into one connection, so a single `query` can join a

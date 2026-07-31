@@ -288,13 +288,17 @@ class TestAttachAll:
         assert [r[0] for r in rows] == ["Melbourne", "Sydney"]
 
     def test_yaml_source(self, yaml_file):
-        # End-to-end through the real community extension; skipped when it can't be fetched
-        # (offline CI, no extension cache) so the suite stays runnable without a network.
+        # End-to-end through the real community extension. ONLY fetching the extension may skip
+        # (offline CI, cold extension cache) — the preflight runs the very statements production
+        # uses. Once the extension is in hand, attach_all runs unguarded, so a broken read_yaml
+        # or a failed view creation fails the test instead of vanishing into a skip.
         con = duckdb.connect()
         try:
-            sources.attach_all(con, [f"regions={yaml_file}"])
+            for stmt in sources._load_ext("yaml"):
+                con.execute(stmt)
         except duckdb.Error as exc:  # pragma: no cover - environment-dependent
             pytest.skip(f"yaml community extension unavailable: {exc}")
+        sources.attach_all(con, [f"regions={yaml_file}"])
         rows = con.execute("SELECT city, state FROM regions ORDER BY city").fetchall()
         assert rows == [("Melbourne", "VIC"), ("Sydney", "NSW")]
 

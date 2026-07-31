@@ -48,7 +48,8 @@ is the name itself — ``nvd=api:…``, never the literal token ``name=``)::
 
 A file whose name lacks a recognised extension (an API endpoint, a ``.dat`` dump) is read by
 forcing the reader with a format prefix — ``csv:`` / ``tsv:`` / ``json:`` / ``parquet:`` /
-``excel:`` / ``avro:`` / ``yaml:`` — placed on the locator (after any ``name=``): ``routes=csv:<url>``.
+``excel:`` / ``avro:`` / ``yaml:`` (``yml:``) — placed on the locator (after any ``name=``):
+``routes=csv:<url>``.
 
 Attached databases (and DuckLake) are referenced in SQL by ``"<source>"."<table>"``; file and
 lakehouse-scan sources by their bare view name.
@@ -283,7 +284,7 @@ def detect_kind(
         + _prefix_help(stripped_name, locator)
         + "If it is a data file with an "
         "unrecognized or absent extension (a .dat dump, an extensionless API URL), force the "
-        "reader with a format prefix — csv:/tsv:/json:/parquet:/excel:/avro:/yaml: — "
+        "reader with a format prefix — csv:/tsv:/json:/parquet:/excel:/avro:/yaml:(yml:) — "
         f"e.g. csv:{locator}. "
         "Recognized extensions: "
         f"{', '.join(sorted(set(_FILE_READERS) | set(_EXT_FILE_READERS) | _SQLITE_EXTS))} "

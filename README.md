@@ -1,7 +1,7 @@
 # Spelunk
 
 A **multi-source DuckDB query + transformation-pipeline MCP server.** Point it at files
-(CSV/Parquet/JSON/Excel/YAML), databases (SQLite/PostgreSQL/MySQL), and REST/JSON APIs
+(CSV/Parquet/JSON/Excel/Avro/YAML), databases (SQLite/PostgreSQL/MySQL), and REST/JSON APIs
 (`api:<url>`, snapshotted at attach with pagination + auth), and an agent like Claude Code
 can query across all of them — and build step-by-step pipelines — through one DuckDB engine.
 
@@ -76,7 +76,7 @@ Sources auto-detect by extension/scheme; prefix with `name=` to set the catalog/
 path may be a **glob** — `--source trips=./data/yellow_*.parquet` attaches every matching file as
 one view, so a partitioned dump is one source, not N. A glob that matches nothing fails loudly.
 A `.yaml`/`.yml` source reads through DuckDB's `yaml` **community** extension, which the server
-installs on first use — that one needs network access (afterwards it is cached locally).
+installs on first use — that one needs network access (afterward it is cached locally).
 Optional resource guards: `--memory-limit 4GB`, `--temp-dir <dir>`, `--max-temp-size 50GB`.
 DuckDB is out-of-core, so a source larger than `--memory-limit` is the normal case — scans read on
 demand and buffering operators spill to the temp directory. Budget roughly 1:1 rather than orders of

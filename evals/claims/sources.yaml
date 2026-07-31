@@ -125,7 +125,7 @@ claims:
   - tests/test_sources.py::TestDeriveName::test_delta_scheme_stripped_from_name
   - tests/test_sources.py::TestDeriveName::test_ducklake_scheme_stripped_from_name
 - id: SRC-012
-  claim: 'For a file with an odd or absent extension, a format prefix (csv:/tsv:/json:/parquet:/excel:/avro:/yaml:)
+  claim: 'For a file with an odd or absent extension, a format prefix (csv:/tsv:/json:/parquet:/excel:/avro:/yaml:/yml:)
     forces the reader.
 
     '
@@ -295,6 +295,6 @@ claims:
   - tests/test_sources.py::TestBuildNewKinds::test_remote_yaml_loads_both_extensions
   - tests/test_sources.py::TestBuildNewKinds::test_core_extension_install_has_no_community_clause
   note: 'Unlike SRC-004 (delta/iceberg, SQL-shape only), a real YAML file is attached and queried
-    end-to-end. Caveat: that one test SKIPS when the community extension cannot be fetched (offline,
-    cold extension cache), so on a network-less run the claim rests on the SQL-generation
-    assertions alone.'
+    end-to-end. The skip is scoped to a preflight INSTALL/LOAD, so only an unfetchable extension
+    (offline, cold cache) skips — a broken reader or view creation fails the test. Caveat: on a
+    network-less run the claim still rests on the SQL-generation assertions alone.'

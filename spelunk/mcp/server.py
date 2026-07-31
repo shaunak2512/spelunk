@@ -648,8 +648,8 @@ def main() -> None:
         default=[],
         metavar="SPEC",
         help=(
-            "A data source, repeatable. A file path (.csv/.parquet/.json/.xlsx/.avro/.yaml) — "
-            "local or a remote https:// / s3:// / gs:// / az:// URL — a SQLite file, a delta:<path> / "
+            "A data source, repeatable. A file path (.csv/.parquet/.json/.xlsx/.avro/.yaml/.yml) "
+            "— local or a remote https:// / s3:// / gs:// / az:// URL — a SQLite file, a delta:<path> / "
             "iceberg:<path> lakehouse table, a sqlite:// / postgresql:// / mysql:// / ducklake: "
             "DSN, or a REST/JSON API: 'api:<url> [key=value ...]' is fetched once at startup into "
             "a local snapshot (options incl. records=<dot.path>, "
@@ -661,7 +661,8 @@ def main() -> None:
             "and '=' to set the source name, e.g. sales=./sales.parquet (the word before '=' "
             "is the name itself, not the literal token 'name'). "
             "For a file with an odd/absent extension, force the reader with a format prefix "
-            "(csv:/tsv:/json:/parquet:/excel:/avro:/yaml:), e.g. routes=csv:https://host/routes.dat."
+            "(csv:/tsv:/json:/parquet:/excel:/avro:/yaml: or yml:), e.g. "
+            "routes=csv:https://host/routes.dat."
         ),
     )
     parser.add_argument("--dsn", default=None, help="Alias for a single --source (back-compat).")
