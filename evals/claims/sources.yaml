@@ -125,7 +125,7 @@ claims:
   - tests/test_sources.py::TestDeriveName::test_delta_scheme_stripped_from_name
   - tests/test_sources.py::TestDeriveName::test_ducklake_scheme_stripped_from_name
 - id: SRC-012
-  claim: 'For a file with an odd or absent extension, a format prefix (csv:/tsv:/json:/parquet:/excel:/avro:)
+  claim: 'For a file with an odd or absent extension, a format prefix (csv:/tsv:/json:/parquet:/excel:/avro:/yaml:)
     forces the reader.
 
     '
@@ -138,6 +138,8 @@ claims:
   - tests/test_sources.py::TestFormatPrefix::test_parquet_prefix_overrides_bin_extension
   - tests/test_sources.py::TestFormatPrefix::test_json_prefix_overrides_txt_extension
   - tests/test_sources.py::TestFormatPrefix::test_excel_prefix_loads_extension
+  - tests/test_sources.py::TestFormatPrefix::test_yaml_prefix_forces_reader_on_odd_extension
+  - tests/test_sources.py::TestFormatPrefix::test_yml_prefix_is_an_alias
   - tests/test_sources.py::TestFormatPrefix::test_prefix_is_case_insensitive
   - tests/test_sources.py::TestFormatPrefix::test_unknown_prefix_falls_through_to_extension
 - id: SRC-013
@@ -278,3 +280,21 @@ claims:
   note: Behaviour is pinned and the affordance is now documented in README.md#install-and-run and
     CLAUDE.md#running-the-server, so the register measures a documented contract rather than an
     incidental one.
+- id: SRC-025
+  claim: A .yaml/.yml file is a queryable source, read via the `yaml` community extension, whose
+    INSTALL carries a `FROM community` clause that core extensions must not get.
+  source: data_source_support.md#local-file-formats
+  mode: behavioral
+  falsifier: A .yaml source fails to attach or is not queryable by its bare name; or a core
+    extension's INSTALL is emitted with `FROM community` (or yaml's without it).
+  status: verified
+  covered_by:
+  - tests/test_sources.py::TestAttachAll::test_yaml_source
+  - tests/test_sources.py::TestBuildNewKinds::test_yaml_loads_community_ext
+  - tests/test_sources.py::TestBuildNewKinds::test_yml_extension_reads_as_yaml
+  - tests/test_sources.py::TestBuildNewKinds::test_remote_yaml_loads_both_extensions
+  - tests/test_sources.py::TestBuildNewKinds::test_core_extension_install_has_no_community_clause
+  note: 'Unlike SRC-004 (delta/iceberg, SQL-shape only), a real YAML file is attached and queried
+    end-to-end. Caveat: that one test SKIPS when the community extension cannot be fetched (offline,
+    cold extension cache), so on a network-less run the claim rests on the SQL-generation
+    assertions alone.'
