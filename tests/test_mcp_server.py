@@ -254,14 +254,26 @@ class TestDescriptionGating:
             session.close()
 
     def test_batch_step_missing_description_rejected(self, sqlite_file):
-        from pydantic import ValidationError
+        # Which exception type surfaces is FastMCP's business and it has changed: up to 3.4.2 the
+        # raw pydantic ValidationError escaped; from 3.4.3 FastMCP wraps it in its own
+        # ValidationError. `fastmcp` is pinned only as `>=`, so both are live in the wild. What
+        # the claim actually asserts is that the step is REJECTED and the message names the
+        # missing field — assert exactly that, against either type.
+        from pydantic import ValidationError as PydanticValidationError
+
+        try:
+            from fastmcp.exceptions import ValidationError as FastMCPValidationError
+        except ImportError:  # pragma: no cover - older FastMCP without its own type
+            FastMCPValidationError = PydanticValidationError
 
         session = DuckSession.open([f"shop={sqlite_file}"])
         srv = build_server(session, require_descriptions=True)
         try:
             # `description` is a required field of the step model, so a step that omits it fails
             # FastMCP's argument-schema validation before the tool body ever runs.
-            with pytest.raises(ValidationError, match="description"):
+            with pytest.raises(
+                (PydanticValidationError, FastMCPValidationError), match="description"
+            ):
                 _run(srv.call_tool("query", {"steps": [{"sql": "SELECT 1 AS x", "name": "x"}]}))
         finally:
             session.close()

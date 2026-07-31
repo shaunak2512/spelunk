@@ -25,10 +25,14 @@ from pathlib import Path
 from typing import Annotated
 
 from fastmcp import FastMCP
+from fastmcp.apps.config import AppConfig, ResourceCSP
+from fastmcp.tools.base import ToolResult
+from mcp.types import TextContent
 from pydantic import BaseModel, Field
 
 from spelunk import __version__
-from spelunk.core.duck import DuckSession
+from spelunk.core.duck import DuckSession, _full_sample_fits, _SAMPLE_ROWS
+from spelunk.mcp import views
 
 # Shared help text for the plain-English `description` — kept identical on the single-query
 # parameter and the per-step field so the agent sees one consistent instruction.
@@ -65,11 +69,13 @@ _LOGGED_ARGS = (
     "sql", "name", "flow", "target", "format", "path", "spec", "steps", "into", "dry_run",
     "description", "source", "params", "rows_from", "records", "paginate", "max_pages",
     "max_rows", "max_urls",
+    "kind", "x", "y", "series", "title",  # show
 )
 _LOGGED_RESULT_FIELDS = (
     "name", "flow", "row_count", "format", "path", "dropped_results", "kind",
     "step_count", "completed", "failed_step",
     "root", "source_flow", "target_flow", "dry_run",  # lineage / replay
+    "displayed", "rendered_by_host",  # show
 )
 # lineage/replay result lists carry the full SQL of every node — log their size, not their body.
 _COUNTED_RESULT_FIELDS = ("columns", "nodes", "edges", "order", "missing", "rebuilt", "plan")
@@ -132,6 +138,15 @@ def _configure_tool_logging(tool_log: str | None) -> None:
 
 def _summarize_result(result: object) -> dict:
     """Compact, log-safe view of a tool result — counts and identifiers, not full row data."""
+    if isinstance(result, ToolResult):
+        # `show` returns a ToolResult: a UI payload for the host plus a JSON text summary for the
+        # model. Log the summary — the Prefab component tree is a rendering detail and would bury
+        # the line in markup.
+        texts = [b.text for b in result.content if isinstance(b, TextContent)]
+        try:
+            result = json.loads(texts[0]) if texts else {}
+        except ValueError:
+            return {"type": "ToolResult"}
     if not isinstance(result, dict):
         return {"type": type(result).__name__}
     summary = {k: result[k] for k in _LOGGED_RESULT_FIELDS if k in result}
@@ -228,6 +243,122 @@ def _dispatch_query(
     return session.query(sql, name, flow, description)
 
 
+def _host_renders_ui() -> bool:
+    """Best-effort: did the connected client advertise the MCP Apps extension?
+
+    Used only to ANNOTATE the summary the model reads, never to decide what to send — `show`
+    always returns both a text summary and the UI payload, because an MCP result carries both
+    and a host that can't render simply ignores `structuredContent`. That matters: not every
+    UI-capable host advertises the extension, and a false negative here must cost the user
+    nothing more than the model declining to say "see the chart above".
+    """
+    try:
+        from fastmcp.apps.config import UI_EXTENSION_ID
+        from fastmcp.server.dependencies import get_context
+
+        return get_context().client_supports_extension(UI_EXTENSION_ID)
+    except (RuntimeError, ImportError):
+        return False  # no active client session (library/test caller), or no apps support
+
+
+def _dispatch_show(
+    session: DuckSession,
+    *,
+    name: str | None,
+    kind: str,
+    x: str | None,
+    y: str | None,
+    series: list[str] | None,
+    title: str | None,
+    flow: str | None,
+    interactive: bool = False,
+) -> ToolResult:
+    """Shared body for the `show` tool: build a Prefab view and a text summary of it.
+
+    Returns both halves of an MCP result — `content` (JSON the model reads, mirroring `query`'s
+    sample contract) and `structuredContent` (the Prefab app a UI host renders). Read-only
+    throughout: no table is created and no lineage row is written, because a view is not a result.
+    """
+    if kind not in views.SHOW_KINDS:
+        raise ValueError(f"Unknown kind {kind!r}. Choose one of {list(views.SHOW_KINDS)}.")
+
+    needs_name = kind in ("table", *views.CHART_KINDS, "profile")
+    if needs_name and not name:
+        raise ValueError(f"show(kind={kind!r}) needs the `name` of a saved result to display.")
+
+    summary: dict = {"displayed": kind, "rendered_by_host": _host_renders_ui()}
+
+    if kind == "catalog":
+        catalog = session.catalog(flow)
+        view = views.catalog_view(catalog)
+        summary.update({"flow": flow, **{k: v for k, v in catalog.items() if k != "results"}})
+        if "results" in catalog:
+            summary["result_count"] = len(catalog["results"])
+            summary["results"] = [r["name"] for r in catalog["results"]]
+
+    elif kind == "lineage":
+        resolved = flow or session.default_flow
+        lineage = session.lineage(name, resolved, render="mermaid")
+        view = views.lineage_view(lineage, name or resolved)
+        summary.update({
+            "flow": resolved, "name": name,
+            "node_count": len(lineage.get("nodes", [])),
+            "edge_count": len(lineage.get("edges", [])),
+            "order": lineage.get("order", []),
+            "missing": lineage.get("missing", []),
+        })
+
+    elif kind == "profile":
+        resolved = flow or session.default_flow
+        profile = session.profile(f'SELECT * FROM "{resolved}"."{name}"', resolved)
+        view = views.profile_view(profile, f"{resolved}.{name}")
+        summary.update({
+            "flow": resolved, "name": name,
+            "row_count": profile.get("row_count", 0),
+            "columns": list(profile.get("columns", {})),
+            "profile": profile.get("columns", {}),
+        })
+
+    else:  # a saved result, as a table or a chart
+        resolved = flow or session.default_flow
+        max_rows = views.CHART_MAX_ROWS if kind in views.CHART_KINDS else None
+        columns, rows = (
+            session.rows_for_display(name, resolved, max_rows=max_rows)
+            if max_rows is not None
+            else session.rows_for_display(name, resolved)
+        )
+        if kind == "table":
+            view = views.result_table(columns, rows, title)
+            plotted: dict = {}
+        else:
+            build = views.interactive_chart if interactive else views.result_chart
+            view = build(kind, columns, rows, x, y, series, title)
+            x_col, measures = views.choose_axes(columns, x, y, series)
+            plotted = {"x": x_col, "series": measures}
+            # An interactive chart shows ONE measure at a time behind a picker, so say so —
+            # otherwise the summary reads as though all of them are on screen at once.
+            if interactive and len(measures) > 1:
+                plotted["interactive"] = True
+                plotted["showing"] = measures[0]
+        # Mirror `query`'s contract exactly: every row when the result is small on both axes,
+        # otherwise a short head. The model then reads a small deliverable straight out of the
+        # text half without needing the host to have rendered anything.
+        complete = _full_sample_fits(len(rows), len(columns))
+        summary.update({
+            "flow": resolved, "name": name,
+            "row_count": len(rows),
+            "columns": [c["name"] for c in columns],
+            "sample": rows if complete else rows[:_SAMPLE_ROWS],
+            "complete": complete,
+            **plotted,
+        })
+
+    return ToolResult(
+        content=[TextContent(type="text", text=json.dumps(summary, default=str))],
+        structured_content=views.to_payload(view),
+    )
+
+
 def build_server(
     session: DuckSession,
     tool_log: str | None = None,
@@ -302,6 +433,21 @@ def build_server(
             "this instead of writing manual aggregation queries.\n"
             "- `export(target, format, path, flow?)` — write a saved result name OR a full SELECT "
             "to csv/json/parquet (no row cap).\n"
+            + (
+                "\n## Show it to the user\n"
+                "- `show(name, kind=...)` — DISPLAY something in the chat: an interactive "
+                "'table', a 'bar'/'line'/'area'/'scatter'/'pie' chart of a saved result, a "
+                "'profile' dashboard, the 'catalog', or a 'lineage' DAG diagram. A view is NOT a "
+                "result — `show` creates nothing and there is nothing to drop afterwards.\n"
+                "- Aggregate FIRST, then show: charts cap at "
+                f"{views.CHART_MAX_ROWS} rows and error rather than truncate, because a "
+                "shortened chart misstates the data. `query` the GROUP BY, `show` the result.\n"
+                "- Use it when a shape, comparison or trend is the point — a chart of 12 monthly "
+                "totals says more than 12 rows of JSON. Keep reading results from `query`; "
+                "`show` is for the human.\n"
+                if views.PREFAB_AVAILABLE
+                else ""
+            )
             + (
                 "\n## Manage sources\n"
                 "- `add_source(spec)` — attach a new data source at runtime. `spec` is a file path "
@@ -489,6 +635,67 @@ def build_server(
         path: str | None = None,
     ) -> dict:
         return session.lineage(name, flow, render, path)
+
+    if views.PREFAB_AVAILABLE:
+        # Spelunk serves its OWN renderer resource rather than the per-tool one FastMCP would
+        # synthesize, so the ext-apps#696 recovery shim travels with the view. Identical to
+        # Prefab's page otherwise — it is built from prefab-ui's own HTML.
+        # The CSP belongs on the RESOURCE, not the tool: that is where the host reads it from
+        # (FastMCP's own synthesized renderer puts it there, and the tool carries only
+        # resourceUri). Declaring it on the tool instead silently yields a resource with NO
+        # policy, the host blocks the renderer bundle, and the app frame stays completely blank —
+        # no error, no spinner, nothing to debug.
+        @mcp.resource(
+            views.RENDERER_URI,
+            name="spelunk_renderer",
+            description="Prefab renderer for `show`, plus a bootstrap view and the ext-apps#696 "
+                        "structuredContent recovery shim.",
+            app=AppConfig(csp=ResourceCSP(**views.renderer_csp())),
+        )
+        def _renderer() -> str:
+            return views.recovery_renderer_html()
+
+        @mcp.tool(
+            name="show",
+            app=AppConfig(resource_uri=views.RENDERER_URI),
+            output_schema=views.SHOW_OUTPUT_SCHEMA,
+            description=(
+                "DISPLAY something in the chat as an interactive table, chart, dashboard or "
+                "diagram. Read-only and non-destructive: `show` creates NO result and NO lineage "
+                "node — it is a VIEW of what already exists, not a new result, so there is "
+                "nothing to `drop` afterwards. `kind` picks what to draw: 'table' (sortable, "
+                "searchable, paginated) or 'bar'/'line'/'area'/'scatter'/'pie' for a saved "
+                "result named by `name`; 'profile' for that result's per-column statistics as a "
+                "dashboard; 'catalog' to browse flows (or one flow's results, with `flow`); "
+                "'lineage' for the pipeline DAG as a rendered diagram (`name` narrows it to one "
+                "result's upstream closure). For charts, `x` and `series` name the columns to "
+                "plot — omit them and the first label column and first numeric column are used. "
+                "AGGREGATE FIRST: charts are capped at "
+                f"{views.CHART_MAX_ROWS} rows and tables at a few thousand; past that `show` "
+                "ERRORS rather than truncating, because a silently shortened view is a picture "
+                "that misstates the data. Group or top-N with `query`, then show that result. "
+                "`interactive=true` on a chart with SEVERAL measures (`series=[...]`) adds a "
+                "picker that switches between them in the browser — no extra tool call, and one "
+                "measure is on screen at a time. "
+                "The reply also carries a text summary (with the rows themselves when the result "
+                "is small), so you can keep reasoning about what you displayed."
+            ),
+        )
+        @_logged
+        def _show(
+            name: str | None = None,
+            kind: str = "table",
+            x: str | None = None,
+            y: str | None = None,
+            series: list[str] | None = None,
+            title: str | None = None,
+            interactive: bool = False,
+            flow: str | None = None,
+        ) -> ToolResult:
+            return _dispatch_show(
+                session, name=name, kind=kind, x=x, y=y, series=series, title=title, flow=flow,
+                interactive=interactive,
+            )
 
     @mcp.tool(
         name="replay",

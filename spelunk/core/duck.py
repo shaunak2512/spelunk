@@ -85,6 +85,15 @@ _FULL_SAMPLE_CELL_CAP = 1000
 # A materialized result larger than this, produced by an unfiltered SELECT * over a source,
 # triggers a nudge: you probably wanted a slice, and DuckDB would have pushed the filter down.
 _LARGE_MATERIALIZE = 100_000
+# Caps for `show`: a rendered view crosses the wire as JSON inside structuredContent and is then
+# held in a browser DOM, so a result that is perfectly fine as a *table* is not fine as a
+# *payload*. Bounded on rows AND cells, like the full-sample caps above — 2000 rows of 60 columns
+# is 120k values nobody reads. rows_for_display REFUSES past these rather than truncating: a
+# silently shortened result renders as a chart that misstates the data, which is worse than no
+# chart. Charts pass a far lower max_rows (see _CHART_MAX_ROWS in mcp/views.py) — 200 bars is
+# already past the point of legibility.
+_DISPLAY_MAX_ROWS = 2000
+_DISPLAY_MAX_CELLS = 40_000
 # After this many consecutive single-statement query() calls, nudge once toward query_steps —
 # dependent steps batched into one call cost one round trip instead of N.
 _BATCH_NUDGE_AT = 3
@@ -364,6 +373,12 @@ class DuckSession:
         stderr. The session stays fully functional; its results just don't persist or share
         with the instance that holds the lock. (With ``per_process`` each process has its own
         subdir, so this contention path is normally never hit.)
+
+        The same fallback covers a ``session_dir`` that can't be *created* — a relative one
+        resolves against the CWD, and an MCP host picks the CWD, not us (Claude Desktop on
+        Windows launches servers in ``C:\\Windows\\system32``, where ``makedirs`` is denied).
+        Degrading to ephemeral keeps the server answering; raising would kill it before
+        ``initialize`` and the host would report only a disconnect.
         """
         _warm_native_imports()
         tmpdir: tempfile.TemporaryDirectory | None = None
@@ -373,18 +388,29 @@ class DuckSession:
             if per_process:
                 pp_parent = base
                 base = os.path.join(base, _process_workspace_id())
-            os.makedirs(base, exist_ok=True)
             try:
+                os.makedirs(base, exist_ok=True)
                 con = duckdb.connect(os.path.join(base, "workspace.duckdb"))
-            except duckdb.IOException as exc:
+            except (OSError, duckdb.IOException) as exc:
+                # Two distinct failures, one recovery. Either the dir isn't creatable/writable
+                # — a RELATIVE session_dir resolves against a CWD we don't own, and MCP hosts on
+                # Windows launch servers in C:\Windows\system32, where makedirs is denied — or
+                # the DuckDB file is held by another server's single-writer lock. Crashing on
+                # either is the worst outcome: main() dies before answering `initialize` and the
+                # host reports only "server disconnected", naming nothing.
                 pp_parent = None  # fell back to ephemeral — no per-process tree to sweep
                 tmpdir = tempfile.TemporaryDirectory(prefix="spelunk_ws_")
                 base = tmpdir.name
                 con = duckdb.connect(os.path.join(base, "workspace.duckdb"))
+                cause = (
+                    "is locked by another server instance"
+                    if isinstance(exc, duckdb.IOException)
+                    else "could not be created or written to"
+                )
                 print(
-                    f"[spelunk] durable workspace in {session_dir!r} is locked by another "
-                    "server instance; using an ephemeral workspace for this session (results "
-                    f"will not persist or be shared). Detail: {exc}",
+                    f"[spelunk] durable workspace in {session_dir!r} {cause}; using an ephemeral "
+                    "workspace for this session (results will not persist or be shared). "
+                    f"Detail: {exc}",
                     file=sys.stderr,
                 )
         else:
@@ -694,6 +720,53 @@ class DuckSession:
     def _head_sample(self, flow: str, name: str, n: int = _SAMPLE_ROWS) -> list[list]:
         cur = self._con.execute(f'SELECT * FROM "{flow}"."{name}" LIMIT {n}')
         return [[_to_python(v) for v in row] for row in cur.fetchall()]
+
+    def rows_for_display(
+        self,
+        name: str,
+        flow: str | None = None,
+        max_rows: int = _DISPLAY_MAX_ROWS,
+        max_cells: int = _DISPLAY_MAX_CELLS,
+    ) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
+        """Read a saved result IN FULL for rendering: ``(columns, rows-as-dicts)``.
+
+        Read-only — no table is created, no lineage row is written. This is the read side of
+        ``show``: a *view* of a result, not a new result.
+
+        Refuses rather than truncates. A view that silently drops rows is a chart that misstates
+        the data, so anything past ``max_rows`` / ``max_cells`` raises with the real row count and
+        the fix (aggregate or ``LIMIT`` first) — the same stance as a glob that matches nothing
+        erroring instead of yielding an empty view.
+        """
+        flow = self._resolve_flow(flow)
+        _validate_name(name)
+        with self._lock:
+            columns = self._columns_of(flow, name)
+            if not columns:
+                known = self._result_names(flow)
+                raise ValueError(
+                    f"No result named {name!r} in flow {flow!r}. "
+                    f"Flow {flow!r} holds: {known or ['(none)']}."
+                )
+            row_count = int(
+                self._con.execute(f'SELECT COUNT(*) FROM "{flow}"."{name}"').fetchone()[0]
+            )
+            cells = row_count * max(len(columns), 1)
+            if row_count > max_rows or cells > max_cells:
+                limit = f"{max_rows} rows" if row_count > max_rows else f"{max_cells} cells"
+                raise ValueError(
+                    f"Result {name!r} is too large to display: {row_count} rows x "
+                    f"{len(columns)} columns ({cells} cells), limit {limit}. Nothing was "
+                    "truncated — a shortened view would misstate the data. Aggregate or filter "
+                    f"it first with `query` (e.g. a GROUP BY, or a top-N with ORDER BY ... "
+                    f"LIMIT), then show that result."
+                )
+            col_names = [c["name"] for c in columns]
+            cur = self._con.execute(f'SELECT * FROM "{flow}"."{name}"')
+            rows = [
+                {k: _to_python(v) for k, v in zip(col_names, row)} for row in cur.fetchall()
+            ]
+        return columns, rows
 
     # ------------------------------------------------------------------ query --------- #
     def query(
