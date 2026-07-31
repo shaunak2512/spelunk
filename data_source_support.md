@@ -20,6 +20,7 @@ necessarily a DuckDB one — most are a few lines away.
 | JSON / NDJSON / JSONL | — | `read_json_auto(path)` | core | ✅ |
 | Excel (xlsx/xlsm/xls) | — | `read_xlsx(path)` (`excel` ext) | core | ✅ |
 | Avro | — | `read_avro(path)` (`avro` ext) | core | ✅ (`.avro` mapped, ext auto-loaded) |
+| YAML / YML | — | `read_yaml(path)` (`yaml` ext) | community | ✅ (`.yaml`/`.yml` mapped, `INSTALL … FROM community` auto-run) |
 | Arrow IPC / Feather | — | `read_arrow` / `nanoarrow` ext | community | ❌ |
 | Lance | — | `lance` ext (read/write) | core | ❌ |
 | Apache ORC | — | *no native reader* | — | ❌ (also n/a in DuckDB) |
@@ -84,7 +85,7 @@ necessarily a DuckDB one — most are a few lines away.
 
 ## Summary of Spelunk's current reach
 
-5 local file families (CSV/Parquet/JSON/Excel/**Avro**) — local **or remote** (`https://`,
+6 local file families (CSV/Parquet/JSON/Excel/Avro/**YAML**) — local **or remote** (`https://`,
 `s3://`, `gs://`, `az://`, filesystem ext auto-loaded) — plus 3 attached DBs
 (SQLite/Postgres/MySQL) and the core lakehouse formats **Delta / Iceberg / DuckLake**. All
 read-only.
@@ -95,6 +96,11 @@ demand, and `delta:<path>` / `iceberg:<path>` / `ducklake:<catalog>` map to `del
 `iceberg_scan` / a DuckLake `ATTACH`. Verified end-to-end against public datasets (DuckDB blobs,
 the Ookla open-data S3 bucket, the Apache Avro sample, a `deltalake`-written table, DuckDB's
 `lineitem_iceberg`, and a locally-built DuckLake catalog).
+
+YAML is the first **community** extension Spelunk wires up: `_COMMUNITY_EXTS` in
+`spelunk/core/sources.py` makes its `INSTALL` carry a `FROM community` clause (a bare `INSTALL`
+only searches the core repository). Adding another community reader is now one map entry plus one
+set entry.
 
 Remaining edges:
 
@@ -112,4 +118,5 @@ Remaining edges:
 - [httpfs / S3 API](https://duckdb.org/docs/current/core_extensions/httpfs/s3api)
 - [Snowflake community extension](https://duckdb.org/community_extensions/extensions/snowflake)
 - [Avro extension](https://duckdb.org/docs/current/core_extensions/avro)
+- [YAML community extension](https://duckdb.org/community_extensions/extensions/yaml)
 - [DuckLake extension](https://duckdb.org/docs/lts/core_extensions/ducklake)

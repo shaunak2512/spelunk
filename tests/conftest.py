@@ -156,6 +156,24 @@ def csv_file(tmp_path) -> str:
     return str(p)
 
 
+@pytest.fixture
+def yaml_file(tmp_path) -> str:
+    """A small YAML sequence-of-mappings, returned as a filesystem path.
+
+    Written by hand (no PyYAML dependency) — read_yaml turns each sequence entry into a row.
+    """
+    p = tmp_path / "regions.yaml"
+    p.write_text(
+        "- city: Sydney\n"
+        "  state: NSW\n"
+        "  pop: 5.3\n"
+        "- city: Melbourne\n"
+        "  state: VIC\n"
+        "  pop: 5.1\n"
+    )
+    return str(p)
+
+
 # --- Real database servers (Postgres / MySQL) ---------------------------------------- #
 #
 # Claims SRC-003 (databases attach READ_ONLY), QRY-001 (one query spanning Parquet x Postgres x

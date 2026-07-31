@@ -49,6 +49,8 @@ class TestDetectKind:
             ("s3://bucket/trips/part.parquet", "file"),
             ("az://container/data.csv", "file"),
             ("data.avro", "file"),
+            ("values.yaml", "file"),
+            ("values.yml", "file"),
             ("https://host/data.parquet?token=abc", "file"),  # query string ignored for ext
             ("delta:./warehouse/events", "delta"),
             ("delta:s3://bucket/tbl", "delta"),
@@ -132,6 +134,32 @@ class TestBuildNewKinds:
         assert ["INSTALL avro", "LOAD avro"] == src.setup_sql[:2]
         assert "read_avro(" in src.setup_sql[-1]
 
+    def test_yaml_loads_community_ext(self):
+        # yaml lives in the community repository, so INSTALL needs the FROM community clause.
+        src = sources.build_source("cfg=./deploy/values.yaml")
+        assert ["INSTALL yaml FROM community", "LOAD yaml"] == src.setup_sql[:2]
+        assert "read_yaml(" in src.setup_sql[-1]
+
+    def test_yml_extension_reads_as_yaml(self):
+        src = sources.build_source("cfg=./deploy/values.yml")
+        assert ["INSTALL yaml FROM community", "LOAD yaml"] == src.setup_sql[:2]
+        assert "read_yaml(" in src.setup_sql[-1]
+
+    def test_remote_yaml_loads_both_extensions(self):
+        # httpfs for the transport, yaml for the reader — both before the view.
+        src = sources.build_source("cfg=https://host/deploy/values.yaml")
+        assert src.setup_sql[:4] == [
+            "INSTALL httpfs",
+            "LOAD httpfs",
+            "INSTALL yaml FROM community",
+            "LOAD yaml",
+        ]
+        assert "read_yaml('https://host/deploy/values.yaml')" in src.setup_sql[-1]
+
+    def test_core_extension_install_has_no_community_clause(self):
+        # Only community-repo extensions get FROM community; core ones must not.
+        assert "FROM community" not in " ".join(sources.build_source("e=./e.avro").setup_sql)
+
     def test_delta_builds_scan_view(self):
         src = sources.build_source("events=delta:./warehouse/events")
         assert src.kind == "delta"
@@ -177,7 +205,7 @@ class TestBuildNewKinds:
 
 
 # --------------------------------------------------------------------------- #
-# Format-override prefixes (csv:/tsv:/json:/parquet:/excel:/avro:) force a reader
+# Format-override prefixes (csv:/tsv:/json:/parquet:/excel:/avro:/yaml:) force a reader
 # --------------------------------------------------------------------------- #
 class TestFormatPrefix:
     def test_csv_prefix_forces_reader_on_odd_extension(self):
@@ -200,6 +228,16 @@ class TestFormatPrefix:
         src = sources.build_source("book=excel:./data.bin")
         assert ["INSTALL excel", "LOAD excel"] == src.setup_sql[-3:-1]
         assert "read_xlsx(" in src.setup_sql[-1]
+
+    def test_yaml_prefix_forces_reader_on_odd_extension(self):
+        src = sources.build_source("cfg=yaml:https://host/api/config")
+        assert src.kind == "file"
+        assert ["INSTALL httpfs", "LOAD httpfs"] == src.setup_sql[:2]
+        assert "read_yaml('https://host/api/config')" in src.setup_sql[-1]
+
+    def test_yml_prefix_is_an_alias(self):
+        src = sources.build_source("cfg=yml:./config.txt")
+        assert "read_yaml(" in src.setup_sql[-1]
 
     def test_prefix_is_case_insensitive(self):
         src = sources.build_source("d=CSV:./data.dat")
@@ -248,6 +286,21 @@ class TestAttachAll:
         sources.attach_all(con, [f"regions={parquet_file}"])
         rows = con.execute("SELECT city FROM regions ORDER BY city").fetchall()
         assert [r[0] for r in rows] == ["Melbourne", "Sydney"]
+
+    def test_yaml_source(self, yaml_file):
+        # End-to-end through the real community extension. ONLY fetching the extension may skip
+        # (offline CI, cold extension cache) — the preflight runs the very statements production
+        # uses. Once the extension is in hand, attach_all runs unguarded, so a broken read_yaml
+        # or a failed view creation fails the test instead of vanishing into a skip.
+        con = duckdb.connect()
+        try:
+            for stmt in sources._load_ext("yaml"):
+                con.execute(stmt)
+        except duckdb.Error as exc:  # pragma: no cover - environment-dependent
+            pytest.skip(f"yaml community extension unavailable: {exc}")
+        sources.attach_all(con, [f"regions={yaml_file}"])
+        rows = con.execute("SELECT city, state FROM regions ORDER BY city").fetchall()
+        assert rows == [("Melbourne", "VIC"), ("Sydney", "NSW")]
 
     def test_duplicate_name_raises(self, sqlite_file, csv_file):
         con = duckdb.connect()

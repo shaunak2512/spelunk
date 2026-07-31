@@ -2,8 +2,8 @@
 
 The unified engine is a single DuckDB connection. Every source is reached through it:
 
-  * **files** (CSV/TSV/Parquet/JSON/Excel/Avro) are scanned with DuckDB's ``read_*`` functions and
-    registered as VIEWs in the workspace ``main`` schema (the file stays the source of truth,
+  * **files** (CSV/TSV/Parquet/JSON/Excel/Avro/YAML) are scanned with DuckDB's ``read_*`` functions
+    and registered as VIEWs in the workspace ``main`` schema (the file stays the source of truth,
     so queries push projection/filters down to the scan rather than copying the file in). A file
     path may be local *or* a remote URL (``https://``, ``s3://``, ``gs://``, ``az://``) — the
     matching filesystem extension (``httpfs`` / ``azure``) is loaded automatically;
@@ -33,6 +33,7 @@ A spec is a string, optionally prefixed with ``<your-chosen-name>=`` (the word b
 is the name itself — ``nvd=api:…``, never the literal token ``name=``)::
 
     sales=./data/sales.parquet
+    config=./deploy/values.yaml                # YAML via the `yaml` community extension
     remote=https://example.com/data/sales.parquet
     routes=csv:https://example.com/data/routes.dat  # force a reader for an odd/absent extension
     trips=s3://my-bucket/trips/*.parquet
@@ -47,7 +48,8 @@ is the name itself — ``nvd=api:…``, never the literal token ``name=``)::
 
 A file whose name lacks a recognised extension (an API endpoint, a ``.dat`` dump) is read by
 forcing the reader with a format prefix — ``csv:`` / ``tsv:`` / ``json:`` / ``parquet:`` /
-``excel:`` / ``avro:`` — placed on the locator (after any ``name=``): ``routes=csv:<url>``.
+``excel:`` / ``avro:`` / ``yaml:`` (``yml:``) — placed on the locator (after any ``name=``):
+``routes=csv:<url>``.
 
 Attached databases (and DuckLake) are referenced in SQL by ``"<source>"."<table>"``; file and
 lakehouse-scan sources by their bare view name.
@@ -91,7 +93,15 @@ _EXT_FILE_READERS: dict[str, tuple[str, str]] = {
     # NB: legacy binary .xls is intentionally absent — DuckDB's excel reader (read_xlsx) handles
     # the OOXML .xlsx/.xlsm formats only, so a .xls would fail at view creation.
     ".avro": ("avro", "read_avro"),
+    # YAML comes from the community repository (see _COMMUNITY_EXTS). ``read_yaml`` unnests a
+    # top-level sequence (and multi-document files) into rows, the way read_json_auto does —
+    # ``read_yaml_objects`` (one row per document) is the other reader and is not wired up.
+    ".yaml": ("yaml", "read_yaml"),
+    ".yml": ("yaml", "read_yaml"),
 }
+# Extensions that live in DuckDB's *community* repository rather than core, so their INSTALL
+# needs a ``FROM community`` clause.
+_COMMUNITY_EXTS = frozenset({"yaml"})
 # Extensions that mean "this path is a SQLite database file" (attach, don't scan).
 _SQLITE_EXTS = frozenset({".sqlite", ".sqlite3", ".db"})
 
@@ -106,6 +116,8 @@ _FORMAT_PREFIX: dict[str, str] = {
     "parquet": ".parquet",
     "excel": ".xlsx",
     "avro": ".avro",
+    "yaml": ".yaml",
+    "yml": ".yaml",
 }
 
 # Read options for a JSON snapshot we wrote ourselves (an ``api:`` fetch, the ``openapi:``
@@ -272,7 +284,8 @@ def detect_kind(
         + _prefix_help(stripped_name, locator)
         + "If it is a data file with an "
         "unrecognized or absent extension (a .dat dump, an extensionless API URL), force the "
-        f"reader with a format prefix — csv:/tsv:/json:/parquet:/excel:/avro: — e.g. csv:{locator}. "
+        "reader with a format prefix — csv:/tsv:/json:/parquet:/excel:/avro:/yaml:(yml:) — "
+        f"e.g. csv:{locator}. "
         "Recognized extensions: "
         f"{', '.join(sorted(set(_FILE_READERS) | set(_EXT_FILE_READERS) | _SQLITE_EXTS))} "
         "(local or via https://, s3://, gs://, az:// URL); or a delta:<path> / iceberg:<path> / "
@@ -369,7 +382,7 @@ def _build_file_source(name: str, locator: str, forced_ext: str | None = None) -
     setup: list[str] = list(_remote_setup(locator))
     if ext in _EXT_FILE_READERS:
         ext_name, reader = _EXT_FILE_READERS[ext]
-        setup += [f"INSTALL {ext_name}", f"LOAD {ext_name}"]
+        setup += _load_ext(ext_name)
         scan = f"{reader}('{path}')"
     else:
         scan = f"{_FILE_READERS[ext]}('{path}')"
@@ -387,7 +400,7 @@ def _build_scan_source(name: str, kind: SourceKind, locator: str) -> Source:
     inner = _strip_scheme(locator, kind)
     path = _duck_path(inner)
     setup: list[str] = list(_remote_setup(inner))
-    setup += [f"INSTALL {ext_name}", f"LOAD {ext_name}"]
+    setup += _load_ext(ext_name)
     setup.append(
         f'CREATE OR REPLACE VIEW main."{name}" AS SELECT * FROM {scan_fn}(\'{path}\'{extra_args})'
     )
@@ -528,7 +541,7 @@ def _build_ducklake_source(name: str, locator: str) -> Source:
     """A DuckLake catalog is ``ATTACH``ed read-only; its TYPE is inferred from the ``ducklake:``
     locator prefix, which is kept intact and passed straight to ATTACH."""
     target = locator.replace("'", "''")
-    setup = ["INSTALL ducklake", "LOAD ducklake"]
+    setup = _load_ext("ducklake")
     setup.append(f"ATTACH '{target}' AS \"{name}\" (READ_ONLY)")
     return Source(name=name, kind="ducklake", locator=locator, setup_sql=setup)
 
@@ -537,7 +550,7 @@ def _build_attach_source(name: str, kind: SourceKind, locator: str) -> Source:
     """A database source is ATTACHed read-only as its own catalog."""
     ext_name = _ATTACH_EXT[kind]
     target = _attach_target(kind, locator)
-    setup = [f"INSTALL {ext_name}", f"LOAD {ext_name}"]
+    setup = _load_ext(ext_name)
     setup.append(f"ATTACH '{target}' AS \"{name}\" (TYPE {ext_name}, READ_ONLY)")
     return Source(name=name, kind=kind, locator=locator, setup_sql=setup)
 
@@ -657,7 +670,7 @@ def _remote_setup(path: str) -> list[str]:
     low = path.lower()
     for scheme, ext_name in _REMOTE_EXT.items():
         if low.startswith(scheme):
-            setup = [f"INSTALL {ext_name}", f"LOAD {ext_name}"]
+            setup = _load_ext(ext_name)
             if scheme in ("s3://", "s3a://"):
                 # Global but non-destructive — keeps any region already set. See the note above.
                 setup.append(
@@ -666,6 +679,18 @@ def _remote_setup(path: str) -> list[str]:
                 )
             return setup
     return []
+
+
+def _load_ext(ext_name: str) -> list[str]:
+    """The ``INSTALL``/``LOAD`` pair for a DuckDB extension.
+
+    Community-repository extensions (:data:`_COMMUNITY_EXTS`) need ``INSTALL <ext> FROM community``
+    — a bare ``INSTALL`` only searches the core repository and fails with "not found".
+    """
+    install = f"INSTALL {ext_name}"
+    if ext_name in _COMMUNITY_EXTS:
+        install += " FROM community"
+    return [install, f"LOAD {ext_name}"]
 
 
 def _strip_scheme(locator: str, kind: str) -> str:

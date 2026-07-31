@@ -5,8 +5,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What Spelunk is
 
 A **multi-source DuckDB query + transformation-pipeline MCP server.** Point it at files
-(CSV/Parquet/JSON/Excel) and databases (SQLite/PostgreSQL/MySQL), and an agent (Claude Code) can
-query across all of them and build step-by-step pipelines through one DuckDB engine.
+(CSV/Parquet/JSON/Excel/Avro/YAML) and databases (SQLite/PostgreSQL/MySQL), and an agent (Claude
+Code) can query across all of them and build step-by-step pipelines through one DuckDB engine.
 
 **Core idea:** a *single DuckDB session* is both the query engine and the workspace. Every source
 is `ATTACH`ed (databases) or scanned (files) into one connection, so a single `query` can join a
@@ -45,7 +45,9 @@ spelunk/core/
                  #   table; lineage() reads that DAG, replay() rebuilds a flow from it.
   sources.py     # Source registry: spec -> DuckDB attach/scan SQL (files + lakehouse scans as
                  #   VIEWs, DBs/DuckLake ATTACHed READ_ONLY). Kinds: file (local OR remote
-                 #   https://,s3://,gs://,az:// via httpfs/azure ext; ext-backed readers excel/avro),
+                 #   https://,s3://,gs://,az:// via httpfs/azure ext; ext-backed readers
+                 #   excel/avro/yaml — yaml is a *community* extension, so _COMMUNITY_EXTS makes
+                 #   its INSTALL carry FROM community),
                  #   sqlite/postgres/mysql, delta:/iceberg: (delta_scan/iceberg_scan VIEWs),
                  #   ducklake:, api: (ONE REST/JSON endpoint fetched at attach into an NDJSON
                  #   snapshot under <workspace>/snapshots/, view over the snapshot — queries never
