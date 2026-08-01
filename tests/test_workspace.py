@@ -94,6 +94,53 @@ class TestEphemeralWorkspace:
             s2.close()
 
 
+class TestUnwritableSessionDir:
+    """WSP-017: a session_dir that cannot be CREATED degrades to ephemeral instead of raising.
+
+    The real-world trigger is the relative default: --session-dir defaults to '.spelunk_session',
+    which resolves against a CWD the MCP *host* picks. Claude Desktop on Windows launches servers
+    in C:\\Windows\\system32, where makedirs is denied — and a raise there kills main() before it
+    answers `initialize`, so the host reports only "server disconnected" and names no cause.
+
+    Simulated rather than acted out: making a directory genuinely unwritable is an ACL operation
+    with no portable form, and the recovery path is what's under test, not the OS's enforcement.
+    """
+
+    def test_falls_back_to_ephemeral_and_warns(self, sqlite_file, tmp_path, capsys, monkeypatch):
+        denied = str(tmp_path / "denied")
+        real_makedirs = os.makedirs
+
+        def refuse_under_denied(path, *args, **kwargs):
+            if os.path.abspath(path).startswith(denied):
+                raise PermissionError(5, "Access is denied", path)  # WinError 5, as reported
+            return real_makedirs(path, *args, **kwargs)
+
+        monkeypatch.setattr("spelunk.core.duck.os.makedirs", refuse_under_denied)
+
+        s = DuckSession.open([f"shop={sqlite_file}"], session_dir=denied)
+        try:
+            ws = os.path.abspath(s.workspace_dir)
+            assert ws.startswith(os.path.abspath(tempfile.gettempdir())), "not an ephemeral dir"
+            assert not os.path.exists(denied), "the refused dir must not have been created"
+            # The point of degrading: the session still serves, sources and all.
+            assert s.query("SELECT 1 AS a", "r")["sample"] == [[1]]
+            assert s.query('SELECT COUNT(*) AS n FROM "shop"."orders"', "n")["sample"] == [[3]]
+        finally:
+            s.close()
+
+        err = capsys.readouterr().err
+        assert "could not be created" in err, f"no diagnosis on stderr: {err!r}"
+        assert "Access is denied" in err, "the OS cause must survive into the warning"
+        assert "ephemeral" in err
+        # Same recovery as lock contention, but NOT the same diagnosis: one says "fix permissions
+        # or move the workspace", the other "another server already holds it". Collapsing them
+        # sends you hunting the wrong problem. The lock half is
+        # test_duck.py::TestPersistence::test_locked_workspace_falls_back_to_ephemeral, which
+        # needs a subprocess — two sessions in one process share DuckDB's cached instance and
+        # never hit the cross-process lock at all.
+        assert "locked by another" not in err
+
+
 def _make_empty_workspace(parent: str, name: str, age_seconds: float) -> str:
     """An empty, unlocked workspace dir aged *age_seconds* — the shape reconnect churn leaves."""
     d = os.path.join(parent, name)

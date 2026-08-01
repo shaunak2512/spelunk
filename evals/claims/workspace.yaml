@@ -188,3 +188,21 @@ claims:
   - tests/test_workspace.py::TestInProcessLivenessBlindSpot::test_a_separate_process_is_correctly_seen_as_live
   note: 'Both sides of the documented boundary: the sweep''s connect probe opens an in-process workspace
     (the blind spot) and is refused cross-process (the mechanism it relies on).'
+- id: WSP-017
+  claim: 'A session_dir that cannot be created or written to degrades to an ephemeral workspace with
+    a stderr warning naming the cause — it never raises out of open(). The relative default
+    (.spelunk_session) resolves against a CWD the MCP host picks, and Claude Desktop on Windows
+    launches servers in C:\Windows\system32, where makedirs is denied.
+
+    '
+  source: CLAUDE.md#running-the-server
+  mode: behavioral
+  falsifier: open() raises on an uncreatable session_dir, killing the server before it answers
+    `initialize` — the host then reports only "server disconnected" and names no cause. Or it
+    degrades silently, or reports the lock-contention cause for a permissions failure.
+  status: verified
+  covered_by:
+  - tests/test_workspace.py::TestUnwritableSessionDir::test_falls_back_to_ephemeral_and_warns
+  note: 'Shares the recovery path with lock contention (WSP-003) but not the diagnosis; the test
+    asserts the two messages stay distinct. Observed in the wild: Claude Desktop crash-looped this
+    server for two weeks with no usable error.'
