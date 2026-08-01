@@ -1,4 +1,4 @@
-"""The CLI entry point, driven as a real subprocess over the stdio MCP transport.
+"""The CLI entry point, driven as a real subprocess over both MCP transports.
 
 `main()` is otherwise never executed by the suite: every other test builds a server in-process.
 That leaves the whole startup path — argument parsing, source wiring, transport, tool-log
@@ -6,14 +6,18 @@ resolution, shutdown — unexercised.
 
 Covers MCP-004 (log output NEVER reaches stdout, which is the protocol stream), MCP-009
 (--source is repeatable, --dsn is an alias), MCP-001 (the registered tool surface matches the
-documented one), and the tool-log sink modes.
+documented one), the tool-log sink modes, and `--transport http` serving the same surface on a
+bound port.
 
-The JSON-RPC client here is hand-rolled on purpose: it asserts what is actually on the wire,
-which is the point of MCP-004.
+The stdio JSON-RPC client here is hand-rolled on purpose: it asserts what is actually on the
+wire, which is the point of MCP-004. The HTTP test uses `fastmcp.Client` instead — there the
+claim is "a real MCP client can connect to the URL", not "these bytes are on the pipe".
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import socket
 import subprocess
 import sys
 import threading
@@ -247,6 +251,120 @@ class TestSourceArguments:
             assert GATED_TOOLS <= _tool_names(client)
         finally:
             client.close()
+
+
+def _free_port() -> int:
+    """Bind port 0, read what the OS handed out, release it. Racy in principle; the window is
+    microseconds and the alternative (a fixed port) collides with whatever else is running."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+class HttpServerProc:
+    """`main() --transport http` as a subprocess, with both pipes drained.
+
+    Same ~4KB Windows pipe-buffer trap as the stdio client: uvicorn logs to stderr on every
+    request, so an undrained stderr would eventually block the server mid-response.
+    """
+
+    def __init__(self, args: list[str], cwd: Path, port: int):
+        self.port = port
+        self.url = f"http://127.0.0.1:{port}/mcp"
+        self.proc = subprocess.Popen(
+            [sys.executable, "-m", "spelunk.mcp.server", *args],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", bufsize=1, cwd=str(cwd),
+        )
+        self.raw_stdout: list[str] = []
+        self.raw_stderr: list[str] = []
+        self._readers = [
+            threading.Thread(target=self._pump, args=(self.proc.stdout, self.raw_stdout), daemon=True),
+            threading.Thread(target=self._pump, args=(self.proc.stderr, self.raw_stderr), daemon=True),
+        ]
+        for reader in self._readers:
+            reader.start()
+
+    @staticmethod
+    def _pump(stream, sink: list[str]) -> None:
+        for line in stream:
+            sink.append(line)
+
+    def wait_until_listening(self, timeout: float = STARTUP_TIMEOUT) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.proc.poll() is not None:
+                raise RuntimeError(
+                    f"server exited with {self.proc.returncode}; stderr: {self.stderr_tail()}"
+                )
+            with socket.socket() as sock:
+                sock.settimeout(0.5)
+                if sock.connect_ex(("127.0.0.1", self.port)) == 0:
+                    return
+            time.sleep(0.2)
+        raise TimeoutError(f"port {self.port} never opened; stderr: {self.stderr_tail()}")
+
+    def stderr_tail(self, limit: int = 1200) -> str:
+        return "".join(self.raw_stderr)[-limit:]
+
+    def close(self) -> None:
+        if self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(timeout=10)
+        for reader in self._readers:
+            reader.join(timeout=5)
+
+
+class TestHttpTransport:
+    """`--transport http` serves the same tool surface over a bound port."""
+
+    @pytest.fixture
+    def http_server(self, tmp_path, sqlite_file, csv_file):
+        port = _free_port()
+        server = HttpServerProc(
+            [
+                "--transport", "http",
+                "--port", str(port),
+                "--source", f"shop={sqlite_file}",
+                "--source", f"orders={csv_file}",
+                "--session-dir", str(tmp_path / "session"),
+            ],
+            cwd=tmp_path,
+            port=port,
+        )
+        try:
+            server.wait_until_listening()
+            yield server
+        finally:
+            server.close()
+
+    def test_same_surface_and_a_cross_source_query_over_http(self, http_server):
+        from fastmcp import Client
+
+        async def exercise() -> tuple[set[str], dict]:
+            async with Client(http_server.url) as client:
+                names = {t.name for t in await client.list_tools()}
+                result = await client.call_tool(
+                    "query",
+                    {
+                        "sql": 'SELECT c.name, o.amount FROM "shop"."customers" c '
+                               "JOIN orders o ON c.id = o.customer_id ORDER BY o.amount",
+                        "name": "joined",
+                    },
+                )
+                return names, json.loads(result.content[0].text)
+
+        names, payload = asyncio.run(exercise())
+        assert names == DOCUMENTED_TOOLS
+        assert payload["row_count"] == 3
+        assert payload["name"] == "joined"
+
+    def test_bound_url_is_announced_on_stderr(self, http_server):
+        assert f"http://127.0.0.1:{http_server.port}/mcp" in "".join(http_server.raw_stderr)
 
 
 class TestToolLogSink:

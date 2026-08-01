@@ -137,7 +137,8 @@ spelunk/core/
 spelunk/mcp/
   server.py      # FastMCP wrapper: build_server(session) registers 7 tools + 2 resources
                  #   (+3 behind --allow-add-source: add_source/remove_source/fetch);
-                 #   main() parses --source specs and serves over stdio
+                 #   main() parses --source specs and serves over stdio (default) or
+                 #   streamable HTTP (--transport http, 127.0.0.1:8080/mcp)
 ```
 
 **`__init__.py` files do not re-export submodules** — import from the submodule directly
@@ -227,6 +228,39 @@ literally as `name=sales <locator>` parses as the name `name` plus an unclassifi
 rather than N; a glob matching nothing is an error, not an empty view. Optional guards: `--memory-limit`, `--temp-dir`, `--max-temp-size`. `--dsn` is a back-compat
 alias for one `--source`. A `.mcp.json` wires Claude Code to a local source (paths are
 machine-specific; edit before use).
+
+**Transport — `--transport {stdio,http}`, default `stdio`.** stdio speaks JSON-RPC over the
+process's stdin/stdout, which is what a *command-launched* client (Claude Code's `.mcp.json`)
+expects; it stays the default so existing wiring is untouched. `--transport http` serves
+**streamable HTTP** instead, via FastMCP's `run(transport="http", …)`:
+
+```powershell
+python -m spelunk.mcp.server --transport http --source sales=./data/sales.parquet
+# -> http://127.0.0.1:8080/mcp
+```
+
+`--host` (default `127.0.0.1`), `--port` (default `8080`), `--http-path` (default `/mcp`) set the
+bind. The URL is echoed to stderr at startup, independent of FastMCP's own banner. Both transports
+register the identical tool + resource surface over one `DuckSession` — the transport is the only
+difference, and `tests/test_cli.py` asserts set equality across the two so they can't drift.
+
+Two things change under HTTP, both consequences of a URL being *shared* where a spawned process is
+not:
+
+- **One session, many clients.** stdio gives each agent its own process and therefore its own
+  workspace; an HTTP endpoint serves every client that connects out of a single `DuckSession`. Flows
+  are still isolated namespaces, but two clients on one endpoint see each other's flows and results.
+  The process-per-agent isolation the rest of this doc assumes is a property of stdio, not of the
+  server. `--transport http --allow-add-source` therefore warns on stderr: that gate is documented as
+  sound *because* of process-per-agent, and over HTTP it isn't. Binding `--host 0.0.0.0` widens this
+  further — the tools are read-only, but they read every configured source.
+- **Shutdown is a signal, not a closed pipe.** The stdio server's clean-shutdown path fires when the
+  client closes stdin. Under HTTP, uvicorn returns from `run()` on SIGINT/SIGTERM and the same
+  `finally` runs; a hard kill skips it and leaves the `<pid>-<rand>` dir for the next server's
+  startup GC sweep to reclaim.
+
+DNS-rebinding protection is FastMCP's `host_origin_protection="auto"`, which already guards a
+loopback-bound server — a browser on another origin can't drive the endpoint.
 
 **`--allow-add-source` (off by default):** registers the `add_source` / `remove_source` / `fetch`
 tools so the agent can attach and detach sources at runtime and call endpoints of an attached API.

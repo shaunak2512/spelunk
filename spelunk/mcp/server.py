@@ -4,10 +4,15 @@ One DuckDB session ([core/duck.py]) is both the query engine and the workspace: 
 attached databases live in it alongside the flow results, so a single ``query`` can join any
 of them. No model, no loop — Claude Code is the agent.
 
-Usage (stdio, for Claude Code via .mcp.json)::
+Usage (stdio, the default — for Claude Code via .mcp.json)::
 
     python -m spelunk.mcp.server --source ./data/sales.parquet --source sqlite:///app.db \
         --session-dir .spelunk_session
+
+Usage (streamable HTTP, for a client that connects to a URL)::
+
+    python -m spelunk.mcp.server --transport http --source ./data/sales.parquet
+    # -> http://127.0.0.1:8080/mcp
 """
 from __future__ import annotations
 
@@ -717,6 +722,35 @@ def main() -> None:
             "story. Off by default (the description parameter is then absent entirely)."
         ),
     )
+    parser.add_argument(
+        "--transport",
+        choices=("stdio", "http"),
+        default="stdio",
+        help=(
+            "How the MCP protocol is carried. 'stdio' (default) speaks JSON-RPC over the "
+            "process's stdin/stdout — the shape a command-launched client (Claude Code's "
+            ".mcp.json) expects. 'http' serves streamable HTTP on --host/--port instead, for a "
+            "client that connects to a URL. See --host/--port/--http-path."
+        ),
+    )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help=(
+            "Interface to bind with --transport http. Default 127.0.0.1 (loopback only). "
+            "'0.0.0.0' exposes the server to the network — the tools are read-only SELECTs, but "
+            "they read every configured source, so only do that on a trusted network."
+        ),
+    )
+    parser.add_argument(
+        "--port", type=int, default=8080,
+        help="Port to bind with --transport http. Default: 8080.",
+    )
+    parser.add_argument(
+        "--http-path",
+        default="/mcp",
+        help="URL path the MCP endpoint is mounted at with --transport http. Default: /mcp.",
+    )
     parser.add_argument("--memory-limit", default=None, help="DuckDB memory_limit, e.g. 4GB.")
     parser.add_argument("--temp-dir", default=None, help="Directory for DuckDB spill files.")
     parser.add_argument("--max-temp-size", default=None, help="Cap on spill size, e.g. 50GB.")
@@ -742,6 +776,18 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+
+    if args.transport == "http" and args.allow_add_source:
+        # Worth saying out loud: --allow-add-source is documented as sound *because* of the
+        # process-per-agent model — each agent's stdio server is its own process, so an
+        # add/remove touches only that connection. One HTTP server serves every client that
+        # connects, from one DuckSession, so that isolation no longer holds.
+        print(
+            "[spelunk] warning: --allow-add-source over HTTP — every client sharing this "
+            f"endpoint shares one session, and can attach any file/DSN reachable from this "
+            f"process (bound to {args.host}).",
+            file=sys.stderr,
+        )
 
     if args.env_file:
         _load_env_file(args.env_file)
@@ -778,11 +824,24 @@ def main() -> None:
         require_descriptions=args.require_descriptions,
     )
     try:
-        server.run(transport="stdio")
+        if args.transport == "http":
+            # FastMCP's own banner can be suppressed (FASTMCP_SHOW_SERVER_BANNER=0), so print the
+            # URL ourselves — on stderr, which is safe in either transport.
+            print(
+                f"[spelunk] MCP over HTTP: http://{args.host}:{args.port}{args.http_path}",
+                file=sys.stderr,
+            )
+            server.run(
+                transport="http", host=args.host, port=args.port, path=args.http_path
+            )
+        else:
+            server.run(transport="stdio")
     finally:
-        # Clean shutdown (client closed stdin): release the tool-log file handle so the dir is
-        # deletable on Windows, then let the session reclaim its own workspace if this run never
-        # did any work — reconnect churn then leaves no empty <pid>-<rand> dirs behind.
+        # Clean shutdown — stdio: the client closed stdin; http: uvicorn caught SIGINT/SIGTERM and
+        # returned. Release the tool-log file handle so the dir is deletable on Windows, then let
+        # the session reclaim its own workspace if this run never did any work — reconnect churn
+        # then leaves no empty <pid>-<rand> dirs behind. A hard kill skips this; the next
+        # server's startup sweep reclaims the dir instead.
         _configure_tool_logging(None)
         session.close(reclaim_if_empty=True)
 
