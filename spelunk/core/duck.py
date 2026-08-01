@@ -35,7 +35,7 @@ from uuid import uuid4
 import duckdb
 
 from . import apifetch, guard, sources as sources_mod
-from .types import ColumnInfo, TableDescription, TableInfo
+from .types import ColumnInfo, TableDescription, TableInfo, is_numeric_type
 
 if TYPE_CHECKING:
     from .sources import Source
@@ -61,19 +61,9 @@ _RESERVED_SCHEMAS = frozenset(
 _ATTACHED_SYSTEM_SCHEMAS = frozenset({"information_schema", "pg_catalog"})
 _ATTACHED_DEFAULT_SCHEMA = {"sqlite": "main", "postgres": "public", "ducklake": "main"}
 
-# DuckDB base type names that mark a column as numeric (for profile stats). Matched against the
-# type name with any parametrisation stripped (e.g. DECIMAL(18,3) -> DECIMAL) — exact, not
-# substring, so INTERVAL is not mistaken for an INT (STDDEV/percentiles fail on interval values).
-_NUMERIC_TYPES = frozenset({
-    "TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT",
-    "UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT", "UHUGEINT",
-    "DECIMAL", "NUMERIC", "REAL", "FLOAT", "DOUBLE",
-})
-
-
-def _is_numeric_type(type_name: str) -> bool:
-    """True if a DuckDB column type is numeric — exact base-type match (drops any `(...)`)."""
-    return type_name.upper().split("(", 1)[0].strip() in _NUMERIC_TYPES
+# The numeric-type predicate (`is_numeric_type`, imported above) lives in core/types.py, beside
+# the ColumnInfo.type it interprets, so the DuckDB-free rendering layer (mcp/views.py) can share
+# it without importing this module and dragging the whole engine along.
 
 _SAMPLE_ROWS = 5
 # When a result is small on BOTH axes, query() returns EVERY row as the `sample` (and reports
@@ -402,11 +392,16 @@ class DuckSession:
                 tmpdir = tempfile.TemporaryDirectory(prefix="spelunk_ws_")
                 base = tmpdir.name
                 con = duckdb.connect(os.path.join(base, "workspace.duckdb"))
-                cause = (
-                    "is locked by another server instance"
-                    if isinstance(exc, duckdb.IOException)
-                    else "could not be created or written to"
-                )
+                # `duckdb.IOException` is not lock-specific — it also covers an incompatible or
+                # corrupt database file — so diagnose contention from the message rather than the
+                # type, and stay neutral otherwise. OSError keeps its own wording so WSP-017's
+                # unwritable-session_dir case reads distinctly from either.
+                if not isinstance(exc, duckdb.IOException):
+                    cause = "could not be created or written to"
+                elif re.search(r"lock|already open|being used by another", str(exc), re.I):
+                    cause = "is locked by another server instance"
+                else:
+                    cause = "could not be opened"
                 print(
                     f"[spelunk] durable workspace in {session_dir!r} {cause}; using an ephemeral "
                     "workspace for this session (results will not persist or be shared). "
@@ -751,7 +746,7 @@ class DuckSession:
             row_count = int(
                 self._con.execute(f'SELECT COUNT(*) FROM "{flow}"."{name}"').fetchone()[0]
             )
-            cells = row_count * max(len(columns), 1)
+            cells = row_count * len(columns)  # non-empty: the unknown-result check above raised
             if row_count > max_rows or cells > max_cells:
                 limit = f"{max_rows} rows" if row_count > max_rows else f"{max_cells} cells"
                 raise ValueError(
@@ -1323,7 +1318,7 @@ class DuckSession:
             if not cols:
                 return {"row_count": 0, "elapsed_s": 0.0, "columns": {}}
 
-            numeric = {c for c, t in cols if _is_numeric_type(t)}
+            numeric = {c for c, t in cols if is_numeric_type(t)}
             select_parts = ["COUNT(*)"]
             meta: list[tuple[str, str]] = [("_total", "_total")]
             for col, _t in cols:

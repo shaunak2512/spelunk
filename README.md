@@ -51,7 +51,7 @@ appear inline in Claude Desktop, claude.ai, VS Code Copilot, Goose and other UI-
 uvx --from "spelunk-mcp[ui]" spelunk --source sales=./data/sales.parquet
 ```
 
-```
+```text
 query("SELECT region, sum(revenue) AS revenue FROM sales GROUP BY region", "by_region")
 show("by_region", kind="bar")        # -> a real bar chart in the conversation
 show("by_region", kind="profile")    # -> per-column stats as a dashboard
@@ -69,7 +69,11 @@ whole renderer, so the page opens offline:
 
 ```python
 from prefab_ui.app import PrefabApp
+from spelunk.core.duck import DuckSession
 from spelunk.mcp import views
+
+session = DuckSession.open(["sales=./data/sales.parquet"])
+session.query("SELECT region, sum(revenue) AS revenue FROM sales GROUP BY region", "by_region")
 
 cols, rows = session.rows_for_display("by_region")
 page = PrefabApp(view=views.result_chart("bar", cols, rows)).html(renderer_mode="bundled")

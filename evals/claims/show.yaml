@@ -120,10 +120,11 @@ claims:
   - tests/test_show.py::TestRegistration::test_show_is_registered_with_ui_metadata
   - tests/test_show.py::TestRegistration::test_renderer_resource_is_readable
   note: >
-    FastMCP synthesizes the resource on demand from the tool's meta; nothing is stored. The
-    renderer HTML loads its JS/CSS from cdn.jsdelivr.net at the pinned prefab-ui version, and
-    declares that origin in the resource's own CSP — so rendering needs client-side network
-    access, and an air-gapped host will show the text half only.
+    Spelunk registers and serves the resource itself (views.RENDERER_URI); the tool's meta
+    carries only the resourceUri pointing at it, rather than the per-tool renderer FastMCP would
+    synthesize — see SHOW-014. The renderer HTML loads its JS/CSS from cdn.jsdelivr.net at the
+    pinned prefab-ui version, and declares that origin in the resource's own CSP — so rendering
+    needs client-side network access, and an air-gapped host will show the text half only.
 
 - id: SHOW-008
   claim: >
@@ -143,9 +144,19 @@ claims:
   - tests/test_show.py::TestViewBuilders::test_no_numeric_column_errors_with_a_way_out
   - tests/test_show.py::TestShowResult::test_chart_reports_the_columns_it_plotted
   - tests/test_show.py::TestShowResult::test_explicit_multi_series
+  - tests/test_show.py::TestShowErrors::test_pie_refuses_several_measures_instead_of_dropping_them
+  - tests/test_show.py::TestShowErrors::test_interactive_pie_still_takes_several_measures
+  - tests/test_show.py::TestShowErrors::test_a_name_that_is_not_an_identifier_is_rejected
+  - tests/test_show.py::TestShowErrors::test_a_flow_that_is_not_an_identifier_is_rejected
   note: >
     The reply reports the columns actually plotted (x, series), so the agent can tell whether
-    the default pick was the one it wanted without inspecting the payload.
+    the default pick was the one it wanted without inspecting the payload. That reporting is
+    also why a non-interactive pie REFUSES several measures rather than drawing the first: it
+    would draw one and report all of them, the same silent misstatement SHOW-002's caps exist
+    to prevent. An INTERACTIVE pie still takes several, because a picker shows one at a time
+    and the summary says which (SHOW-013). Result and flow names are validated on every kind,
+    `profile` included — it is the one display path that builds its own SQL, so skipping the
+    check there would turn a clear "invalid result name" into a DuckDB parse error.
 
 - id: SHOW-009
   claim: >
@@ -237,8 +248,9 @@ claims:
   source: views.py#_RECOVERY_SHIM
   mode: behavioral
   falsifier: >
-    The shim fires on a healthy host (double-calling every `show`), or it cannot re-deliver the
-    recovered payload because Prefab's transport rejects the synthetic message.
+    The shim fires on a healthy host (double-calling every `show`), it cannot re-deliver the
+    recovered payload because Prefab's transport rejects the message it hands over, or it accepts
+    a recovery response from a frame other than the host.
   status: partial
   covered_by:
   - tests/test_show.py::TestRecoveryShimBehaviour::test_healthy_host_triggers_nothing
@@ -246,6 +258,7 @@ claims:
   - tests/test_show.py::TestRecoveryShimBehaviour::test_stripped_result_refetches_with_the_captured_args
   - tests/test_show.py::TestRecoveryShimBehaviour::test_recovered_payload_reaches_the_renderer
   - tests/test_show.py::TestRecoveryShimBehaviour::test_recovery_runs_at_most_once
+  - tests/test_show.py::TestRecoveryShimBehaviour::test_a_response_from_another_frame_is_ignored
   - tests/test_show.py::TestRendererResource::test_recovery_shim_refetches_through_the_host_proxy
   - tests/test_show.py::TestRendererResource::test_recovery_is_a_no_op_on_a_healthy_host
   - tests/test_show.py::TestRendererResource::test_shim_runs_before_the_renderer_registers_its_listener
@@ -256,13 +269,17 @@ claims:
     stand-in transport that applies Prefab's real guard (`event.source !== window.parent`). That
     covers the no-op on a healthy host, the refusal to re-run an errored call, the re-fetch
     carrying the args captured from tool-input, the recovered payload arriving at the renderer,
-    and the once-only guard.
+    the once-only guard, and the refusal of a recovery response from any frame that is not the
+    host.
 
     Delivery deliberately does NOT depend on browser-native behaviour: rather than constructing a
     MessageEvent and trusting dispatchEvent to preserve `source`, the shim captures Prefab's
     listener (by wrapping addEventListener before the deferred renderer module runs) and calls it
     directly with a plain object. Prefab reads only `source` and `data`, so this is exactly what
-    it would have received.
+    it would have received. The same `source === window.parent` identity check Prefab applies to
+    what it accepts, the shim applies to the recovery response it accepts — the request id is a
+    fixed string, so without it any frame able to postMessage into the view could supply the
+    payload the renderer draws.
 
     CONFIRMED END TO END on 2026-07-31: `show` renders in Claude Desktop 1.24012.9 (Windows) with
     this shim in place — the host answers the app-initiated `tools/call` with structuredContent

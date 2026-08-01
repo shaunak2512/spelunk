@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from spelunk.core.duck import _is_numeric_type
+from spelunk.core.types import is_numeric_type
 
 try:  # pragma: no cover - exercised by both installs, only one path per environment
     from prefab_ui.app import PrefabApp
@@ -121,9 +121,10 @@ RENDERER_URI = "ui://spelunk/renderer.html"
 #
 # Step 3 is the delicate part. Prefab's transport ignores any message whose `event.source` is not
 # `window.parent` (an identity check in the ext-apps postMessage transport), so the shim cannot
-# simply post to itself. It instead constructs a MessageEvent with `source: window.parent` — a
-# WindowProxy we legitimately hold — and dispatches that, which satisfies the check without
-# patching a single line of Prefab.
+# simply post to itself. It instead calls Prefab's own message listener directly with a plain
+# object carrying `source: window.parent` — a WindowProxy we legitimately hold — which satisfies
+# the check without patching a single line of Prefab, and without depending on the browser to
+# preserve `source` through a synthetic `MessageEvent` dispatch.
 #
 # Safe to run everywhere: the whole thing is behind `if (!structuredContent && !isError)`, so on
 # a host that behaves it never fires. Re-calling is only sound because `show` is read-only and
@@ -185,7 +186,11 @@ _RECOVERY_SHIM = """
   function refetch(originalContent) {
     var id = 'spelunk-recover-1';
     function onResponse(ev) {
-      var d = ev && ev.data;
+      // Only the host answers a `tools/call` we sent it. `id` is a fixed, guessable string, so
+      // without this check any frame able to postMessage into the view could supply its own
+      // `structuredContent` and have it rendered as though the host had returned it.
+      if (!ev || ev.source !== window.parent) return;
+      var d = ev.data;
       if (!d || d.id !== id) return;
       nativeRemove('message', onResponse);
       var sc = d.result && d.result.structuredContent;
@@ -220,7 +225,10 @@ def _bootstrap_payload() -> str:
     with PrefabApp() as app:
         with Column(gap=2):
             Muted("Loading view…")
-    return json.dumps(app.to_json())
+    # Escape `<` so the JSON can never close the <script> tag it gets embedded in. The payload is
+    # a fixed literal today, so nothing depends on this — it is here so that giving the bootstrap
+    # view real content later cannot quietly turn this line into an injection point.
+    return json.dumps(app.to_json()).replace("<", "\\u003c")
 
 
 # Plain HTML inside #root, replaced the moment the renderer mounts. It exists so that a failure
@@ -276,7 +284,7 @@ def renderer_csp() -> dict[str, Any]:
 # --------------------------------------------------------------------------- column helpers --- #
 def _numeric_columns(columns: list[dict[str, str]]) -> list[str]:
     """Names of the numeric columns, in schema order."""
-    return [c["name"] for c in columns if _is_numeric_type(c["type"])]
+    return [c["name"] for c in columns if is_numeric_type(c["type"])]
 
 
 def _require_column(candidate: str, columns: list[dict[str, str]], role: str) -> str:
@@ -376,10 +384,17 @@ def result_chart(
     if kind not in CHART_KINDS:
         raise ValueError(f"Unknown chart kind {kind!r}. Choose one of {list(CHART_KINDS)}.")
     x_col, measures = choose_axes(columns, x, y, series)
+    if kind == "pie" and len(measures) > 1:
+        # A pie has one measure by construction — slices of a single whole. Refuse rather than
+        # plot measures[0] and leave the rest off: the summary would report every measure as
+        # displayed, which is the same silent misstatement the row caps exist to prevent.
+        raise ValueError(
+            f"A pie chart shows ONE measure, but {len(measures)} were named: {measures}. "
+            "Pick one (`y='<column>'`), or use kind='bar'/'line' to compare several."
+        )
 
     def build() -> Any:
         if kind == "pie":
-            # A pie has one measure by construction — slices of a single whole.
             return PieChart(data=rows, name_key=x_col, data_key=measures[0], height=320)
         if kind == "scatter":
             return ScatterChart(

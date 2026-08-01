@@ -203,6 +203,11 @@ claims:
   status: verified
   covered_by:
   - tests/test_workspace.py::TestUnwritableSessionDir::test_falls_back_to_ephemeral_and_warns
+  - tests/test_workspace.py::TestUnwritableSessionDir::test_a_non_lock_io_error_is_not_diagnosed_as_contention
   note: 'Shares the recovery path with lock contention (WSP-003) but not the diagnosis; the test
-    asserts the two messages stay distinct. Observed in the wild: Claude Desktop crash-looped this
-    server for two weeks with no usable error.'
+    asserts the two messages stay distinct. THREE causes, three messages: OSError says the dir
+    could not be created or written to, a duckdb.IOException whose message names a lock says
+    another server holds it, and any other IOException (a corrupt or version-incompatible file)
+    stays neutral — blaming contention for a deserialization failure sends you hunting a process
+    that does not exist. Observed in the wild: Claude Desktop crash-looped this server for two
+    weeks with no usable error.'

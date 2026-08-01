@@ -31,7 +31,7 @@ from mcp.types import TextContent
 from pydantic import BaseModel, Field
 
 from spelunk import __version__
-from spelunk.core.duck import DuckSession, _full_sample_fits, _SAMPLE_ROWS
+from spelunk.core.duck import DuckSession, _full_sample_fits, _SAMPLE_ROWS, _validate_name
 from spelunk.mcp import views
 
 # Shared help text for the plain-English `description` — kept identical on the single-query
@@ -257,8 +257,11 @@ def _host_renders_ui() -> bool:
         from fastmcp.server.dependencies import get_context
 
         return get_context().client_supports_extension(UI_EXTENSION_ID)
-    except (RuntimeError, ImportError):
-        return False  # no active client session (library/test caller), or no apps support
+    except (RuntimeError, ImportError, AttributeError):
+        # No active client session (library/test caller), no apps support, or a host/FastMCP
+        # build whose context lacks `client_supports_extension`. All three are cosmetic here —
+        # letting any of them escape would turn a missing annotation into a failed `show`.
+        return False
 
 
 def _dispatch_show(
@@ -309,7 +312,12 @@ def _dispatch_show(
         })
 
     elif kind == "profile":
-        resolved = flow or session.default_flow
+        # Validate BEFORE interpolating: this is the one display path that builds its own SQL
+        # (`rows_for_display` validates internally, `catalog`/`lineage` validate the flow), and
+        # an unvalidated name with a double quote in it reaches DuckDB as broken SQL — a parse
+        # error instead of the clear "invalid result name" every other kind gives.
+        resolved = _validate_name(flow or session.default_flow, "flow name")
+        _validate_name(name)
         profile = session.profile(f'SELECT * FROM "{resolved}"."{name}"', resolved)
         view = views.profile_view(profile, f"{resolved}.{name}")
         summary.update({
@@ -668,8 +676,9 @@ def build_server(
                 "result named by `name`; 'profile' for that result's per-column statistics as a "
                 "dashboard; 'catalog' to browse flows (or one flow's results, with `flow`); "
                 "'lineage' for the pipeline DAG as a rendered diagram (`name` narrows it to one "
-                "result's upstream closure). For charts, `x` and `series` name the columns to "
-                "plot — omit them and the first label column and first numeric column are used. "
+                "result's upstream closure). For charts, `x` names the label column and the "
+                "measure comes from `y` (ONE column) or `series` (SEVERAL) — omit them and the "
+                "first label column and first numeric column are used. "
                 "AGGREGATE FIRST: charts are capped at "
                 f"{views.CHART_MAX_ROWS} rows and tables at a few thousand; past that `show` "
                 "ERRORS rather than truncating, because a silently shortened view is a picture "

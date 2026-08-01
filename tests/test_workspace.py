@@ -140,6 +140,37 @@ class TestUnwritableSessionDir:
         # never hit the cross-process lock at all.
         assert "locked by another" not in err
 
+    def test_a_non_lock_io_error_is_not_diagnosed_as_contention(
+        self, sqlite_file, tmp_path, capsys, monkeypatch
+    ):
+        """`duckdb.IOException` is not lock-specific — it also covers a corrupt or
+        version-incompatible database file. Blaming "another server instance" for one of those
+        sends you looking for a process that does not exist."""
+        # The ephemeral fallback needs a working connect, so only the durable attempt is refused.
+        real_connect = duckdb.connect
+        seen: list[str] = []
+
+        def connect_once_then_work(path, *args, **kwargs):
+            seen.append(str(path))
+            if len(seen) == 1:
+                raise duckdb.IOException(
+                    "Failed to deserialize: the file was written by a newer version of DuckDB"
+                )
+            return real_connect(path, *args, **kwargs)
+
+        monkeypatch.setattr("spelunk.core.duck.duckdb.connect", connect_once_then_work)
+
+        s = DuckSession.open([f"shop={sqlite_file}"], session_dir=str(tmp_path / "ws"))
+        try:
+            assert s.query("SELECT 1 AS a", "r")["sample"] == [[1]]
+        finally:
+            s.close()
+
+        err = capsys.readouterr().err
+        assert "could not be opened" in err, f"wrong diagnosis: {err!r}"
+        assert "locked by another" not in err, "a deserialization failure is not lock contention"
+        assert "newer version of DuckDB" in err, "the real cause must survive into the warning"
+
 
 def _make_empty_workspace(parent: str, name: str, age_seconds: float) -> str:
     """An empty, unlocked workspace dir aged *age_seconds* — the shape reconnect churn leaves."""

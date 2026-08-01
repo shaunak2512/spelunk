@@ -1451,6 +1451,7 @@ dependencies = [
 
 [package.optional-dependencies]
 dev = [
+    { name = "jsonschema" },
     { name = "prefab-ui" },
     { name = "pyarrow" },
     { name = "pytest" },
@@ -1459,16 +1460,19 @@ dev = [
     { name = "ruff" },
 ]
 ui = [
+    { name = "fastmcp" },
     { name = "prefab-ui" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "duckdb", specifier = ">=1.5" },
-    { name = "fastmcp", specifier = ">=2.0" },
+    { name = "fastmcp", specifier = ">=3.4" },
+    { name = "fastmcp", marker = "extra == 'ui'", specifier = ">=3.4" },
+    { name = "jsonschema", marker = "extra == 'dev'", specifier = ">=4.0" },
     { name = "pandas", specifier = ">=2.2" },
-    { name = "prefab-ui", marker = "extra == 'dev'", specifier = ">=0.20,<0.21" },
-    { name = "prefab-ui", marker = "extra == 'ui'", specifier = ">=0.20,<0.21" },
+    { name = "prefab-ui", marker = "extra == 'dev'", specifier = "==0.20.2" },
+    { name = "prefab-ui", marker = "extra == 'ui'", specifier = "==0.20.2" },
     { name = "pyarrow", marker = "extra == 'dev'", specifier = ">=15.0" },
     { name = "pydantic", specifier = ">=2.7" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },

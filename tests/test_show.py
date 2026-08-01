@@ -198,7 +198,14 @@ class TestRowsForDisplay:
         _, session = show_server
         columns, rows = session.rows_for_display("by_region")
         assert [c["name"] for c in columns] == ["region", "revenue", "orders"]
-        assert rows[0] == {"region": "UK", "revenue": 200, "orders": 15}
+        # Compare order-independently: `rows_for_display` scans the table with no ORDER BY, so
+        # the fixture's materialization order is not a promise DuckDB makes on read-back.
+        by_region = {r["region"]: r for r in rows}
+        assert by_region == {
+            "UK": {"region": "UK", "revenue": 200, "orders": 15},
+            "AU": {"region": "AU", "revenue": 120, "orders": 9},
+            "NZ": {"region": "NZ", "revenue": 80, "orders": 4},
+        }
 
     def test_unknown_result_names_what_the_flow_holds(self, show_server):
         _, session = show_server
@@ -328,9 +335,9 @@ class TestRendererResource:
 
 _SHIM_HARNESS = r"""
 // Minimal stand-ins for the browser globals the shim touches, so its LOGIC can be executed
-// outside a browser. What this cannot prove is the one browser-native step — whether a real
-// MessageEvent carrying `source: window.parent` is accepted by Prefab's transport. Everything
-// up to and including the dispatch is exercised for real.
+// outside a browser. What this cannot prove is the one browser-native step — whether the real
+// Prefab transport's listener, reached through a real page, accepts the plain event object the
+// shim hands it. Everything up to and including that call is exercised for real.
 const listeners = [], posted = [], delivered = [];
 const parentWindow = { postMessage: (m) => posted.push(m) };
 globalThis.window = {
@@ -378,6 +385,16 @@ if (scenario === 'healthy') {
   }
 } else if (scenario === 'twice') {
   send(INIT); send(INPUT); send(STRIPPED); send(STRIPPED);
+} else if (scenario === 'spoofed') {
+  // A frame that is NOT the host answers the recovery call first, with the same guessable id.
+  send(INIT); send(INPUT); send(STRIPPED);
+  const req = posted[0];
+  const attacker = { postMessage: () => {} };
+  for (const fn of [...listeners]) {
+    fn({ data: { jsonrpc: '2.0', id: req.id,
+                 result: { structuredContent: { view: { type: 'Evil' } } } },
+         source: attacker, origin: 'https://evil.local' });
+  }
 }
 
 console.log(JSON.stringify({ posted, delivered }));
@@ -393,7 +410,12 @@ def _run_shim(tmp_path, renderer_html: str, scenario: str) -> dict:
     node = shutil.which("node")
     if not node:
         pytest.skip("needs node to execute the renderer shim")
-    js = re.search(r"<script>(.*?)</script>", renderer_html, re.S).group(1)
+    # The LAST bare <script> block is ours: `recovery_renderer_html` appends the shim to Prefab's
+    # own page, so a bare tag Prefab happens to emit (today it does not, but that is a version
+    # away) would otherwise be executed in its place — silently testing the wrong code.
+    blocks = re.findall(r"<script>(.*?)</script>", renderer_html, re.S)
+    assert blocks, "no bare <script> block in the renderer HTML — the shim is not being embedded"
+    js = blocks[-1]
     harness = tmp_path / "harness.mjs"
     harness.write_text(_SHIM_HARNESS.replace("__SHIM__", js), encoding="utf-8")
     out = subprocess.run(
@@ -446,6 +468,17 @@ class TestRecoveryShimBehaviour:
     def test_recovery_runs_at_most_once(self, tmp_path, html):
         """Two stripped results must not produce two re-calls."""
         assert len(_run_shim(tmp_path, html, "twice")["posted"]) == 1
+
+    def test_a_response_from_another_frame_is_ignored(self, tmp_path, html):
+        """The recovery id is fixed and guessable, so only the host may answer with it.
+
+        Without the `ev.source === window.parent` check, any frame able to postMessage into the
+        view could hand the renderer a payload of its choosing and have it drawn as the result.
+        """
+        result = _run_shim(tmp_path, html, "spoofed")
+        assert len(result["posted"]) == 1  # the recovery call still went out
+        # Only the host's own stripped result reached the renderer; the spoofed one did not.
+        assert [d.get("structuredContent") for d in result["delivered"]] == [None]
 
 
 class TestOutputSchema:
@@ -604,6 +637,35 @@ class TestShowErrors:
         server, _ = show_server
         with pytest.raises(Exception, match="by_region"):
             _call(server, {"name": "ghost", "kind": "table"})
+
+    def test_pie_refuses_several_measures_instead_of_dropping_them(self, show_server):
+        """A pie can draw one measure. Plotting the first and reporting all of them as
+        `series` is the same silent misstatement the row caps exist to prevent."""
+        server, _ = show_server
+        with pytest.raises(Exception, match="pie chart shows ONE measure"):
+            _call(server, {"name": "by_region", "kind": "pie",
+                           "series": ["revenue", "orders"]})
+
+    def test_interactive_pie_still_takes_several_measures(self, show_server):
+        """The refusal is about showing one and claiming several — a picker shows one at a
+        time and SAYS so, which is honest."""
+        server, _ = show_server
+        summary = _summary(_call(server, {"name": "by_region", "kind": "pie", "interactive": True,
+                                          "series": ["revenue", "orders"]}))
+        assert summary["showing"] == "revenue"
+
+    @pytest.mark.parametrize("kind", ["profile", "table"])
+    def test_a_name_that_is_not_an_identifier_is_rejected(self, show_server, kind):
+        """Every display path validates the same way. `profile` builds its own SQL, so an
+        unvalidated name there would surface as a DuckDB parse error instead of this."""
+        server, _ = show_server
+        with pytest.raises(Exception, match="Invalid result name"):
+            _call(server, {"name": 'by_region" AS x --', "kind": kind})
+
+    def test_a_flow_that_is_not_an_identifier_is_rejected(self, show_server):
+        server, _ = show_server
+        with pytest.raises(Exception, match="Invalid flow name"):
+            _call(server, {"name": "by_region", "kind": "profile", "flow": 'a" AS x --'})
 
 
 class TestShowLogging:
