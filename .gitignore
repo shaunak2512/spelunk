@@ -24,3 +24,5 @@ scripts/
 briefs/
 data/
 dag/
+# Local output of scripts/preview_views.py (self-contained ~6.5MB HTML previews).
+preview_out/

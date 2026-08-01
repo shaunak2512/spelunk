@@ -2,7 +2,9 @@ area: MCP surface, CLI, packaging, tool-call logging
 prefix: MCP
 claims:
 - id: MCP-001
-  claim: build_server(session) registers 7 tools and 2 resources, plus 3 more behind --allow-add-source.
+  claim: build_server(session) registers 7 tools and 2 resources, plus 3 more tools behind
+    --allow-add-source, plus `show` and its ui:// renderer resource when the optional [ui]
+    extra is installed.
   source: CLAUDE.md#mcp/server.py
   mode: behavioral
   falsifier: A documented tool or resource is missing, or an undocumented one is exposed.

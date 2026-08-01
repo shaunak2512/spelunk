@@ -17,6 +17,7 @@ Postgres table to a result you built two steps ago — all in DuckDB SQL.
 | `spelunk/core/sources.py` | Source registry — maps a spec to a DuckDB attach/scan. DuckDB-only: a source it can't attach (e.g. SQL Server) is rejected. |
 | `spelunk/core/guard.py` | sqlglot AST safety: read-only enforcement (`assert_read_only`). |
 | `spelunk/mcp/server.py` | Thin FastMCP wrapper over `DuckSession`. |
+| `spelunk/mcp/views.py` | MCP Apps rendering for `show` (optional `[ui]` extra). |
 | `tests` | Acceptance tests. |
 
 ## Tools
@@ -31,11 +32,58 @@ catalog(flow?)              # list flows, or the results in one flow
 drop(name?, flow?)          # drop one result, or a whole flow
 lineage(name?, flow?)       # provenance DAG: the SQL + deps that built a result (or a whole flow)
 replay(flow?, into?)        # rebuild a flow from its recorded SQL, in dependency order
+show(name?, kind?, ...)     # [ui extra] DISPLAY it in the chat: an interactive table, a bar/
+                            #   line/area/scatter/pie chart, a profile dashboard, the catalog,
+                            #   or the lineage DAG as a diagram. A view, never a new result.
 ```
 
 Discovery resources: `db://tables` (queryable source objects) and `db://{table}` (columns, PK,
 sample, row count). A **flow** is an isolated result namespace (a DuckDB schema); give each
 concurrent line of analysis its own flow.
+
+### Charts and tables in the chat
+
+Install the `ui` extra and Spelunk registers `show`, which renders results as
+[MCP Apps](https://modelcontextprotocol.io/docs/extensions/apps) — interactive components that
+appear inline in Claude Desktop, claude.ai, VS Code Copilot, Goose and other UI-capable hosts:
+
+```bash
+uvx --from "spelunk-mcp[ui]" spelunk --source sales=./data/sales.parquet
+```
+
+```text
+query("SELECT region, sum(revenue) AS revenue FROM sales GROUP BY region", "by_region")
+show("by_region", kind="bar")        # -> a real bar chart in the conversation
+show("by_region", kind="profile")    # -> per-column stats as a dashboard
+show(kind="lineage")                 # -> the pipeline DAG, drawn
+```
+
+Two things worth knowing. **A view is not a result** — `show` creates no table and records no
+lineage, so there is nothing to clean up afterwards. And **aggregate before you show**: charts
+cap at 200 rows and error rather than truncating, because a quietly shortened chart misstates
+the data. Group in SQL, render the small thing. Hosts that can't display MCP Apps lose nothing —
+`show` also returns a text summary, so the tool still works in a terminal.
+
+To see a view without any chat client, render it to a standalone HTML file — Prefab inlines the
+whole renderer, so the page opens offline:
+
+```python
+from prefab_ui.app import PrefabApp
+from spelunk.core.duck import DuckSession
+from spelunk.mcp import views
+
+session = DuckSession.open(["sales=./data/sales.parquet"])
+session.query("SELECT region, sum(revenue) AS revenue FROM sales GROUP BY region", "by_region")
+
+cols, rows = session.rows_for_display("by_region")
+page = PrefabApp(view=views.result_chart("bar", cols, rows)).html(renderer_mode="bundled")
+```
+
+> **Claude Desktop note.** Claude Desktop currently strips `structuredContent` from the tool
+> result it forwards to an app view ([ext-apps#696](https://github.com/modelcontextprotocol/ext-apps/issues/696)),
+> which leaves every MCP App — not just Spelunk's — stuck on "Waiting for content…". Spelunk ships
+> a recovery shim in its renderer that re-fetches through the host's `tools/call` proxy, which is
+> unaffected. It is a no-op on hosts that deliver the field correctly (claude.ai, MCP Jam).
 
 ## Install & run
 

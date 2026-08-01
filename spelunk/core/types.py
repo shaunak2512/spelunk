@@ -12,6 +12,28 @@ from pydantic import BaseModel, Field
 
 
 # --------------------------------------------------------------------------- #
+# Column-type predicates
+# --------------------------------------------------------------------------- #
+# DuckDB base type names that mark a column as numeric. Matched against the type name with any
+# parametrisation stripped (e.g. DECIMAL(18,3) -> DECIMAL) — exact, not substring, so INTERVAL is
+# not mistaken for an INT (STDDEV/percentiles fail on interval values).
+#
+# It lives here, beside `ColumnInfo.type` which it interprets, rather than in `duck.py`: both the
+# profiler and the `show` chart builders need it, and `mcp/views.py` is deliberately free of
+# DuckDB (importing it from `duck.py` pulled the whole engine into the rendering layer).
+NUMERIC_TYPES = frozenset({
+    "TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT",
+    "UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT", "UHUGEINT",
+    "DECIMAL", "NUMERIC", "REAL", "FLOAT", "DOUBLE",
+})
+
+
+def is_numeric_type(type_name: str) -> bool:
+    """True if a DuckDB column type is numeric — exact base-type match (drops any `(...)`)."""
+    return type_name.upper().split("(", 1)[0].strip() in NUMERIC_TYPES
+
+
+# --------------------------------------------------------------------------- #
 # Schema description (results of list_objects / describe)
 # --------------------------------------------------------------------------- #
 class ForeignKey(BaseModel):
