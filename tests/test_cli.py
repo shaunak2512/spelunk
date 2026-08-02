@@ -497,6 +497,150 @@ class TestEndpointAuthorities:
         assert "localhost:8080" not in allowed
 
 
+class TestOriginGuardDiagnostic:
+    """A tunnelled client trips the guard, and the 403 body it gets is never shown to the user.
+
+    These pin the stderr announcement instead: the header, the value that arrived, and the
+    `--allowed-origin` flag that admits it. Without that line the failure reads as an unexplained
+    "server disconnected" and the cause is only findable by reading server.py.
+    """
+
+    def _guard(self):
+        from spelunk.mcp.server import _OriginGuard, _endpoint_authorities
+
+        return _OriginGuard(
+            None, allowed=_endpoint_authorities("127.0.0.1", 8080), check_host=True
+        )
+
+    def test_a_tunnelled_host_is_rejected_with_its_value(self):
+        # `ngrok http 8080` forwards the ORIGINAL Host, so the loopback server sees the public
+        # hostname. Both halves matter: the header name, and the value to pass back as a flag.
+        assert self._guard()._rejections({"host": "1a2b3c.ngrok-free.app"}) == [
+            ("Host", "1a2b3c.ngrok-free.app"),
+        ]
+
+    def test_a_remote_client_origin_is_rejected_with_its_value(self):
+        assert self._guard()._rejections({"origin": "https://claude.ai"}) == [
+            ("Origin", "https://claude.ai"),
+        ]
+
+    def test_both_failing_headers_are_reported_together(self):
+        """The real ngrok + Claude Desktop shape gets BOTH wrong. Reporting only the first
+        costs a restart to discover the second — which is the bug this branch exists for."""
+        assert self._guard()._rejections(
+            {"host": "1a2b3c.ngrok-free.app", "origin": "https://claude.ai"}
+        ) == [("Origin", "https://claude.ai"), ("Host", "1a2b3c.ngrok-free.app")]
+
+    def test_the_endpoints_own_client_still_passes(self):
+        assert self._guard()._rejections({"host": "127.0.0.1:8080"}) == []
+
+    def test_a_non_loopback_bind_does_not_check_host(self):
+        """Host is unenumerable off loopback, so only Origin can carry the weight."""
+        from spelunk.mcp.server import _OriginGuard, _endpoint_authorities
+
+        guard = _OriginGuard(
+            None, allowed=_endpoint_authorities("0.0.0.0", 8080), check_host=False
+        )
+        assert guard._rejections({"host": "anything.example"}) == []
+
+    def test_the_log_names_the_flag_that_would_admit_the_client(self, capsys):
+        guard = self._guard()
+        guard._announce("Host", "1a2b3c.ngrok-free.app")
+        err = capsys.readouterr().err
+        # A bare authority gets a scheme, so the suggestion is paste-ready as written.
+        assert "--allowed-origin https://1a2b3c.ngrok-free.app" in err
+        assert "127.0.0.1:8080" in err  # what IS allowed, so the mismatch is visible
+
+    def test_an_origin_is_suggested_verbatim_not_double_schemed(self, capsys):
+        guard = self._guard()
+        guard._announce("Origin", "https://claude.ai")
+        assert "--allowed-origin https://claude.ai" in capsys.readouterr().err
+
+    def test_an_opaque_origin_is_never_suggested_as_an_allowlist_value(self, capsys):
+        """`Origin: null` must not be coached into the allowlist.
+
+        The regression chain: suggesting `--allowed-origin https://null` parses to the authority
+        `null`, and `_authority_of('null')` is also `null` — so following the advice would admit
+        EVERY sandboxed iframe, defeating the refusal `_authority_of` documents.
+        """
+        guard = self._guard()
+        guard._announce("Origin", "null")
+        err = capsys.readouterr().err
+        assert "--allowed-origin" not in err
+        assert "cannot be allowlisted" in err
+
+    def test_an_opaque_origin_is_refused_as_a_configured_value(self):
+        """Defence in depth: even hand-passed, `null` must not reach the allowed set."""
+        from spelunk.mcp.server import _endpoint_authorities
+
+        # A port suffix must not smuggle it past: `urlsplit("null:443")` yields NO netloc, so the
+        # bare-authority fallback keeps the port and a plain `== "null"` compare misses it.
+        for spelling in ("null", "https://null", "NULL", "null:443", "https://null:443",
+                         "NULL:443"):
+            with pytest.raises(ValueError, match="opaque origin"):
+                _endpoint_authorities("127.0.0.1", 8080, [spelling])
+
+    def test_a_bracketed_ipv6_origin_survives_the_null_check(self):
+        """The port-stripping must not shred an IPv6 literal's own colons."""
+        from spelunk.mcp.server import _endpoint_authorities, _host_only
+
+        assert _host_only("[::1]:443") == "[::1]"
+        assert _host_only("[2001:db8::1]") == "[2001:db8::1]"
+        assert "[2001:db8::1]:8443" in _endpoint_authorities(
+            "127.0.0.1", 8080, ["https://[2001:db8::1]:8443"]
+        )
+
+    def test_a_host_merely_containing_null_is_still_allowed(self):
+        """`null` is rejected as the WHOLE host, not as a substring."""
+        from spelunk.mcp.server import _endpoint_authorities
+
+        assert "nullable.example" in _endpoint_authorities(
+            "127.0.0.1", 8080, ["https://nullable.example"]
+        )
+
+    def test_a_real_origin_is_still_accepted(self):
+        from spelunk.mcp.server import _endpoint_authorities
+
+        assert "app.example" in _endpoint_authorities(
+            "127.0.0.1", 8080, ["https://app.example"]
+        )
+
+    def test_the_announcement_set_is_bounded(self, capsys):
+        """The dedupe key is an attacker-controlled header on a pre-auth path, so it needs a
+        ceiling — otherwise a scanner sending unique Hosts grows the set for the process's life."""
+        from spelunk.mcp.server import _ANNOUNCE_LIMIT
+
+        guard = self._guard()
+        for i in range(_ANNOUNCE_LIMIT * 3):
+            guard._announce("Host", f"h{i}.example")
+        assert len(guard._announced) <= _ANNOUNCE_LIMIT
+        err = capsys.readouterr().err
+        assert err.count("--allowed-origin") == _ANNOUNCE_LIMIT
+        assert "further 403 diagnostics suppressed" in err
+
+    def test_the_suppression_notice_is_printed_once(self, capsys):
+        from spelunk.mcp.server import _ANNOUNCE_LIMIT
+
+        guard = self._guard()
+        for i in range(_ANNOUNCE_LIMIT * 3):
+            guard._announce("Host", f"h{i}.example")
+        assert capsys.readouterr().err.count("diagnostics suppressed") == 1
+
+    def test_a_repeated_rejection_is_announced_once(self, capsys):
+        """A scanner hammering the port must not bury the one line that explains the failure."""
+        guard = self._guard()
+        for _ in range(5):
+            guard._announce("Host", "1a2b3c.ngrok-free.app")
+        assert capsys.readouterr().err.count("--allowed-origin") == 1
+
+    def test_a_different_value_is_announced_again(self, capsys):
+        """Dedup is per (header, value) — ngrok hands out a new hostname on every restart."""
+        guard = self._guard()
+        guard._announce("Host", "aaa.ngrok-free.app")
+        guard._announce("Host", "bbb.ngrok-free.app")
+        assert capsys.readouterr().err.count("--allowed-origin") == 2
+
+
 class TestHttpOriginGuard:
     """MCP-016: the HTTP transport refuses cross-origin and DNS-rebound requests.
 
