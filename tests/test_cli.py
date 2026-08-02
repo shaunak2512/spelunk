@@ -573,9 +573,30 @@ class TestOriginGuardDiagnostic:
         """Defence in depth: even hand-passed, `null` must not reach the allowed set."""
         from spelunk.mcp.server import _endpoint_authorities
 
-        for spelling in ("null", "https://null", "NULL"):
+        # A port suffix must not smuggle it past: `urlsplit("null:443")` yields NO netloc, so the
+        # bare-authority fallback keeps the port and a plain `== "null"` compare misses it.
+        for spelling in ("null", "https://null", "NULL", "null:443", "https://null:443",
+                         "NULL:443"):
             with pytest.raises(ValueError, match="opaque origin"):
                 _endpoint_authorities("127.0.0.1", 8080, [spelling])
+
+    def test_a_bracketed_ipv6_origin_survives_the_null_check(self):
+        """The port-stripping must not shred an IPv6 literal's own colons."""
+        from spelunk.mcp.server import _endpoint_authorities, _host_only
+
+        assert _host_only("[::1]:443") == "[::1]"
+        assert _host_only("[2001:db8::1]") == "[2001:db8::1]"
+        assert "[2001:db8::1]:8443" in _endpoint_authorities(
+            "127.0.0.1", 8080, ["https://[2001:db8::1]:8443"]
+        )
+
+    def test_a_host_merely_containing_null_is_still_allowed(self):
+        """`null` is rejected as the WHOLE host, not as a substring."""
+        from spelunk.mcp.server import _endpoint_authorities
+
+        assert "nullable.example" in _endpoint_authorities(
+            "127.0.0.1", 8080, ["https://nullable.example"]
+        )
 
     def test_a_real_origin_is_still_accepted(self):
         from spelunk.mcp.server import _endpoint_authorities

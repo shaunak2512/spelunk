@@ -930,17 +930,32 @@ def _endpoint_authorities(host: str, port: int, extra: list[str] | None = None) 
     for value in extra or ():
         # Accept a full origin (`https://app.example`) or a bare authority (`app.example:443`).
         authority = (urlsplit(value).netloc or value).strip().lower()
-        if authority == "null":
+        if _host_only(authority) == "null":
             # `Origin: null` is what a sandboxed iframe (and a few opaque origins) send — it
             # names no host, so allowing it would admit ANY such context, not one trusted peer.
-            # It parses out of `null`, `https://null` and `null:443` alike, so the check is on
-            # the parsed authority rather than the raw spelling.
+            # It parses out of `null`, `https://null`, `null:443` and `https://null:443` alike,
+            # so the check is on the parsed HOST rather than the raw spelling.
             raise ValueError(
                 f"--allowed-origin {value!r} resolves to the opaque origin 'null', which names "
                 "no host: allowing it would admit any sandboxed iframe. Pass the real origin."
             )
         names.add(authority)
     return frozenset(names)
+
+
+def _host_only(authority: str) -> str:
+    """An authority minus a trailing `:port`.
+
+    Needed because the `null` checks below compare a HOST, and `urlsplit` does not give one for
+    a bare authority: `null:443` splits to no netloc at all, so the fallback keeps the port and
+    `== "null"` misses it. Bracketed IPv6 keeps its brackets and inner colons — `[::1]:443` is a
+    host of `[::1]`, and rpartitioning on `:` would otherwise shred it.
+    """
+    if authority.startswith("["):
+        end = authority.find("]")
+        return authority[: end + 1] if end != -1 else authority
+    host, sep, port = authority.rpartition(":")
+    return host if sep and port.isdigit() else authority
 
 
 def _authority_of(origin: str) -> str:
@@ -1032,7 +1047,7 @@ class _OriginGuard:
         coach the user into `https://null`, which parses to the authority `null` and matches the
         very header this guard is documented to refuse. Say why instead.
         """
-        if header == "Origin" and _authority_of(value) == "null":
+        if header == "Origin" and _host_only(_authority_of(value)) == "null":
             return (
                 " This client sent the opaque origin 'null' (a sandboxed iframe); it names no "
                 "host, so it cannot be allowlisted. Give it a real origin."
