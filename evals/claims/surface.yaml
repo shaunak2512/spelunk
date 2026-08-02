@@ -234,7 +234,16 @@ claims:
   - tests/test_cli.py::TestHttpOriginGuard::test_a_normal_client_sending_no_origin_is_untouched
   - tests/test_cli.py::TestHttpOriginGuard::test_the_endpoints_own_origin_is_allowed
   - tests/test_cli.py::TestHttpOriginGuard::test_allowed_origin_opens_a_named_extra
-  note: 'This guard is OURS (spelunk.mcp.server._OriginGuard), not FastMCP''s. FastMCP 3.4.2 ships no
+  - tests/test_cli.py::TestEndpointAuthorities::test_the_bound_host_always_names_itself
+  - tests/test_cli.py::TestEndpointAuthorities::test_loopback_aliases_come_too
+  - tests/test_cli.py::TestEndpointAuthorities::test_an_ipv6_bind_is_bracketed
+  - tests/test_cli.py::TestEndpointAuthorities::test_a_non_loopback_bind_names_only_itself_and_extras
+  note: 'The bound host ALWAYS names itself: 127.0.0.0/8 is entirely loopback, so an allowed set
+    built only from the standard aliases would enable check_host and then 403 the endpoint''s own
+    clients on `--host 127.0.0.2`. That case is asserted at unit level because binding a non-.1
+    loopback address is not portable enough to drive as a subprocess.
+
+    This guard is OURS (spelunk.mcp.server._OriginGuard), not FastMCP''s. FastMCP 3.4.2 ships no
     host_origin_protection — the string appears nowhere in the package — so an earlier draft of the
     docs claiming it was simply wrong, which is what this claim now pins. The negative tests assert
     403 specifically; the positive ones assert "not 403" rather than 200, because a raw ping with no

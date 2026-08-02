@@ -437,6 +437,40 @@ class TestHttpTransport:
         assert "--http-path must start with '/'" in proc.stderr
 
 
+class TestEndpointAuthorities:
+    """The allowed-authority set itself, unit-level.
+
+    Bound at this level deliberately: `--host 127.0.0.2` is the interesting case and binding a
+    non-.1 loopback address is not portable enough to assert on in a subprocess.
+    """
+
+    def test_the_bound_host_always_names_itself(self):
+        # The regression: 127.0.0.0/8 is all loopback, so check_host is on, and a set built only
+        # from the standard aliases would 403 a client whose Host is exactly what it dialled.
+        from spelunk.mcp.server import _endpoint_authorities
+
+        assert "127.0.0.2:8080" in _endpoint_authorities("127.0.0.2", 8080)
+
+    def test_loopback_aliases_come_too(self):
+        from spelunk.mcp.server import _endpoint_authorities
+
+        allowed = _endpoint_authorities("127.0.0.1", 8080)
+        assert {"127.0.0.1:8080", "localhost:8080", "[::1]:8080"} <= allowed
+
+    def test_an_ipv6_bind_is_bracketed(self):
+        from spelunk.mcp.server import _endpoint_authorities
+
+        assert "[::1]:8080" in _endpoint_authorities("::1", 8080)
+
+    def test_a_non_loopback_bind_names_only_itself_and_extras(self):
+        from spelunk.mcp.server import _endpoint_authorities
+
+        allowed = _endpoint_authorities("0.0.0.0", 8080, ["https://app.example"])
+        assert "0.0.0.0:8080" in allowed
+        assert "app.example" in allowed
+        assert "localhost:8080" not in allowed
+
+
 class TestHttpOriginGuard:
     """MCP-016: the HTTP transport refuses cross-origin and DNS-rebound requests.
 

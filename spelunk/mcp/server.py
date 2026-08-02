@@ -672,7 +672,13 @@ def _bracketed(host: str) -> str:
 
 def _endpoint_authorities(host: str, port: int, extra: list[str] | None = None) -> frozenset[str]:
     """Every `Host:`/`Origin:` authority that legitimately addresses this endpoint."""
-    bases = list(_LOOPBACK_NAMES) if _is_loopback(host) else [_bracketed(host)]
+    # The bound host ALWAYS names itself. Listing only _LOOPBACK_NAMES would make the guard
+    # refuse the endpoint's own clients on any loopback address other than 127.0.0.1 — the whole
+    # of 127.0.0.0/8 is loopback, so `--host 127.0.0.2` would 403 a client whose Host is exactly
+    # what it dialled. The aliases are added on top, not instead.
+    bases = [_bracketed(host)]
+    if _is_loopback(host):
+        bases += list(_LOOPBACK_NAMES)
     names = set()
     for base in bases:
         names.add(f"{base}:{port}".lower())

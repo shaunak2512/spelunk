@@ -20,7 +20,10 @@ classifiers = [
 dependencies = [
     "duckdb>=1.5",
     "sqlglot>=25.0",
-    "fastmcp>=2.0",
+    # 3.4, not 2.x: `--transport http` passes transport="http" AND a `middleware=` list to
+    # FastMCP.run for the DNS-rebinding guard. FastMCP 2.0 has neither — it would fail at the
+    # run() call, i.e. after startup looked fine. Verified present in 3.4.0.
+    "fastmcp>=3.4",
     "pydantic>=2.7",
     "pandas>=2.2",
 ]
