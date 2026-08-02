@@ -556,6 +556,55 @@ class TestOriginGuardDiagnostic:
         guard._announce("Origin", "https://claude.ai")
         assert "--allowed-origin https://claude.ai" in capsys.readouterr().err
 
+    def test_an_opaque_origin_is_never_suggested_as_an_allowlist_value(self, capsys):
+        """`Origin: null` must not be coached into the allowlist.
+
+        The regression chain: suggesting `--allowed-origin https://null` parses to the authority
+        `null`, and `_authority_of('null')` is also `null` — so following the advice would admit
+        EVERY sandboxed iframe, defeating the refusal `_authority_of` documents.
+        """
+        guard = self._guard()
+        guard._announce("Origin", "null")
+        err = capsys.readouterr().err
+        assert "--allowed-origin" not in err
+        assert "cannot be allowlisted" in err
+
+    def test_an_opaque_origin_is_refused_as_a_configured_value(self):
+        """Defence in depth: even hand-passed, `null` must not reach the allowed set."""
+        from spelunk.mcp.server import _endpoint_authorities
+
+        for spelling in ("null", "https://null", "NULL"):
+            with pytest.raises(ValueError, match="opaque origin"):
+                _endpoint_authorities("127.0.0.1", 8080, [spelling])
+
+    def test_a_real_origin_is_still_accepted(self):
+        from spelunk.mcp.server import _endpoint_authorities
+
+        assert "app.example" in _endpoint_authorities(
+            "127.0.0.1", 8080, ["https://app.example"]
+        )
+
+    def test_the_announcement_set_is_bounded(self, capsys):
+        """The dedupe key is an attacker-controlled header on a pre-auth path, so it needs a
+        ceiling — otherwise a scanner sending unique Hosts grows the set for the process's life."""
+        from spelunk.mcp.server import _ANNOUNCE_LIMIT
+
+        guard = self._guard()
+        for i in range(_ANNOUNCE_LIMIT * 3):
+            guard._announce("Host", f"h{i}.example")
+        assert len(guard._announced) <= _ANNOUNCE_LIMIT
+        err = capsys.readouterr().err
+        assert err.count("--allowed-origin") == _ANNOUNCE_LIMIT
+        assert "further 403 diagnostics suppressed" in err
+
+    def test_the_suppression_notice_is_printed_once(self, capsys):
+        from spelunk.mcp.server import _ANNOUNCE_LIMIT
+
+        guard = self._guard()
+        for i in range(_ANNOUNCE_LIMIT * 3):
+            guard._announce("Host", f"h{i}.example")
+        assert capsys.readouterr().err.count("diagnostics suppressed") == 1
+
     def test_a_repeated_rejection_is_announced_once(self, capsys):
         """A scanner hammering the port must not bury the one line that explains the failure."""
         guard = self._guard()

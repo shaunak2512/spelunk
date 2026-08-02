@@ -883,6 +883,12 @@ def _load_env_file(path: str) -> None:
 
 _LOOPBACK_NAMES = ("127.0.0.1", "localhost", "[::1]")
 
+# How many DISTINCT rejected Origin/Host values one process will explain before going quiet.
+# The dedupe set behind the 403 diagnostic is keyed on a header an unauthenticated caller
+# controls, so it needs a ceiling; a real deployment sees a handful (one tunnel hostname, one
+# client origin, a rotation or two), so this is far above legitimate use and far below a leak.
+_ANNOUNCE_LIMIT = 32
+
 
 def _is_loopback(host: str) -> bool:
     """Does `host` name this machine only? Decides whether we can enumerate valid Host values."""
@@ -923,7 +929,17 @@ def _endpoint_authorities(host: str, port: int, extra: list[str] | None = None) 
             names.add(base.lower())  # browsers omit the default port from Origin
     for value in extra or ():
         # Accept a full origin (`https://app.example`) or a bare authority (`app.example:443`).
-        names.add((urlsplit(value).netloc or value).strip().lower())
+        authority = (urlsplit(value).netloc or value).strip().lower()
+        if authority == "null":
+            # `Origin: null` is what a sandboxed iframe (and a few opaque origins) send — it
+            # names no host, so allowing it would admit ANY such context, not one trusted peer.
+            # It parses out of `null`, `https://null` and `null:443` alike, so the check is on
+            # the parsed authority rather than the raw spelling.
+            raise ValueError(
+                f"--allowed-origin {value!r} resolves to the opaque origin 'null', which names "
+                "no host: allowing it would admit any sandboxed iframe. Pass the real origin."
+            )
+        names.add(authority)
     return frozenset(names)
 
 
@@ -966,6 +982,7 @@ class _OriginGuard:
         self.allowed = allowed
         self.check_host = check_host
         self._announced: set[tuple[str, str]] = set()
+        self._suppressed = False
 
     def _rejections(self, headers: dict[str, str]) -> list[tuple[str, str]]:
         """EVERY header that failed, with the value it carried; empty to allow.
@@ -987,16 +1004,45 @@ class _OriginGuard:
     def _announce(self, header: str, value: str) -> None:
         if (header, value) in self._announced:
             return
+        if len(self._announced) >= _ANNOUNCE_LIMIT:
+            # The dedupe set is fed by an attacker-controllable header on a pre-auth path, so it
+            # cannot grow without bound. Say so once, then go quiet: the diagnostic exists for
+            # the first few distinct values, and a flood is itself the thing worth reporting.
+            if not self._suppressed:
+                self._suppressed = True
+                print(
+                    f"[spelunk] {_ANNOUNCE_LIMIT} distinct rejected Origin/Host values seen; "
+                    "further 403 diagnostics suppressed for this process.",
+                    file=sys.stderr,
+                )
+            return
         self._announced.add((header, value))
+        print(
+            f"[spelunk] 403: {header}: {value} does not name this endpoint (DNS-rebinding "
+            f"guard). Allowed: {', '.join(sorted(self.allowed))}."
+            + self._advice(header, value),
+            file=sys.stderr,
+        )
+
+    def _advice(self, header: str, value: str) -> str:
+        """The paste-ready fix — omitted when there isn't one.
+
+        `Origin: null` (a sandboxed iframe) names no host, so no --allowed-origin value can
+        admit that client without admitting every other opaque origin too. Suggesting one would
+        coach the user into `https://null`, which parses to the authority `null` and matches the
+        very header this guard is documented to refuse. Say why instead.
+        """
+        if header == "Origin" and _authority_of(value) == "null":
+            return (
+                " This client sent the opaque origin 'null' (a sandboxed iframe); it names no "
+                "host, so it cannot be allowlisted. Give it a real origin."
+            )
         # An Origin arrives as a full origin and is echoed as-is; a Host is a bare authority, so
         # give it a scheme to match how --allowed-origin is normally written (either form parses).
         suggestion = value if "://" in value else f"https://{value}"
-        print(
-            f"[spelunk] 403: {header}: {value} does not name this endpoint (DNS-rebinding "
-            f"guard). Allowed: {', '.join(sorted(self.allowed))}. If this client is legitimate "
-            f"(a tunnel or reverse proxy forwards its own {header}), restart with "
-            f"--allowed-origin {suggestion}",
-            file=sys.stderr,
+        return (
+            f" If this client is legitimate (a tunnel or reverse proxy forwards its own "
+            f"{header}), restart with --allowed-origin {suggestion}"
         )
 
     async def __call__(self, scope, receive, send) -> None:
@@ -1180,6 +1226,17 @@ def main() -> None:
         # URL would silently read `...:8080mcp` — a broken address the user would copy.
         parser.error(f"--http-path must start with '/': got {args.http_path!r}")
 
+    allowed_authorities: frozenset[str] = frozenset()
+    if args.transport == "http":
+        # Resolve here, before any session is opened: a rejected --allowed-origin should be an
+        # argparse error, not a traceback out of the middleware with a workspace already created.
+        try:
+            allowed_authorities = _endpoint_authorities(
+                args.host, args.port, args.allowed_origin
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+
     if args.transport == "http" and args.allow_add_source:
         # Worth saying out loud: --allow-add-source is documented as sound *because* of the
         # process-per-agent model — each agent's stdio server is its own process, so an
@@ -1240,7 +1297,7 @@ def main() -> None:
             )
             guard = Middleware(
                 _OriginGuard,
-                allowed=_endpoint_authorities(args.host, args.port, args.allowed_origin),
+                allowed=allowed_authorities,  # validated at parse time, above
                 check_host=_is_loopback(args.host),
             )
             server.run(
