@@ -11,16 +11,23 @@ claims:
   source: CLAUDE.md#tool-surface
   mode: invariant
   falsifier: >
-    A `show` call leaves a new table in the flow, or adds a row to _spelunk_meta.lineage.
+    A `show` call leaves a new table in the flow, adds a row to _spelunk_meta.lineage, or
+    brings a new FLOW into existence.
   status: verified
   covered_by:
   - tests/test_show.py::TestShowIsAView::test_creates_no_result
+  - tests/test_show.py::TestShowIsAView::test_creates_no_flow
   - tests/test_show.py::TestShowIsAView::test_records_no_lineage_node
   - tests/test_show.py::TestRowsForDisplay::test_reads_without_creating_anything
   note: >
-    The load-bearing claim of the whole feature. Both tests sweep every kind (table, chart,
+    The load-bearing claim of the whole feature. The tests sweep every kind (table, chart,
     profile, catalog, lineage) rather than one, because each takes a different code path into
     the session and only the result-building ones would be tempted to materialize.
+    The falsifier used to name only tables and lineage rows, and that omission hid a real
+    leak: `session.catalog(flow)` and `session.profile(...)` both CREATE SCHEMA IF NOT EXISTS,
+    so `show(kind="catalog", flow="typo")` PROVISIONED the flow and `catalog` then listed it —
+    "nothing in catalog" was false in the one way it is observable. `show` now refuses an
+    unknown flow instead; the provisioning behaviour of the catalog/profile TOOLS is unchanged.
 
 - id: SHOW-002
   claim: >

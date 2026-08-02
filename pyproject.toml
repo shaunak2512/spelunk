@@ -20,9 +20,13 @@ classifiers = [
 dependencies = [
     "duckdb>=1.5",
     "sqlglot>=25.0",
-    # 3.4, not 2.x: server.py imports `fastmcp.apps.config` and `fastmcp.tools.base.ToolResult`
-    # unconditionally (the MCP Apps wiring `show` needs), and neither path exists in FastMCP 2.x.
-    # A 2.x resolution would fail at IMPORT time — a server that never starts, not a missing tool.
+    # 3.4, not 2.x — two independent reasons, either one sufficient:
+    #   * server.py imports `fastmcp.apps.config` and `fastmcp.tools.base.ToolResult`
+    #     unconditionally (the MCP Apps wiring `show` needs), and neither path exists in 2.x.
+    #     A 2.x resolution fails at IMPORT time — a server that never starts, not a missing tool.
+    #   * `--transport http` passes transport="http" AND a `middleware=` list to FastMCP.run for
+    #     the DNS-rebinding guard. 2.0 has neither, and that one fails at the run() call, i.e.
+    #     after startup looked fine. Both verified present in 3.4.0.
     "fastmcp>=3.4",
     "pydantic>=2.7",
     "pandas>=2.2",

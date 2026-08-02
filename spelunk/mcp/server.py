@@ -4,16 +4,22 @@ One DuckDB session ([core/duck.py]) is both the query engine and the workspace: 
 attached databases live in it alongside the flow results, so a single ``query`` can join any
 of them. No model, no loop — Claude Code is the agent.
 
-Usage (stdio, for Claude Code via .mcp.json)::
+Usage (stdio, the default — for Claude Code via .mcp.json)::
 
     python -m spelunk.mcp.server --source ./data/sales.parquet --source sqlite:///app.db \
         --session-dir .spelunk_session
+
+Usage (streamable HTTP, for a client that connects to a URL)::
+
+    python -m spelunk.mcp.server --transport http --source ./data/sales.parquet
+    # -> http://127.0.0.1:8080/mcp
 """
 from __future__ import annotations
 
 import argparse
 import functools
 import inspect
+import ipaddress
 import json
 import logging
 import os
@@ -23,6 +29,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
+from urllib.parse import urlsplit
 
 from fastmcp import FastMCP
 from fastmcp.apps.config import AppConfig, ResourceCSP
@@ -264,6 +271,21 @@ def _host_renders_ui() -> bool:
         return False
 
 
+def _require_existing_flow(session: DuckSession, flow: str) -> str:
+    """Reject an unknown flow BEFORE a display path can provision it.
+
+    `session.catalog(flow)` and `session.profile(...)` both `CREATE SCHEMA IF NOT EXISTS` — right
+    for the tools that BUILD, wrong for `show`, which must leave nothing behind. Without this a
+    typo'd flow name gets created and then shows up in `catalog`, which is precisely the way "a
+    view is not a result" is observable. Checked here rather than in DuckSession so the
+    `catalog`/`profile` TOOLS keep their existing provisioning behaviour.
+    """
+    known = {f["flow"] for f in session.catalog()["flows"]}  # no-arg catalog only lists
+    if flow not in known:
+        raise ValueError(f"Unknown flow {flow!r}. Known flows: {sorted(known)}.")
+    return flow
+
+
 def _dispatch_show(
     session: DuckSession,
     *,
@@ -292,6 +314,8 @@ def _dispatch_show(
     summary: dict = {"displayed": kind, "rendered_by_host": _host_renders_ui()}
 
     if kind == "catalog":
+        if flow is not None:
+            _require_existing_flow(session, flow)
         catalog = session.catalog(flow)
         view = views.catalog_view(catalog)
         summary.update({"flow": flow, **{k: v for k, v in catalog.items() if k != "results"}})
@@ -318,6 +342,10 @@ def _dispatch_show(
         # error instead of the clear "invalid result name" every other kind gives.
         resolved = _validate_name(flow or session.default_flow, "flow name")
         _validate_name(name)
+        # Identifier validation first, existence second: junk like `a"b` should still read as an
+        # invalid name, not "unknown flow". Once the flow is known to exist, profile's own
+        # CREATE SCHEMA IF NOT EXISTS is a no-op, so a missing RESULT leaves nothing behind.
+        _require_existing_flow(session, resolved)
         profile = session.profile(f'SELECT * FROM "{resolved}"."{name}"', resolved)
         view = views.profile_view(profile, f"{resolved}.{name}")
         summary.update({
@@ -853,6 +881,116 @@ def _load_env_file(path: str) -> None:
             os.environ.setdefault(key, value)
 
 
+_LOOPBACK_NAMES = ("127.0.0.1", "localhost", "[::1]")
+
+
+def _is_loopback(host: str) -> bool:
+    """Does `host` name this machine only? Decides whether we can enumerate valid Host values."""
+    bare = host.strip("[]").lower()
+    if bare in {"localhost", "::1"}:
+        return True
+    try:
+        return ipaddress.ip_address(bare).is_loopback
+    except ValueError:
+        return False
+
+
+def _bracketed(host: str) -> str:
+    """`::1` -> `[::1]`; anything else unchanged. An IPv6 literal is only a valid URL authority
+    in brackets, so the announced URL and the Host/Origin comparisons must both use this form."""
+    bare = host.strip("[]")
+    try:
+        if ipaddress.ip_address(bare).version == 6:
+            return f"[{bare}]"
+    except ValueError:
+        pass
+    return bare
+
+
+def _endpoint_authorities(host: str, port: int, extra: list[str] | None = None) -> frozenset[str]:
+    """Every `Host:`/`Origin:` authority that legitimately addresses this endpoint."""
+    # The bound host ALWAYS names itself. Listing only _LOOPBACK_NAMES would make the guard
+    # refuse the endpoint's own clients on any loopback address other than 127.0.0.1 — the whole
+    # of 127.0.0.0/8 is loopback, so `--host 127.0.0.2` would 403 a client whose Host is exactly
+    # what it dialled. The aliases are added on top, not instead.
+    bases = [_bracketed(host)]
+    if _is_loopback(host):
+        bases += list(_LOOPBACK_NAMES)
+    names = set()
+    for base in bases:
+        names.add(f"{base}:{port}".lower())
+        if port in (80, 443):
+            names.add(base.lower())  # browsers omit the default port from Origin
+    for value in extra or ():
+        # Accept a full origin (`https://app.example`) or a bare authority (`app.example:443`).
+        names.add((urlsplit(value).netloc or value).strip().lower())
+    return frozenset(names)
+
+
+def _authority_of(origin: str) -> str:
+    """Authority part of an Origin header. `null` (sandboxed iframe) has none and stays `null`,
+    which never matches an allowed name — that is the intended outcome, not an oversight."""
+    return (urlsplit(origin).netloc or origin).strip().lower()
+
+
+class _OriginGuard:
+    """ASGI middleware: reject cross-origin and DNS-rebound requests to the HTTP transport.
+
+    A loopback bind is not a security boundary. Any page the user happens to visit can POST to
+    127.0.0.1, and DNS rebinding lets it do so under a hostname it controls — which is why the
+    MCP HTTP guidance is that a local server MUST validate `Origin`. FastMCP 3.4 ships no such
+    guard (`host_origin_protection` appears nowhere in the package), so Spelunk supplies one
+    rather than documenting a protection it does not have.
+
+    Two checks:
+      * `Origin`, when present, must name this endpoint. Browsers set it on exactly the
+        cross-origin requests an attack would use; a normal MCP client sends none at all, so
+        this costs a CLI client nothing.
+      * `Host` must name this endpoint too — but only when we bound loopback and therefore KNOW
+        every name that can legitimately reach us. A rebound request carries the attacker's
+        hostname, so this is the rebinding defence proper rather than a CORS nicety. On a
+        non-loopback bind the set of valid names is whatever DNS says, which we cannot
+        enumerate, so the Host check is skipped and `Origin` carries the weight.
+    """
+
+    def __init__(self, app, *, allowed: frozenset[str], check_host: bool) -> None:
+        self.app = app
+        self.allowed = allowed
+        self.check_host = check_host
+
+    def _rejection(self, headers: dict[str, str]) -> str | None:
+        origin = headers.get("origin")
+        if origin is not None and _authority_of(origin) not in self.allowed:
+            return "Origin"
+        if self.check_host:
+            host = headers.get("host")
+            if host is not None and host.strip().lower() not in self.allowed:
+                return "Host"
+        return None
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope["headers"]}
+        reason = self._rejection(headers)
+        if reason is None:
+            await self.app(scope, receive, send)
+            return
+        body = json.dumps(
+            {"error": f"{reason} header does not name this endpoint (DNS-rebinding guard)"}
+        ).encode()
+        await send({
+            "type": "http.response.start",
+            "status": 403,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode()),
+            ],
+        })
+        await send({"type": "http.response.body", "body": body})
+
+
 def main() -> None:
     """CLI entry point: build a DuckSession from --source specs, serve over stdio."""
     parser = argparse.ArgumentParser(
@@ -933,6 +1071,47 @@ def main() -> None:
             "story. Off by default (the description parameter is then absent entirely)."
         ),
     )
+    parser.add_argument(
+        "--transport",
+        choices=("stdio", "http"),
+        default="stdio",
+        help=(
+            "How the MCP protocol is carried. 'stdio' (default) speaks JSON-RPC over the "
+            "process's stdin/stdout — the shape a command-launched client (Claude Code's "
+            ".mcp.json) expects. 'http' serves streamable HTTP on --host/--port instead, for a "
+            "client that connects to a URL. See --host/--port/--http-path."
+        ),
+    )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help=(
+            "Interface to bind with --transport http. Default 127.0.0.1 (loopback only). "
+            "'0.0.0.0' exposes the server to the network — the tools are read-only SELECTs, but "
+            "they read every configured source, so only do that on a trusted network."
+        ),
+    )
+    parser.add_argument(
+        "--port", type=int, default=8080,
+        help="Port to bind with --transport http. Default: 8080.",
+    )
+    parser.add_argument(
+        "--http-path",
+        default="/mcp",
+        help="URL path the MCP endpoint is mounted at with --transport http. Default: /mcp.",
+    )
+    parser.add_argument(
+        "--allowed-origin",
+        action="append",
+        default=[],
+        metavar="ORIGIN",
+        help=(
+            "Extra Origin/Host authority to accept with --transport http, repeatable. The "
+            "endpoint's own names are always allowed; this is the escape hatch for a browser "
+            "client reaching a non-loopback bind, which the DNS-rebinding guard would otherwise "
+            "refuse. Accepts a full origin (https://app.example) or a bare authority."
+        ),
+    )
     parser.add_argument("--memory-limit", default=None, help="DuckDB memory_limit, e.g. 4GB.")
     parser.add_argument("--temp-dir", default=None, help="Directory for DuckDB spill files.")
     parser.add_argument("--max-temp-size", default=None, help="Cap on spill size, e.g. 50GB.")
@@ -958,6 +1137,23 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+
+    if not args.http_path.startswith("/"):
+        # Fail fast rather than at bind time: Starlette routes must be rooted, and the announced
+        # URL would silently read `...:8080mcp` — a broken address the user would copy.
+        parser.error(f"--http-path must start with '/': got {args.http_path!r}")
+
+    if args.transport == "http" and args.allow_add_source:
+        # Worth saying out loud: --allow-add-source is documented as sound *because* of the
+        # process-per-agent model — each agent's stdio server is its own process, so an
+        # add/remove touches only that connection. One HTTP server serves every client that
+        # connects, from one DuckSession, so that isolation no longer holds.
+        print(
+            "[spelunk] warning: --allow-add-source over HTTP — every client sharing this "
+            f"endpoint shares one session, and can attach any file/DSN reachable from this "
+            f"process (bound to {args.host}).",
+            file=sys.stderr,
+        )
 
     if args.env_file:
         _load_env_file(args.env_file)
@@ -994,11 +1190,37 @@ def main() -> None:
         require_descriptions=args.require_descriptions,
     )
     try:
-        server.run(transport="stdio")
+        if args.transport == "http":
+            from starlette.middleware import Middleware
+
+            # FastMCP's own banner can be suppressed (FASTMCP_SHOW_SERVER_BANNER=0), so print the
+            # URL ourselves — on stderr, which is safe in either transport. An IPv6 literal is
+            # only a valid authority in brackets, hence _bracketed.
+            print(
+                f"[spelunk] MCP over HTTP: "
+                f"http://{_bracketed(args.host)}:{args.port}{args.http_path}",
+                file=sys.stderr,
+            )
+            guard = Middleware(
+                _OriginGuard,
+                allowed=_endpoint_authorities(args.host, args.port, args.allowed_origin),
+                check_host=_is_loopback(args.host),
+            )
+            server.run(
+                transport="http",
+                host=args.host,
+                port=args.port,
+                path=args.http_path,
+                middleware=[guard],
+            )
+        else:
+            server.run(transport="stdio")
     finally:
-        # Clean shutdown (client closed stdin): release the tool-log file handle so the dir is
-        # deletable on Windows, then let the session reclaim its own workspace if this run never
-        # did any work — reconnect churn then leaves no empty <pid>-<rand> dirs behind.
+        # Clean shutdown — stdio: the client closed stdin; http: uvicorn caught SIGINT/SIGTERM and
+        # returned. Release the tool-log file handle so the dir is deletable on Windows, then let
+        # the session reclaim its own workspace if this run never did any work — reconnect churn
+        # then leaves no empty <pid>-<rand> dirs behind. A hard kill skips this; the next
+        # server's startup sweep reclaims the dir instead.
         _configure_tool_logging(None)
         session.close(reclaim_if_empty=True)
 
