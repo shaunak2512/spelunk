@@ -951,34 +951,71 @@ class _OriginGuard:
         hostname, so this is the rebinding defence proper rather than a CORS nicety. On a
         non-loopback bind the set of valid names is whatever DNS says, which we cannot
         enumerate, so the Host check is skipped and `Origin` carries the weight.
+
+    A rejection is announced on stderr, not just in the 403 body. The body is the only place the
+    reason used to appear, and no MCP client shows it — a tunnelled client (ngrok, a reverse
+    proxy) forwards its own `Host`/`Origin`, trips the guard, and the user sees nothing but
+    "server disconnected". The log names the header, the value that arrived, and the
+    `--allowed-origin` flag that would admit it, so the fix is readable off the terminal rather
+    than deduced from this source file. Each distinct (header, value) pair is logged once — a
+    scanner hammering the port must not drown the one line that matters.
     """
 
     def __init__(self, app, *, allowed: frozenset[str], check_host: bool) -> None:
         self.app = app
         self.allowed = allowed
         self.check_host = check_host
+        self._announced: set[tuple[str, str]] = set()
 
-    def _rejection(self, headers: dict[str, str]) -> str | None:
+    def _rejections(self, headers: dict[str, str]) -> list[tuple[str, str]]:
+        """EVERY header that failed, with the value it carried; empty to allow.
+
+        All of them, not the first: a tunnelled browser client gets both wrong at once (ngrok
+        forwards its own `Host`, the client sends its own `Origin`), and reporting only the first
+        costs the user a restart to discover the second.
+        """
+        failed = []
         origin = headers.get("origin")
         if origin is not None and _authority_of(origin) not in self.allowed:
-            return "Origin"
+            failed.append(("Origin", origin.strip()))
         if self.check_host:
             host = headers.get("host")
             if host is not None and host.strip().lower() not in self.allowed:
-                return "Host"
-        return None
+                failed.append(("Host", host.strip()))
+        return failed
+
+    def _announce(self, header: str, value: str) -> None:
+        if (header, value) in self._announced:
+            return
+        self._announced.add((header, value))
+        # An Origin arrives as a full origin and is echoed as-is; a Host is a bare authority, so
+        # give it a scheme to match how --allowed-origin is normally written (either form parses).
+        suggestion = value if "://" in value else f"https://{value}"
+        print(
+            f"[spelunk] 403: {header}: {value} does not name this endpoint (DNS-rebinding "
+            f"guard). Allowed: {', '.join(sorted(self.allowed))}. If this client is legitimate "
+            f"(a tunnel or reverse proxy forwards its own {header}), restart with "
+            f"--allowed-origin {suggestion}",
+            file=sys.stderr,
+        )
 
     async def __call__(self, scope, receive, send) -> None:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
         headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope["headers"]}
-        reason = self._rejection(headers)
-        if reason is None:
+        rejections = self._rejections(headers)
+        if not rejections:
             await self.app(scope, receive, send)
             return
+        for header, value in rejections:
+            self._announce(header, value)
+        # The body names every failing header for the same reason the log does, but stays a
+        # single `error` string — no client renders it, and the shape is what tests pin.
+        reason = " and ".join(header for header, _ in rejections)
+        noun = "header does" if len(rejections) == 1 else "headers do"
         body = json.dumps(
-            {"error": f"{reason} header does not name this endpoint (DNS-rebinding guard)"}
+            {"error": f"{reason} {noun} not name this endpoint (DNS-rebinding guard)"}
         ).encode()
         await send({
             "type": "http.response.start",

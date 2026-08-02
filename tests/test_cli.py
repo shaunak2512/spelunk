@@ -497,6 +497,80 @@ class TestEndpointAuthorities:
         assert "localhost:8080" not in allowed
 
 
+class TestOriginGuardDiagnostic:
+    """A tunnelled client trips the guard, and the 403 body it gets is never shown to the user.
+
+    These pin the stderr announcement instead: the header, the value that arrived, and the
+    `--allowed-origin` flag that admits it. Without that line the failure reads as an unexplained
+    "server disconnected" and the cause is only findable by reading server.py.
+    """
+
+    def _guard(self):
+        from spelunk.mcp.server import _OriginGuard, _endpoint_authorities
+
+        return _OriginGuard(
+            None, allowed=_endpoint_authorities("127.0.0.1", 8080), check_host=True
+        )
+
+    def test_a_tunnelled_host_is_rejected_with_its_value(self):
+        # `ngrok http 8080` forwards the ORIGINAL Host, so the loopback server sees the public
+        # hostname. Both halves matter: the header name, and the value to pass back as a flag.
+        assert self._guard()._rejections({"host": "1a2b3c.ngrok-free.app"}) == [
+            ("Host", "1a2b3c.ngrok-free.app"),
+        ]
+
+    def test_a_remote_client_origin_is_rejected_with_its_value(self):
+        assert self._guard()._rejections({"origin": "https://claude.ai"}) == [
+            ("Origin", "https://claude.ai"),
+        ]
+
+    def test_both_failing_headers_are_reported_together(self):
+        """The real ngrok + Claude Desktop shape gets BOTH wrong. Reporting only the first
+        costs a restart to discover the second — which is the bug this branch exists for."""
+        assert self._guard()._rejections(
+            {"host": "1a2b3c.ngrok-free.app", "origin": "https://claude.ai"}
+        ) == [("Origin", "https://claude.ai"), ("Host", "1a2b3c.ngrok-free.app")]
+
+    def test_the_endpoints_own_client_still_passes(self):
+        assert self._guard()._rejections({"host": "127.0.0.1:8080"}) == []
+
+    def test_a_non_loopback_bind_does_not_check_host(self):
+        """Host is unenumerable off loopback, so only Origin can carry the weight."""
+        from spelunk.mcp.server import _OriginGuard, _endpoint_authorities
+
+        guard = _OriginGuard(
+            None, allowed=_endpoint_authorities("0.0.0.0", 8080), check_host=False
+        )
+        assert guard._rejections({"host": "anything.example"}) == []
+
+    def test_the_log_names_the_flag_that_would_admit_the_client(self, capsys):
+        guard = self._guard()
+        guard._announce("Host", "1a2b3c.ngrok-free.app")
+        err = capsys.readouterr().err
+        # A bare authority gets a scheme, so the suggestion is paste-ready as written.
+        assert "--allowed-origin https://1a2b3c.ngrok-free.app" in err
+        assert "127.0.0.1:8080" in err  # what IS allowed, so the mismatch is visible
+
+    def test_an_origin_is_suggested_verbatim_not_double_schemed(self, capsys):
+        guard = self._guard()
+        guard._announce("Origin", "https://claude.ai")
+        assert "--allowed-origin https://claude.ai" in capsys.readouterr().err
+
+    def test_a_repeated_rejection_is_announced_once(self, capsys):
+        """A scanner hammering the port must not bury the one line that explains the failure."""
+        guard = self._guard()
+        for _ in range(5):
+            guard._announce("Host", "1a2b3c.ngrok-free.app")
+        assert capsys.readouterr().err.count("--allowed-origin") == 1
+
+    def test_a_different_value_is_announced_again(self, capsys):
+        """Dedup is per (header, value) — ngrok hands out a new hostname on every restart."""
+        guard = self._guard()
+        guard._announce("Host", "aaa.ngrok-free.app")
+        guard._announce("Host", "bbb.ngrok-free.app")
+        assert capsys.readouterr().err.count("--allowed-origin") == 2
+
+
 class TestHttpOriginGuard:
     """MCP-016: the HTTP transport refuses cross-origin and DNS-rebound requests.
 
