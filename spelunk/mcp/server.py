@@ -271,6 +271,21 @@ def _host_renders_ui() -> bool:
         return False
 
 
+def _require_existing_flow(session: DuckSession, flow: str) -> str:
+    """Reject an unknown flow BEFORE a display path can provision it.
+
+    `session.catalog(flow)` and `session.profile(...)` both `CREATE SCHEMA IF NOT EXISTS` — right
+    for the tools that BUILD, wrong for `show`, which must leave nothing behind. Without this a
+    typo'd flow name gets created and then shows up in `catalog`, which is precisely the way "a
+    view is not a result" is observable. Checked here rather than in DuckSession so the
+    `catalog`/`profile` TOOLS keep their existing provisioning behaviour.
+    """
+    known = {f["flow"] for f in session.catalog()["flows"]}  # no-arg catalog only lists
+    if flow not in known:
+        raise ValueError(f"Unknown flow {flow!r}. Known flows: {sorted(known)}.")
+    return flow
+
+
 def _dispatch_show(
     session: DuckSession,
     *,
@@ -299,6 +314,8 @@ def _dispatch_show(
     summary: dict = {"displayed": kind, "rendered_by_host": _host_renders_ui()}
 
     if kind == "catalog":
+        if flow is not None:
+            _require_existing_flow(session, flow)
         catalog = session.catalog(flow)
         view = views.catalog_view(catalog)
         summary.update({"flow": flow, **{k: v for k, v in catalog.items() if k != "results"}})
@@ -325,6 +342,10 @@ def _dispatch_show(
         # error instead of the clear "invalid result name" every other kind gives.
         resolved = _validate_name(flow or session.default_flow, "flow name")
         _validate_name(name)
+        # Identifier validation first, existence second: junk like `a"b` should still read as an
+        # invalid name, not "unknown flow". Once the flow is known to exist, profile's own
+        # CREATE SCHEMA IF NOT EXISTS is a no-op, so a missing RESULT leaves nothing behind.
+        _require_existing_flow(session, resolved)
         profile = session.profile(f'SELECT * FROM "{resolved}"."{name}"', resolved)
         view = views.profile_view(profile, f"{resolved}.{name}")
         summary.update({

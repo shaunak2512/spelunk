@@ -602,6 +602,22 @@ class TestShowIsAView:
             _call(server, args)
         assert {r["name"] for r in session.catalog("default")["results"]} == before
 
+    def test_creates_no_flow(self, show_server):
+        """An unknown flow must be REFUSED, not provisioned.
+
+        The sibling test above watches results; this one watches FLOWS, which is where the
+        invariant leaked. `session.catalog(flow)` and `session.profile(...)` both CREATE SCHEMA
+        IF NOT EXISTS — correct for the tools that build, wrong for `show`. A typo'd flow name
+        was being created and then listed by `catalog`, i.e. "nothing in catalog" was false.
+        """
+        server, session = show_server
+        before = {f["flow"] for f in session.catalog()["flows"]}
+        for args in ({"kind": "catalog", "flow": "ghost"},
+                     {"kind": "profile", "name": "by_region", "flow": "ghost"}):
+            with pytest.raises(Exception, match="Unknown flow"):
+                _call(server, args)
+        assert {f["flow"] for f in session.catalog()["flows"]} == before
+
     def test_records_no_lineage_node(self, show_server):
         server, session = show_server
         before = len(session.lineage()["nodes"])

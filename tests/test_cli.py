@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import importlib.util
 import json
 import socket
 import subprocess
@@ -29,14 +30,16 @@ from pathlib import Path
 
 import pytest
 
-from spelunk.mcp import views
-
 DOCUMENTED_TOOLS = {"query", "profile", "export", "catalog", "drop", "lineage", "replay"}
-# `show` is registered only when the optional [ui] extra (prefab-ui) is installed. Fold it in
-# conditionally rather than dropping the set-equality assertion: in a [ui] install a MISSING
-# `show` must still fail here, and in a lean install an unexpected `show` must too. The
-# subprocess under test runs the same interpreter, so this import sees the same answer it will.
-if views.PREFAB_AVAILABLE:
+# `show` is registered only when the optional [ui] extra (prefab-ui) is installed. Decide that
+# from whether prefab-ui is INSTALLED — deliberately NOT from views.PREFAB_AVAILABLE, which is
+# the very flag the server consults: deriving the expectation from the implementation's own
+# signal means a broken detection (prefab-ui present, import guard wrongly False) drops `show`
+# from both sides at once and the assertion passes on a server that lost the tool. find_spec is
+# an independent answer, so the two can disagree and the test says so. The subprocess under
+# test runs this same interpreter, so what is importable here is importable there.
+PREFAB_INSTALLED = importlib.util.find_spec("prefab_ui") is not None
+if PREFAB_INSTALLED:
     DOCUMENTED_TOOLS |= {"show"}
 GATED_TOOLS = {"add_source", "remove_source", "fetch"}
 
@@ -179,6 +182,21 @@ class TestStdioTransport:
     def test_registered_surface_is_exactly_the_documented_one(self, server):
         """MCP-001 as set EQUALITY: an undocumented tool fails here too."""
         assert _tool_names(server) == DOCUMENTED_TOOLS
+
+    @pytest.mark.skipif(not PREFAB_INSTALLED, reason="prefab-ui not installed (lean install)")
+    def test_show_is_registered_when_prefab_is_installed(self, server):
+        """The UI-enabled half, stated outright rather than folded into DOCUMENTED_TOOLS.
+
+        Named directly so the [ui] expectation cannot be satisfied by the same guard that
+        registers the tool: if prefab-ui is importable and `show` is still missing, that is a
+        detection or registration failure and it must fail HERE, loudly.
+        """
+        assert "show" in _tool_names(server)
+
+    @pytest.mark.skipif(PREFAB_INSTALLED, reason="prefab-ui is installed (ui/dev install)")
+    def test_show_is_absent_without_prefab(self, server):
+        """The lean-install half: no prefab-ui means no `show`, and no import error either."""
+        assert "show" not in _tool_names(server)
 
     def test_gated_tools_absent_without_the_flag(self, server):
         assert _tool_names(server) & GATED_TOOLS == set()
