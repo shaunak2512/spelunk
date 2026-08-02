@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import functools
 import inspect
+import ipaddress
 import json
 import logging
 import os
@@ -28,6 +29,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
+from urllib.parse import urlsplit
 
 from fastmcp import FastMCP
 from pydantic import BaseModel, Field
@@ -642,6 +644,110 @@ def _load_env_file(path: str) -> None:
             os.environ.setdefault(key, value)
 
 
+_LOOPBACK_NAMES = ("127.0.0.1", "localhost", "[::1]")
+
+
+def _is_loopback(host: str) -> bool:
+    """Does `host` name this machine only? Decides whether we can enumerate valid Host values."""
+    bare = host.strip("[]").lower()
+    if bare in {"localhost", "::1"}:
+        return True
+    try:
+        return ipaddress.ip_address(bare).is_loopback
+    except ValueError:
+        return False
+
+
+def _bracketed(host: str) -> str:
+    """`::1` -> `[::1]`; anything else unchanged. An IPv6 literal is only a valid URL authority
+    in brackets, so the announced URL and the Host/Origin comparisons must both use this form."""
+    bare = host.strip("[]")
+    try:
+        if ipaddress.ip_address(bare).version == 6:
+            return f"[{bare}]"
+    except ValueError:
+        pass
+    return bare
+
+
+def _endpoint_authorities(host: str, port: int, extra: list[str] | None = None) -> frozenset[str]:
+    """Every `Host:`/`Origin:` authority that legitimately addresses this endpoint."""
+    bases = list(_LOOPBACK_NAMES) if _is_loopback(host) else [_bracketed(host)]
+    names = set()
+    for base in bases:
+        names.add(f"{base}:{port}".lower())
+        if port in (80, 443):
+            names.add(base.lower())  # browsers omit the default port from Origin
+    for value in extra or ():
+        # Accept a full origin (`https://app.example`) or a bare authority (`app.example:443`).
+        names.add((urlsplit(value).netloc or value).strip().lower())
+    return frozenset(names)
+
+
+def _authority_of(origin: str) -> str:
+    """Authority part of an Origin header. `null` (sandboxed iframe) has none and stays `null`,
+    which never matches an allowed name — that is the intended outcome, not an oversight."""
+    return (urlsplit(origin).netloc or origin).strip().lower()
+
+
+class _OriginGuard:
+    """ASGI middleware: reject cross-origin and DNS-rebound requests to the HTTP transport.
+
+    A loopback bind is not a security boundary. Any page the user happens to visit can POST to
+    127.0.0.1, and DNS rebinding lets it do so under a hostname it controls — which is why the
+    MCP HTTP guidance is that a local server MUST validate `Origin`. FastMCP 3.4 ships no such
+    guard (`host_origin_protection` appears nowhere in the package), so Spelunk supplies one
+    rather than documenting a protection it does not have.
+
+    Two checks:
+      * `Origin`, when present, must name this endpoint. Browsers set it on exactly the
+        cross-origin requests an attack would use; a normal MCP client sends none at all, so
+        this costs a CLI client nothing.
+      * `Host` must name this endpoint too — but only when we bound loopback and therefore KNOW
+        every name that can legitimately reach us. A rebound request carries the attacker's
+        hostname, so this is the rebinding defence proper rather than a CORS nicety. On a
+        non-loopback bind the set of valid names is whatever DNS says, which we cannot
+        enumerate, so the Host check is skipped and `Origin` carries the weight.
+    """
+
+    def __init__(self, app, *, allowed: frozenset[str], check_host: bool) -> None:
+        self.app = app
+        self.allowed = allowed
+        self.check_host = check_host
+
+    def _rejection(self, headers: dict[str, str]) -> str | None:
+        origin = headers.get("origin")
+        if origin is not None and _authority_of(origin) not in self.allowed:
+            return "Origin"
+        if self.check_host:
+            host = headers.get("host")
+            if host is not None and host.strip().lower() not in self.allowed:
+                return "Host"
+        return None
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope["headers"]}
+        reason = self._rejection(headers)
+        if reason is None:
+            await self.app(scope, receive, send)
+            return
+        body = json.dumps(
+            {"error": f"{reason} header does not name this endpoint (DNS-rebinding guard)"}
+        ).encode()
+        await send({
+            "type": "http.response.start",
+            "status": 403,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode()),
+            ],
+        })
+        await send({"type": "http.response.body", "body": body})
+
+
 def main() -> None:
     """CLI entry point: build a DuckSession from --source specs, serve over stdio."""
     parser = argparse.ArgumentParser(
@@ -751,6 +857,18 @@ def main() -> None:
         default="/mcp",
         help="URL path the MCP endpoint is mounted at with --transport http. Default: /mcp.",
     )
+    parser.add_argument(
+        "--allowed-origin",
+        action="append",
+        default=[],
+        metavar="ORIGIN",
+        help=(
+            "Extra Origin/Host authority to accept with --transport http, repeatable. The "
+            "endpoint's own names are always allowed; this is the escape hatch for a browser "
+            "client reaching a non-loopback bind, which the DNS-rebinding guard would otherwise "
+            "refuse. Accepts a full origin (https://app.example) or a bare authority."
+        ),
+    )
     parser.add_argument("--memory-limit", default=None, help="DuckDB memory_limit, e.g. 4GB.")
     parser.add_argument("--temp-dir", default=None, help="Directory for DuckDB spill files.")
     parser.add_argument("--max-temp-size", default=None, help="Cap on spill size, e.g. 50GB.")
@@ -776,6 +894,11 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+
+    if not args.http_path.startswith("/"):
+        # Fail fast rather than at bind time: Starlette routes must be rooted, and the announced
+        # URL would silently read `...:8080mcp` — a broken address the user would copy.
+        parser.error(f"--http-path must start with '/': got {args.http_path!r}")
 
     if args.transport == "http" and args.allow_add_source:
         # Worth saying out loud: --allow-add-source is documented as sound *because* of the
@@ -825,14 +948,27 @@ def main() -> None:
     )
     try:
         if args.transport == "http":
+            from starlette.middleware import Middleware
+
             # FastMCP's own banner can be suppressed (FASTMCP_SHOW_SERVER_BANNER=0), so print the
-            # URL ourselves — on stderr, which is safe in either transport.
+            # URL ourselves — on stderr, which is safe in either transport. An IPv6 literal is
+            # only a valid authority in brackets, hence _bracketed.
             print(
-                f"[spelunk] MCP over HTTP: http://{args.host}:{args.port}{args.http_path}",
+                f"[spelunk] MCP over HTTP: "
+                f"http://{_bracketed(args.host)}:{args.port}{args.http_path}",
                 file=sys.stderr,
             )
+            guard = Middleware(
+                _OriginGuard,
+                allowed=_endpoint_authorities(args.host, args.port, args.allowed_origin),
+                check_host=_is_loopback(args.host),
+            )
             server.run(
-                transport="http", host=args.host, port=args.port, path=args.http_path
+                transport="http",
+                host=args.host,
+                port=args.port,
+                path=args.http_path,
+                middleware=[guard],
             )
         else:
             server.run(transport="stdio")

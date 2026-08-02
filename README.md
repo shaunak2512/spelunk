@@ -92,13 +92,20 @@ spelunk --transport http --source sales=./data/sales.parquet
 ```
 
 `--host` (default `127.0.0.1`, loopback only), `--port` (default `8080`) and `--http-path` (default
-`/mcp`) control the bind. The tool surface is identical on both transports.
+`/mcp`) control the bind. The tool and resource surface is identical on both transports.
 
-One caveat worth knowing: stdio gives every agent its own server process and its own workspace,
-while an HTTP endpoint serves **all** connecting clients from one session — so flows and results are
-shared between them. Combining `--transport http` with `--allow-add-source` gives any client that
-can reach the port the ability to attach any file or DSN the server process can, which is why that
-combination warns on startup.
+Requests are screened for **DNS rebinding**: an `Origin` header, when present, must name this
+endpoint, and on a loopback bind the `Host` header must too — otherwise the request is refused with
+**403**. A normal MCP client sends no `Origin` and is unaffected; this stops a web page the user
+happens to visit from driving the server on `127.0.0.1`. Use `--allowed-origin` (repeatable) to
+permit a browser client on a non-loopback bind.
+
+One caveat worth knowing: stdio in the default per-process mode gives every agent its own server
+process and its own workspace, while an HTTP endpoint serves **all** connecting clients from one
+session — so flows and results are shared between them. (`--shared-workspace` gives up that
+isolation on stdio too, pointing every process at one workspace file.) Combining `--transport http`
+with `--allow-add-source` gives any client that can reach the port the ability to attach any file or
+DSN the server process can, which is why that combination warns on startup.
 
 Sources auto-detect by extension/scheme; prefix with `name=` to set the catalog/view name. A file
 path may be a **glob** — `--source trips=./data/yellow_*.parquet` attaches every matching file as

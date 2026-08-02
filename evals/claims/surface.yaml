@@ -203,11 +203,41 @@ claims:
   covered_by:
   - tests/test_cli.py::TestHttpTransport::test_same_surface_and_a_cross_source_query_over_http
   - tests/test_cli.py::TestHttpTransport::test_bound_url_is_announced_on_stderr
+  - tests/test_cli.py::TestHttpTransport::test_a_non_default_http_path_is_where_the_endpoint_lands
+  - tests/test_cli.py::TestHttpTransport::test_http_path_without_a_leading_slash_is_refused
   - tests/test_cli.py::TestStdioTransport::test_registered_surface_is_exactly_the_documented_one
   note: 'The HTTP test asserts set EQUALITY against the same DOCUMENTED_TOOLS the stdio test uses, so
-    the two transports cannot drift apart in surface. The stdio tests are unchanged and pass no
-    --transport, which is what pins stdio as the default.
+    the two transports cannot drift apart in surface. It also lists RESOURCES: the claim says "tool and
+    resource surface", and a tools-only assertion would let a transport serve half of it and still pass.
+    The stdio tests are unchanged and pass no --transport, which is what pins stdio as the default.
+    --http-path is exercised at a NON-default value, so forwarding it to FastMCP (not merely printing
+    it) is what the test proves; a value without a leading slash is refused at parse time.
 
     Deliberately NOT covered: clean shutdown in HTTP mode. uvicorn returns from run() on SIGINT/SIGTERM
     so the workspace-reclaim finally does fire, but a portable test needs a graceful signal that Windows
     subprocess.terminate() does not send. The startup GC sweep reclaims the dir either way.'
+- id: MCP-016
+  claim: 'The HTTP transport screens requests for DNS rebinding: an Origin header, when present, must
+    name the endpoint, and on a loopback bind the Host header must too — otherwise 403. A client that
+    sends no Origin (every normal MCP client) is unaffected. --allowed-origin adds authorities.
+
+    '
+  source: CLAUDE.md#running-the-server
+  mode: invariant
+  falsifier: 'A request carrying a foreign Origin (or, on a loopback bind, a Host naming somewhere
+    else) reaches the MCP layer instead of being refused; or the guard refuses a client that sends no
+    Origin, or one naming the endpoint itself, or one named by --allowed-origin.'
+  status: verified
+  covered_by:
+  - tests/test_cli.py::TestHttpOriginGuard::test_a_foreign_origin_is_refused
+  - tests/test_cli.py::TestHttpOriginGuard::test_a_rebound_host_is_refused
+  - tests/test_cli.py::TestHttpOriginGuard::test_a_normal_client_sending_no_origin_is_untouched
+  - tests/test_cli.py::TestHttpOriginGuard::test_the_endpoints_own_origin_is_allowed
+  - tests/test_cli.py::TestHttpOriginGuard::test_allowed_origin_opens_a_named_extra
+  note: 'This guard is OURS (spelunk.mcp.server._OriginGuard), not FastMCP''s. FastMCP 3.4.2 ships no
+    host_origin_protection — the string appears nowhere in the package — so an earlier draft of the
+    docs claiming it was simply wrong, which is what this claim now pins. The negative tests assert
+    403 specifically; the positive ones assert "not 403" rather than 200, because a raw ping with no
+    MCP session legitimately draws a 400 from the layer BELOW the guard, and asserting 200 there would
+    couple the claim to the handshake instead of the guard. If FastMCP later ships its own guard,
+    delete ours rather than stacking them, and re-point this claim.'

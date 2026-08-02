@@ -247,20 +247,38 @@ difference, and `tests/test_cli.py` asserts set equality across the two so they 
 Two things change under HTTP, both consequences of a URL being *shared* where a spawned process is
 not:
 
-- **One session, many clients.** stdio gives each agent its own process and therefore its own
-  workspace; an HTTP endpoint serves every client that connects out of a single `DuckSession`. Flows
-  are still isolated namespaces, but two clients on one endpoint see each other's flows and results.
-  The process-per-agent isolation the rest of this doc assumes is a property of stdio, not of the
-  server. `--transport http --allow-add-source` therefore warns on stderr: that gate is documented as
-  sound *because* of process-per-agent, and over HTTP it isn't. Binding `--host 0.0.0.0` widens this
-  further — the tools are read-only, but they read every configured source.
+- **One session, many clients.** stdio (in the default per-process mode) gives each agent its own
+  process and therefore its own workspace; an HTTP endpoint serves every client that connects out of
+  a single `DuckSession`. Flows are still isolated namespaces, but two clients on one endpoint see
+  each other's flows and results. The process-per-agent isolation the rest of this doc assumes is a
+  property of stdio + per-process workspaces, not of the server — `--shared-workspace` already
+  gives it up on stdio, pointing every process at one `workspace.duckdb` (where DuckDB's
+  single-writer lock then leaves only the first durable). `--transport http --allow-add-source`
+  therefore warns on stderr: that gate is documented as sound *because* of process-per-agent, and
+  over HTTP it isn't. Binding `--host 0.0.0.0` widens this further — the tools are read-only, but
+  they read every configured source.
 - **Shutdown is a signal, not a closed pipe.** The stdio server's clean-shutdown path fires when the
   client closes stdin. Under HTTP, uvicorn returns from `run()` on SIGINT/SIGTERM and the same
   `finally` runs; a hard kill skips it and leaves the `<pid>-<rand>` dir for the next server's
   startup GC sweep to reclaim.
 
-DNS-rebinding protection is FastMCP's `host_origin_protection="auto"`, which already guards a
-loopback-bound server — a browser on another origin can't drive the endpoint.
+**DNS-rebinding protection is ours, not FastMCP's.** A loopback bind is not a security boundary:
+any page the user visits can POST to `127.0.0.1`, and DNS rebinding lets it do so under a hostname
+it controls. FastMCP 3.4 ships no Host/Origin guard (`host_origin_protection` appears nowhere in the
+package — an earlier draft of this doc claimed otherwise and was wrong), so `--transport http`
+installs `_OriginGuard`, one ASGI middleware, and returns **403** when it trips:
+
+- `Origin`, when present, must name this endpoint. Browsers set it on exactly the cross-origin
+  requests an attack would use; a normal MCP client sends none, so a CLI client pays nothing.
+  `Origin: null` (sandboxed iframe) never matches and is refused.
+- `Host` must name this endpoint too — but only on a **loopback** bind, where we know every name
+  that can legitimately reach us. That is the rebinding defence proper: a rebound request arrives
+  carrying the attacker's hostname. On a non-loopback bind the valid names are whatever DNS says,
+  which we can't enumerate, so the Host check is skipped and `Origin` carries the weight.
+
+`--allowed-origin <origin>` (repeatable) adds authorities — the escape hatch for a browser client
+reaching a non-loopback bind. If FastMCP later ships its own guard, delete ours rather than stacking
+them.
 
 **`--allow-add-source` (off by default):** registers the `add_source` / `remove_source` / `fetch`
 tools so the agent can attach and detach sources at runtime and call endpoints of an attached API.
