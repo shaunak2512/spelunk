@@ -20,9 +20,13 @@ classifiers = [
 dependencies = [
     "duckdb>=1.5",
     "sqlglot>=25.0",
-    # 3.4, not 2.x: `--transport http` passes transport="http" AND a `middleware=` list to
-    # FastMCP.run for the DNS-rebinding guard. FastMCP 2.0 has neither — it would fail at the
-    # run() call, i.e. after startup looked fine. Verified present in 3.4.0.
+    # 3.4, not 2.x — two independent reasons, either one sufficient:
+    #   * server.py imports `fastmcp.apps.config` and `fastmcp.tools.base.ToolResult`
+    #     unconditionally (the MCP Apps wiring `show` needs), and neither path exists in 2.x.
+    #     A 2.x resolution fails at IMPORT time — a server that never starts, not a missing tool.
+    #   * `--transport http` passes transport="http" AND a `middleware=` list to FastMCP.run for
+    #     the DNS-rebinding guard. 2.0 has neither, and that one fails at the run() call, i.e.
+    #     after startup looked fine. Both verified present in 3.4.0.
     "fastmcp>=3.4",
     "pydantic>=2.7",
     "pandas>=2.2",
@@ -37,9 +41,31 @@ Issues = "https://github.com/shaunak2512/spelunk/issues"
 spelunk = "spelunk.mcp.server:main"
 
 [project.optional-dependencies]
+# The `show` tool's renderer. Kept optional so the core install stays lean — without it `show`
+# is simply not registered, rather than present and always failing. Pinned EXACTLY, as the
+# Prefab/FastMCP guide instructs ("pin prefab-ui explicitly rather than relying on
+# minimum-version constraints"): prefab-ui is pre-1.0 and expects breaking changes, and the
+# version ALSO selects the JS bundle the iframe loads (the renderer HTML points at
+# cdn.jsdelivr.net/npm/@prefecthq/prefab-ui@<this version>), so an upgrade changes what users'
+# browsers fetch, not just what the server imports. Spelunk additionally builds its own renderer
+# resource from this package's HTML (see views.recovery_renderer_html), which is a second reason
+# a surprise version bump should never happen silently.
+# The fastmcp bound restates the core pin rather than raising it — kept explicit because it is
+# THIS extra that needs the MCP Apps surface (`@mcp.tool(app=True)`, the ui:// renderer), so the
+# requirement stays visible if the core floor is ever relaxed.
+ui = ["prefab-ui==0.20.2", "fastmcp>=3.4"]
 # PyYAML is for evals/coverage.py — the claim register lives in YAML and the script is part of
 # the documented dev workflow, so a clean `--extra dev` install must be able to run it.
-dev = ["pytest>=8.0", "pytest-cov", "ruff", "pyarrow>=15.0", "PyYAML>=6.0"]
+# prefab-ui rides along so tests/test_show.py actually runs instead of skipping — pinned to the
+# SAME version as the `ui` extra, because those tests assert on the renderer HTML that
+# `prefab_ui.renderer.get_renderer_html()` returns, and a floating patch release would test a
+# different bundle than the one users' browsers fetch. jsonschema likewise: without it
+# test_every_payload_validates_against_it importorskips, so the check that `show`'s declared
+# output schema matches its payloads would never actually run.
+dev = [
+    "pytest>=8.0", "pytest-cov", "ruff", "pyarrow>=15.0", "PyYAML>=6.0",
+    "prefab-ui==0.20.2", "jsonschema>=4.0",
+]
 
 [build-system]
 requires = ["hatchling"]

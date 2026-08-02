@@ -1,0 +1,351 @@
+area: >
+  The `show` tool and the MCP Apps / Prefab rendering layer — what gets displayed, what must
+  never be displayed silently, and the boundary that keeps a view from becoming a result.
+prefix: SHOW
+claims:
+
+- id: SHOW-001
+  claim: >
+    `show` is read-only: it creates NO result and records NO lineage node. A view is not a
+    result, so there is nothing to drop after displaying something.
+  source: CLAUDE.md#tool-surface
+  mode: invariant
+  falsifier: >
+    A `show` call leaves a new table in the flow, or adds a row to _spelunk_meta.lineage.
+  status: verified
+  covered_by:
+  - tests/test_show.py::TestShowIsAView::test_creates_no_result
+  - tests/test_show.py::TestShowIsAView::test_records_no_lineage_node
+  - tests/test_show.py::TestRowsForDisplay::test_reads_without_creating_anything
+  note: >
+    The load-bearing claim of the whole feature. Both tests sweep every kind (table, chart,
+    profile, catalog, lineage) rather than one, because each takes a different code path into
+    the session and only the result-building ones would be tempted to materialize.
+
+- id: SHOW-002
+  claim: >
+    Past its row/cell cap, `show` ERRORS rather than truncating — a silently shortened view is
+    a picture that misstates the data. The error names the real row count and the way out.
+  source: CLAUDE.md#tool-surface
+  mode: behavioral
+  falsifier: >
+    A result larger than the cap renders anyway, with rows quietly dropped and no indication in
+    the reply that anything is missing.
+  status: verified
+  covered_by:
+  - tests/test_show.py::TestRowsForDisplay::test_refuses_past_the_row_cap_instead_of_truncating
+  - tests/test_show.py::TestRowsForDisplay::test_cell_cap_catches_a_wide_result_the_row_cap_misses
+  - tests/test_show.py::TestShowErrors::test_chart_over_the_cap_errors_rather_than_truncating
+  note: >
+    Bounded on rows AND cells, like the full-sample caps on query: the row cap alone lets a
+    50-row x 400-column result through, which is the same payload problem. The message asserts
+    on content, not just the raise — "500 rows", "Nothing was truncated", and a GROUP BY
+    pointer — because an error that does not say how to proceed just moves the dead end.
+
+- id: SHOW-003
+  claim: >
+    Charts cap far lower than tables (200 rows vs a few thousand), because the limit on a chart
+    is legibility, not payload size.
+  source: CLAUDE.md#tool-surface
+  mode: quantitative
+  falsifier: A 400-row result is accepted as a bar chart, or refused as a table.
+  status: verified
+  covered_by:
+  - tests/test_show.py::TestShowErrors::test_chart_over_the_cap_errors_rather_than_truncating
+  - tests/test_show.py::TestShowErrors::test_a_table_accepts_what_a_chart_refuses
+  note: >
+    The pair is the point — one test alone would pass with a single shared cap.
+
+- id: SHOW-004
+  claim: >
+    `show` returns BOTH halves of an MCP result: a JSON text summary the model reads and the
+    Prefab payload a UI host renders. The model is never handed '[Rendered Prefab UI]'.
+  source: CLAUDE.md#tool-surface
+  mode: invariant
+  falsifier: >
+    A `show` reply's text content is the Prefab placeholder string, or carries no summary — so
+    the agent cannot tell what it displayed.
+  status: verified
+  covered_by:
+  - tests/test_show.py::TestShowResult::test_returns_both_halves
+  - tests/test_show.py::TestShowResult::test_text_half_is_never_the_prefab_placeholder
+  note: >
+    Returning a bare Prefab component from the tool is exactly what produces the placeholder —
+    fastmcp/tools/base.py substitutes it whenever a component is the return value. `show` builds
+    its own ToolResult to avoid that path. This is also why `query` was NOT made an app tool.
+
+- id: SHOW-005
+  claim: >
+    The text half mirrors `query`'s sample contract — every row when the result is small on both
+    axes (complete: true), otherwise a 5-row head.
+  source: CLAUDE.md#tool-surface
+  mode: behavioral
+  falsifier: >
+    A small displayed result comes back without its rows, or a large one dumps all of them.
+  status: verified
+  covered_by:
+  - tests/test_show.py::TestShowResult::test_small_result_carries_every_row_like_query_does
+  - tests/test_show.py::TestShowResult::test_large_result_carries_a_head
+  note: >
+    Reuses _full_sample_fits rather than re-deriving a threshold, so the two tools cannot drift
+    apart. This is what makes a text-only host degrade gracefully with no negotiation branch:
+    the summary alone is enough to report the result.
+
+- id: SHOW-006
+  claim: >
+    Without the optional [ui] extra, `show` is not registered at all — rather than present and
+    always failing.
+  source: CLAUDE.md#tool-surface
+  mode: behavioral
+  falsifier: >
+    A lean install advertises `show`, or a [ui] install omits it, or the rest of the tool
+    surface changes with the extra.
+  status: verified
+  covered_by:
+  - tests/test_show.py::TestRegistration::test_absent_extra_means_no_show_tool
+  - tests/test_cli.py::TestStdioTransport::test_registered_surface_is_exactly_the_documented_one
+  note: >
+    The CLI test folds `show` into DOCUMENTED_TOOLS conditionally on the same flag the server
+    registers by, so set equality stays meaningful in BOTH installs.
+
+- id: SHOW-007
+  claim: >
+    The tool carries _meta.ui.resourceUri pointing at a readable ui:// renderer resource, which
+    is what makes a host render it as an MCP App.
+  source: CLAUDE.md#tool-surface
+  mode: invariant
+  falsifier: The registered tool has no ui metadata, or the URI it names cannot be read.
+  status: verified
+  covered_by:
+  - tests/test_show.py::TestRegistration::test_show_is_registered_with_ui_metadata
+  - tests/test_show.py::TestRegistration::test_renderer_resource_is_readable
+  note: >
+    Spelunk registers and serves the resource itself (views.RENDERER_URI); the tool's meta
+    carries only the resourceUri pointing at it, rather than the per-tool renderer FastMCP would
+    synthesize — see SHOW-014. The renderer HTML loads its JS/CSS from cdn.jsdelivr.net at the
+    pinned prefab-ui version, and declares that origin in the resource's own CSP — so rendering
+    needs client-side network access, and an air-gapped host will show the text half only.
+
+- id: SHOW-008
+  claim: >
+    Chart axes default to the first label column and the first numeric column, and any column
+    the caller names must exist — a chart is never silently plotted against the wrong column.
+  source: server.py#show
+  mode: behavioral
+  falsifier: >
+    An unknown column name is accepted and quietly ignored, or a result with no numeric column
+    produces an empty chart instead of an error.
+  status: verified
+  covered_by:
+  - tests/test_show.py::TestViewBuilders::test_default_axes_pick_label_and_first_numeric
+  - tests/test_show.py::TestViewBuilders::test_explicit_series_wins_over_y
+  - tests/test_show.py::TestViewBuilders::test_unknown_axis_column_errors_naming_the_real_ones
+  - tests/test_show.py::TestViewBuilders::test_all_numeric_result_still_charts
+  - tests/test_show.py::TestViewBuilders::test_no_numeric_column_errors_with_a_way_out
+  - tests/test_show.py::TestShowResult::test_chart_reports_the_columns_it_plotted
+  - tests/test_show.py::TestShowResult::test_explicit_multi_series
+  - tests/test_show.py::TestShowErrors::test_pie_refuses_several_measures_instead_of_dropping_them
+  - tests/test_show.py::TestShowErrors::test_interactive_pie_still_takes_several_measures
+  - tests/test_show.py::TestShowErrors::test_a_name_that_is_not_an_identifier_is_rejected
+  - tests/test_show.py::TestShowErrors::test_a_flow_that_is_not_an_identifier_is_rejected
+  note: >
+    The reply reports the columns actually plotted (x, series), so the agent can tell whether
+    the default pick was the one it wanted without inspecting the payload. That reporting is
+    also why a non-interactive pie REFUSES several measures rather than drawing the first: it
+    would draw one and report all of them, the same silent misstatement SHOW-002's caps exist
+    to prevent. An INTERACTIVE pie still takes several, because a picker shows one at a time
+    and the summary says which (SHOW-013). Result and flow names are validated on every kind,
+    `profile` included — it is the one display path that builds its own SQL, so skipping the
+    check there would turn a clear "invalid result name" into a DuckDB parse error.
+
+- id: SHOW-009
+  claim: >
+    A titled view keeps both the heading AND the component — Prefab attaches a component to
+    whichever container is open at CONSTRUCTION time, so building one outside its context drops
+    it from the payload silently.
+  source: views.py#_titled
+  mode: invariant
+  falsifier: A titled table or chart renders as a heading with nothing underneath it.
+  status: verified
+  covered_by:
+  - tests/test_show.py::TestViewBuilders::test_title_wraps_the_component_without_dropping_it
+  - tests/test_show.py::TestViewBuilders::test_titled_chart_keeps_both_parts
+  note: >
+    Found by probing the real API, not by reading the docs: the first implementation built the
+    component then named it inside the `with` block, which registers nothing and raises nothing.
+    The regression is invisible without asserting on payload contents, hence these tests.
+
+- id: SHOW-010
+  claim: >
+    `show` renders four Spelunk surfaces beyond a saved result's rows — a profile dashboard, the
+    catalog, and a lineage DAG as a real diagram — without changing those tools' own output.
+  source: CLAUDE.md#tool-surface
+  mode: behavioral
+  falsifier: >
+    A kind fails to render, or `profile`/`catalog`/`lineage` themselves start returning UI
+    payloads instead of the data an agent reads.
+  status: verified
+  covered_by:
+  - tests/test_show.py::TestShowResult::test_the_other_surfaces_render
+  - tests/test_show.py::TestShowResult::test_lineage_shows_the_diagram
+  - tests/test_show.py::TestShowResult::test_catalog_without_flow_lists_flows
+  - tests/test_show.py::TestShowResult::test_catalog_with_flow_lists_its_results
+  - tests/test_show.py::TestViewBuilders::test_profile_splits_numeric_and_text_columns
+  - tests/test_show.py::TestViewBuilders::test_catalog_flow_list_and_single_flow_both_render
+  - tests/test_show.py::TestViewBuilders::test_lineage_view_renders_the_diagram
+  note: >
+    The lineage diagram reuses the Mermaid string DuckSession._to_mermaid already produces, so
+    the graph stays server-side and deterministic and the renderer only displays it. One display
+    verb rather than four app tools is what keeps the data tools' contracts untouched.
+
+- id: SHOW-011
+  claim: >
+    A `show` call logs one JSON line summarising the view — not the Prefab component tree.
+  source: CLAUDE.md#tool-call-logging
+  mode: behavioral
+  falsifier: The tool log contains rendered markup, or omits `show` calls entirely.
+  status: verified
+  covered_by:
+  - tests/test_show.py::TestShowLogging::test_one_json_line_summarising_the_view
+  note: >
+    _summarize_result unwraps the ToolResult and logs its text half, so `show` lines are the
+    same shape as every other tool's and the log stays queryable by Spelunk itself.
+
+- id: SHOW-014
+  claim: >
+    `show` serves Spelunk's OWN renderer resource — Prefab's page plus a baked-in bootstrap view
+    and a recovery shim — rather than the per-tool renderer FastMCP would synthesize, and
+    declares the Prefab CDN in its own CSP.
+  source: CLAUDE.md#tool-surface
+  mode: invariant
+  falsifier: >
+    The tool points at ui://prefab/tool/<hash>/renderer.html; or the served page is missing the
+    bootstrap view or the shim; or the CSP is absent from the RESOURCE, so a strict host blocks
+    the renderer bundle and the app frame stays blank.
+  status: verified
+  covered_by:
+  - tests/test_show.py::TestRendererResource::test_show_points_at_spelunks_renderer
+  - tests/test_show.py::TestRendererResource::test_the_RESOURCE_declares_the_prefab_cdn_in_its_csp
+  - tests/test_show.py::TestRendererResource::test_renderer_carries_a_bootstrap_view
+  - tests/test_show.py::TestRendererResource::test_static_fallback_survives_a_blocked_bundle
+  - tests/test_show.py::TestRendererResource::test_renderer_is_still_prefabs_own_page
+  note: >
+    The CSP goes on the RESOURCE, not the tool — that is where the host reads it, and it is what
+    FastMCP's own synthesized renderer does (the tool carries only resourceUri). Declaring it on
+    the tool instead produced a resource with no policy at all: the host blocked the bundle and
+    the app frame rendered completely blank, with nothing in the server to indicate a problem.
+    Observed in Claude Desktop, and the first version of this test asserted the TOOL's csp, so it
+    passed while checking the wrong layer. The test now reads the resource. The page also carries
+    a plain-HTML fallback inside #root, so this failure mode can never again be a silent black
+    box — a blocked bundle now says so on screen.
+
+- id: SHOW-015
+  claim: >
+    A host that strips `structuredContent` from the tool-result it forwards (Claude Desktop,
+    modelcontextprotocol/ext-apps#696) still renders: the view captures the call's arguments from
+    the intact `tool-input` notification and re-fetches through the host's `tools/call` proxy,
+    which is unaffected. The recovery is a no-op wherever the field arrives intact.
+  source: views.py#_RECOVERY_SHIM
+  mode: behavioral
+  falsifier: >
+    The shim fires on a healthy host (double-calling every `show`), it cannot re-deliver the
+    recovered payload because Prefab's transport rejects the message it hands over, or it accepts
+    a recovery response from a frame other than the host.
+  status: partial
+  covered_by:
+  - tests/test_show.py::TestRecoveryShimBehaviour::test_healthy_host_triggers_nothing
+  - tests/test_show.py::TestRecoveryShimBehaviour::test_error_result_is_left_alone
+  - tests/test_show.py::TestRecoveryShimBehaviour::test_stripped_result_refetches_with_the_captured_args
+  - tests/test_show.py::TestRecoveryShimBehaviour::test_recovered_payload_reaches_the_renderer
+  - tests/test_show.py::TestRecoveryShimBehaviour::test_recovery_runs_at_most_once
+  - tests/test_show.py::TestRecoveryShimBehaviour::test_a_response_from_another_frame_is_ignored
+  - tests/test_show.py::TestRendererResource::test_recovery_shim_refetches_through_the_host_proxy
+  - tests/test_show.py::TestRendererResource::test_recovery_is_a_no_op_on_a_healthy_host
+  - tests/test_show.py::TestRendererResource::test_shim_runs_before_the_renderer_registers_its_listener
+  - tests/test_show.py::TestShowIsAView::test_creates_no_result
+  gap: >
+    The shim is EXECUTED, not merely inspected: the tests extract the JavaScript from the page
+    Spelunk actually serves, run it in node under stubbed browser globals, and deliver into a
+    stand-in transport that applies Prefab's real guard (`event.source !== window.parent`). That
+    covers the no-op on a healthy host, the refusal to re-run an errored call, the re-fetch
+    carrying the args captured from tool-input, the recovered payload arriving at the renderer,
+    the once-only guard, and the refusal of a recovery response from any frame that is not the
+    host.
+
+    Delivery deliberately does NOT depend on browser-native behaviour: rather than constructing a
+    MessageEvent and trusting dispatchEvent to preserve `source`, the shim captures Prefab's
+    listener (by wrapping addEventListener before the deferred renderer module runs) and calls it
+    directly with a plain object. Prefab reads only `source` and `data`, so this is exactly what
+    it would have received. The same `source === window.parent` identity check Prefab applies to
+    what it accepts, the shim applies to the recovery response it accepts — the request id is a
+    fixed string, so without it any frame able to postMessage into the view could supply the
+    payload the renderer draws.
+
+    CONFIRMED END TO END on 2026-07-31: `show` renders in Claude Desktop 1.24012.9 (Windows) with
+    this shim in place — the host answers the app-initiated `tools/call` with structuredContent
+    intact and Prefab paints the recovered view. That is a manual observation, not a test, which
+    is why this claim stays `partial` rather than `verified`: nothing in the suite would fail if
+    the behaviour regressed in a future host or prefab-ui build. Closing it needs a
+    headless-browser harness driving the real page.
+
+    Re-calling is sound ONLY because `show` is idempotent (SHOW-001); a tool with side effects
+    must never use this.
+
+- id: SHOW-016
+  claim: >
+    `show` declares an outputSchema describing the Prefab envelope, and every payload it returns
+    validates against it.
+  source: views.py#SHOW_OUTPUT_SCHEMA
+  mode: invariant
+  falsifier: A `show` payload violates the schema the tool advertises.
+  status: verified
+  covered_by:
+  - tests/test_show.py::TestOutputSchema::test_show_declares_one
+  - tests/test_show.py::TestOutputSchema::test_every_payload_validates_against_it
+  note: >
+    MCP Apps guidance is to declare a schema whenever a tool returns structured content; FastMCP
+    suppresses the one it would infer for app tools, so this is stated explicitly. It does NOT
+    work around ext-apps#696 — that was tested both ways upstream — it is simply correct. The
+    validation test sweeps every kind, because a declared schema the payload violates is worse
+    than no schema at all: clients reject the result outright.
+
+- id: SHOW-013
+  claim: >
+    `interactive=true` on a multi-measure chart adds a picker that switches measures entirely
+    client-side — no tool call, no round trip, no new result — and the rows are carried once in
+    app state rather than copied per measure.
+  source: CLAUDE.md#tool-surface
+  mode: behavioral
+  falsifier: >
+    Switching measures issues a tool call; or the payload embeds one full copy of the rows per
+    measure; or a single-measure chart still renders a one-option picker.
+  status: verified
+  covered_by:
+  - tests/test_show.py::TestViewBuilders::test_interactive_chart_adds_a_picker_and_one_branch_per_measure
+  - tests/test_show.py::TestViewBuilders::test_interactive_chart_holds_the_rows_once_in_state
+  - tests/test_show.py::TestViewBuilders::test_interactive_with_one_measure_falls_back_to_a_plain_chart
+  - tests/test_show.py::TestShowResult::test_interactive_chart_reports_what_is_on_screen
+  - tests/test_show.py::TestShowResult::test_interactive_is_off_by_default
+  note: >
+    Prefab compiles the picker to a `Condition` node with a template predicate, so the swap
+    happens in the renderer. Off by default: it multiplies the number of chart nodes, and the
+    summary has to say `showing` because only one measure is on screen at a time — a summary
+    listing all of them would misdescribe what the user sees.
+
+- id: SHOW-012
+  claim: >
+    Handed a result whose shape is the point, an agent shows a chart rather than dumping rows —
+    and aggregates first instead of hitting the cap.
+  source: server.py#instructions
+  mode: affordance
+  falsifier: >
+    Agents either never call `show`, or call it on raw un-aggregated results and get the cap
+    error, then fall back to pasting JSON.
+  status: unverified
+  covered_by: []
+  gap: >
+    SHOW-002/003 prove the cap FIRES; this claims the instruction changes what an agent does
+    with it. Needs the agent harness with a no-`show` ablation arm: measure how often a
+    shape-shaped question ends in a rendered view versus a wall of rows, and how often the first
+    `show` call errors on size. A high first-call error rate would say the "aggregate first"
+    wording is not landing, which is a docs bug, not a code one.

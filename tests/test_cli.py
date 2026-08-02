@@ -29,7 +29,15 @@ from pathlib import Path
 
 import pytest
 
+from spelunk.mcp import views
+
 DOCUMENTED_TOOLS = {"query", "profile", "export", "catalog", "drop", "lineage", "replay"}
+# `show` is registered only when the optional [ui] extra (prefab-ui) is installed. Fold it in
+# conditionally rather than dropping the set-equality assertion: in a [ui] install a MISSING
+# `show` must still fail here, and in a lean install an unexpected `show` must too. The
+# subprocess under test runs the same interpreter, so this import sees the same answer it will.
+if views.PREFAB_AVAILABLE:
+    DOCUMENTED_TOOLS |= {"show"}
 GATED_TOOLS = {"add_source", "remove_source", "fetch"}
 
 STARTUP_TIMEOUT = 90.0  # cold DuckDB + extension load on Windows CI is not fast
