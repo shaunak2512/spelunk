@@ -22,6 +22,8 @@ Parquet file to a Postgres table to a result built two steps ago — all in Duck
 uv sync --extra dev                                   # install (dev pulls in prefab-ui, so
                                                       #   tests/test_show.py runs, not skips)
 uv sync --extra ui                                    # runtime install WITH the `show` tool
+uv sync --extra code-mode                             # adds the Monty sandbox for --code-mode
+                                                      #   (EXPERIMENTAL; dev pulls it in too)
 uv run --extra dev python -m pytest -q                # all tests
 .\.venv\Scripts\python.exe -m pytest tests\test_duck.py -q   # one file
 uv run --extra dev ruff check spelunk/                # lint
@@ -139,7 +141,8 @@ spelunk/core/
 spelunk/mcp/
   server.py      # FastMCP wrapper: build_server(session) registers 7 tools + 2 resources
                  #   (+3 behind --allow-add-source: add_source/remove_source/fetch; +`show`
-                 #   when the [ui] extra is installed);
+                 #   when the [ui] extra is installed). --code-mode swaps that whole surface for
+                 #   FastMCP's CodeMode meta-tools (EXPERIMENTAL — see "Running the server");
                  #   main() parses --source specs and serves over stdio (default) or
                  #   streamable HTTP (--transport http, 127.0.0.1:8080/mcp — with an
                  #   Origin/Host guard against DNS rebinding)
@@ -336,6 +339,45 @@ getting its own flag: agent-initiated network reach is one capability an operato
 `fetch` is additionally confined to its connection's host + base path (absolute URLs, `..`, and
 traversal through a bound `{placeholder}` are all refused), so it reaches strictly *less* than
 `add_source` already does.
+
+**`--code-mode` (off by default, EXPERIMENTAL — branch `feature/code-mode-test`):** applies
+FastMCP's `CodeMode` transform. The client then sees **only** `search` / `get_schema` / `execute`;
+Spelunk's tools stay registered but are reachable only from inside `execute`, as
+`await call_tool(name, params)` in a Monty sandbox. Needs the `code-mode` extra
+(`uv sync --extra code-mode`), which pulls `pydantic-monty` through fastmcp's own pin.
+
+What it buys, and what it doesn't:
+
+- **Not the token argument.** CodeMode's headline win is not shipping a huge catalog up front.
+  Spelunk has ~10 tools, so discovery here costs more turns than it saves tokens. That's why the
+  transform is configured **two-stage** (`Search(default_detail="detailed")`, plus `GetSchemas`
+  for a full schema) rather than the three-stage default — the agent gets parameters inline and
+  can write the call from the search result alone.
+- **The real win is conditional control flow.** `query(steps=[...])` already batches
+  straight-line chains with fail-fast and lineage; what it cannot express is a *branch or loop on
+  a value read from an earlier step*. That is the only genuinely new capability, and it's the
+  thing an ablation should measure (CODE-008 — unverified, needs the agent harness).
+- **A sandbox call is a full tool call.** It materializes, records lineage, and passes through
+  `@_logged` — code mode changes how tools are *addressed*, not what they do. The tool log matters
+  more here than anywhere else: the agent's transcript shows one opaque `execute`, so the JSONL is
+  the only record of the N calls inside it.
+- **`show` is suppressed.** `call_tool` unwraps a `ToolResult` to its `structured_content`
+  (`code_mode.py::_unwrap_tool_result`), and for `show` that field *is* the Prefab payload — the
+  agent would get the render payload as a plain sandbox value and the human would see nothing,
+  since `execute`'s own result is what the host displays and it is not an app tool. Exactly the
+  inversion the "never return a bare Prefab component" rule exists to prevent, so the honest
+  surface is no `show` at all. The `ui://` renderer resource goes with it.
+- **Failure is moved to startup.** `MontySandboxProvider` imports `pydantic_monty` lazily inside
+  `run()`, so a sandbox-less server would start clean, collapse its own tool surface, and die on
+  the agent's first `execute` with no fallback left. `build_server` checks up front, and `main()`
+  pre-checks before opening the `DuckSession` — a missing sandbox is an argparse error (exit 2),
+  not a workspace dir plus a traceback.
+- **Write code against `sample` positionally.** A sample row is a list of values, not a keyed
+  object; names live in `columns`. Unchanged behaviour, but code mode is the first surface where
+  the model writes code against that shape instead of reading it.
+
+Pinned by `evals/claims/code-mode.yaml` (CODE-001..009), kept separate from `surface.yaml` so the
+experiment can't quietly relax MCP-001's set-equality guard on the shipped surface.
 
 **Per-process workspace (the default):** `--session-dir` is a *root* (default `./.spelunk_session`,
 created if missing, gitignored) and **each server process gets its own durable workspace** at

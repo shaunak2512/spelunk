@@ -395,12 +395,56 @@ def _dispatch_show(
     )
 
 
+_CODE_MODE_NO_SANDBOX = (
+    "--code-mode needs the Monty sandbox (pydantic-monty), which is not installed. "
+    "Install it with: uv sync --extra code-mode"
+)
+
+
+def _code_mode_sandbox_available() -> bool:
+    """Is the sandbox runtime importable? Checked before a server commits to code mode."""
+    try:
+        import pydantic_monty  # noqa: F401
+    except ModuleNotFoundError:
+        return False
+    return True
+
+
+def _code_mode_transform():
+    """Build the EXPERIMENTAL FastMCP ``CodeMode`` transform (branch feature/code-mode-test).
+
+    CodeMode replaces the entire tool catalog with meta-tools — ``search`` / ``get_schema`` to
+    discover, and ``execute`` to run agent-written Python whose only capability is
+    ``await call_tool(name, params)``. Spelunk's tools are unchanged; they become reachable only
+    from inside that sandbox.
+
+    Two deliberate choices:
+
+    * **Two-stage discovery** (``Search(default_detail="detailed")``), not the three-stage
+      default. CodeMode's headline win is not paying for a huge catalog up front, and Spelunk has
+      ~10 tools — a brief-then-``get_schema`` round trip would cost more turns than it saves
+      tokens. ``get_schema`` is still registered for the full JSON schema of a single tool.
+    * **The sandbox is imported here, at build time.** ``MontySandboxProvider`` resolves
+      ``pydantic_monty`` lazily inside ``run()``, so a server missing it starts perfectly and then
+      raises ImportError on the agent's first ``execute`` — a failure mid-conversation, with the
+      tool surface already collapsed and no non-code-mode path left to fall back to. Failing at
+      startup instead turns that into a config error the operator sees immediately.
+    """
+    if not _code_mode_sandbox_available():
+        raise RuntimeError(_CODE_MODE_NO_SANDBOX)
+
+    from fastmcp.experimental.transforms.code_mode import CodeMode, GetSchemas, Search
+
+    return CodeMode(discovery_tools=[Search(default_detail="detailed"), GetSchemas()])
+
+
 def build_server(
     session: DuckSession,
     tool_log: str | None = None,
     *,
     allow_add_source: bool = False,
     require_descriptions: bool = False,
+    code_mode: bool = False,
 ) -> FastMCP:
     """Build a FastMCP instance wired to an open :class:`DuckSession`.
 
@@ -418,14 +462,31 @@ def build_server(
     the ``query`` tool exposes a required one-line ``description`` on every single query and every
     batch step (stored in lineage, surfaced by ``lineage`` / ``catalog``); when off, the parameter
     is absent from the tool schema entirely.
+
+    ``code_mode`` (off by default, EXPERIMENTAL) applies FastMCP's ``CodeMode`` transform: clients
+    then see only ``search`` / ``get_schema`` / ``execute`` instead of Spelunk's tools, and reach
+    the real tools by writing Python that calls ``await call_tool(...)``. See
+    :func:`_code_mode_transform`. It also suppresses ``show`` — see the registration site.
     """
     _configure_tool_logging(tool_log)
 
     source_list = ", ".join(f"{s.name} ({s.kind})" for s in session.sources) or "(none configured)"
 
+    # `show` is deliberately NOT registered under code mode. CodeMode reaches tools through
+    # `call_tool`, which unwraps a ToolResult by returning `structured_content` when it is present
+    # (fastmcp/experimental/transforms/code_mode.py::_unwrap_tool_result) — and for `show` that
+    # field IS the Prefab render payload. The agent would receive the payload as an ordinary
+    # sandbox value and the human would see nothing: the render never reaches the host, because
+    # `execute`'s own result is what the host displays, and it is not an app tool. That is exactly
+    # the inversion the "never return a bare Prefab component" rule exists to prevent, so the
+    # honest surface under code mode is no `show` at all rather than one that silently renders
+    # nowhere. The renderer resource goes with it — it exists only to back `show`.
+    show_enabled = views.PREFAB_AVAILABLE and not code_mode
+
     mcp = FastMCP(
         "spelunk",
         version=__version__,
+        transforms=[_code_mode_transform()] if code_mode else [],
         instructions=(
             "Spelunk is a single DuckDB engine over all your data sources. Files (CSV/Parquet/"
             "JSON/Excel) and attached databases (SQLite/PostgreSQL/MySQL) live in one DuckDB "
@@ -481,7 +542,7 @@ def build_server(
                 "- Use it when a shape, comparison or trend is the point — a chart of 12 monthly "
                 "totals says more than 12 rows of JSON. Keep reading results from `query`; "
                 "`show` is for the human.\n"
-                if views.PREFAB_AVAILABLE
+                if show_enabled
                 else ""
             )
             + (
@@ -672,7 +733,7 @@ def build_server(
     ) -> dict:
         return session.lineage(name, flow, render, path)
 
-    if views.PREFAB_AVAILABLE:
+    if show_enabled:
         # Spelunk serves its OWN renderer resource rather than the per-tool one FastMCP would
         # synthesize, so the ext-apps#696 recovery shim travels with the view. Identical to
         # Prefab's page otherwise — it is built from prefab-ui's own HTML.
@@ -1062,6 +1123,18 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--code-mode",
+        action="store_true",
+        help=(
+            "EXPERIMENTAL. Collapse the tool surface into FastMCP's CodeMode meta-tools: the "
+            "client sees only search / get_schema / execute, and reaches Spelunk's tools by "
+            "writing Python that calls await call_tool(name, params) in a sandbox. Lets an agent "
+            "branch and loop across tool calls in ONE round trip, which query(steps=[...]) "
+            "cannot express. Suppresses `show` (its render payload cannot reach the host through "
+            "a sandbox return value). Needs the code-mode extra. Off by default."
+        ),
+    )
+    parser.add_argument(
         "--require-descriptions",
         action="store_true",
         help=(
@@ -1143,6 +1216,12 @@ def main() -> None:
         # URL would silently read `...:8080mcp` — a broken address the user would copy.
         parser.error(f"--http-path must start with '/': got {args.http_path!r}")
 
+    if args.code_mode and not _code_mode_sandbox_available():
+        # Checked here, before the DuckSession is opened, so a missing sandbox costs the operator
+        # an argparse error rather than a workspace dir and a traceback from a server that was
+        # never going to answer `initialize`.
+        parser.error(_CODE_MODE_NO_SANDBOX)
+
     if args.transport == "http" and args.allow_add_source:
         # Worth saying out loud: --allow-add-source is documented as sound *because* of the
         # process-per-agent model — each agent's stdio server is its own process, so an
@@ -1188,6 +1267,7 @@ def main() -> None:
         tool_log=tool_log,
         allow_add_source=args.allow_add_source,
         require_descriptions=args.require_descriptions,
+        code_mode=args.code_mode,
     )
     try:
         if args.transport == "http":

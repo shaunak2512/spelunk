@@ -1,0 +1,151 @@
+area: >
+  EXPERIMENTAL --code-mode (branch feature/code-mode-test) — FastMCP's CodeMode transform, which
+  replaces the whole tool catalog with search / get_schema / execute meta-tools and reaches the
+  real tools only from inside a sandbox via `await call_tool(name, params)`.
+
+  These claims are deliberately separate from surface.yaml: MCP-001 pins the DEFAULT surface as
+  set equality, and code mode is the one configuration that legitimately breaks it. Keeping them
+  apart means the experiment cannot quietly relax the claim that guards the shipped surface.
+prefix: CODE
+claims:
+
+- id: CODE-001
+  claim: >
+    --code-mode collapses the client-visible tool surface to exactly search / get_schema /
+    execute; without the flag the documented surface is untouched.
+  source: CLAUDE.md#code-mode
+  mode: behavioral
+  falsifier: A Spelunk tool is directly callable under the flag, or the flag changes the default surface.
+  status: verified
+  covered_by:
+  - tests/test_code_mode.py::test_code_mode_collapses_the_tool_surface
+  - tests/test_code_mode.py::test_default_surface_is_untouched
+  - tests/test_code_mode.py::test_gated_tools_are_collapsed_too
+  - tests/test_cli.py::TestSourceArguments::test_code_mode_collapses_the_surface_over_the_transport
+  note: >
+    The CLI test is the one that covers the argparse -> build_server plumbing; the in-process
+    tests construct the server directly and would pass even if the flag were never wired.
+
+- id: CODE-002
+  claim: >
+    `show` is NOT registered under code mode, because call_tool unwraps a ToolResult to its
+    structured_content — which for `show` IS the Prefab render payload, so the agent would
+    receive the payload and the human would see no render at all.
+  source: CLAUDE.md#code-mode
+  mode: invariant
+  falsifier: "`show` appears in the code-mode tool catalog, or is reachable from inside execute."
+  status: partial
+  covered_by:
+  - tests/test_code_mode.py::test_show_is_suppressed_under_code_mode
+  gap: >
+    The test pins non-registration, which is what makes `show` unreachable from the sandbox too
+    (call_tool resolves against the same catalog). Not directly asserted: that a hypothetical
+    app-tool result CANNOT render when returned through execute. That is a property of the host,
+    not of Spelunk, so it is unfalsifiable here without a UI host in the loop.
+
+- id: CODE-003
+  claim: >
+    A tool called from inside the sandbox is the SAME tool: it materializes into the flow and
+    records lineage, so code mode changes how tools are reached, not what they do.
+  source: CLAUDE.md#code-mode
+  mode: invariant
+  falsifier: A sandbox-issued query leaves no table, or no lineage row, or loses a dependency edge.
+  status: verified
+  covered_by:
+  - tests/test_code_mode.py::test_sandbox_results_are_real_results_with_lineage
+  note: >
+    This is the claim that makes code mode an addressing change rather than a second, weaker path
+    into the engine. If it ever fails, replay silently stops covering sandbox-built results.
+
+- id: CODE-004
+  claim: >
+    Per-call tool logging (and its DSN masking) survives code mode: each call_tool invocation
+    from the sandbox still passes through the @_logged decorator.
+  source: CLAUDE.md#code-mode
+  mode: behavioral
+  falsifier: An execute block issues N tool calls and the tool log records none of them.
+  status: verified
+  covered_by:
+  - tests/test_code_mode.py::test_tool_calls_from_the_sandbox_are_logged
+  note: >
+    Load-bearing for observability specifically UNDER code mode: the agent's own transcript shows
+    one opaque `execute`, so the tool log becomes the only record of what actually ran.
+
+- id: CODE-005
+  claim: >
+    A missing sandbox runtime (pydantic-monty) fails at startup, not at the agent's first
+    execute call.
+  source: CLAUDE.md#code-mode
+  mode: behavioral
+  falsifier: A sandbox-less server starts, collapses its surface, and raises only when execute is called.
+  status: verified
+  covered_by:
+  - tests/test_code_mode.py::test_missing_sandbox_fails_at_build_not_at_first_execute
+  - tests/test_code_mode.py::test_missing_sandbox_does_not_affect_the_default_server
+  note: >
+    MontySandboxProvider imports pydantic_monty lazily inside run(), so the natural failure is
+    mid-conversation with the tool surface already collapsed and no fallback path left. main()
+    additionally pre-checks before opening the DuckSession, so the operator gets an argparse
+    error (exit 2) rather than a workspace dir and a traceback.
+
+- id: CODE-006
+  claim: >
+    CodeMode caps call_tool invocations per execute (default 50) and the cap surfaces as a failed
+    call, not a truncated success.
+  source: CLAUDE.md#code-mode
+  mode: quantitative
+  falsifier: A 60-call loop returns a partial result the agent would read as complete.
+  status: verified
+  covered_by:
+  - tests/test_code_mode.py::test_tool_call_budget_is_enforced
+
+- id: CODE-007
+  claim: >
+    execute can branch and loop on values read from an earlier tool call within one round trip —
+    the capability query(steps=[...]) cannot express.
+  source: CLAUDE.md#code-mode
+  mode: behavioral
+  falsifier: A data-dependent branch inside execute cannot see the first call's result.
+  status: verified
+  covered_by:
+  - tests/test_code_mode.py::test_execute_chains_tool_calls_in_one_round_trip
+  - tests/test_code_mode.py::test_execute_can_branch_on_intermediate_results
+  note: >
+    This is the whole reason the experiment is worth running. Batch mode already covers
+    straight-line chains with fail-fast and lineage, so conditional control flow is the only
+    genuinely new capability code mode offers Spelunk.
+
+- id: CODE-008
+  claim: >
+    Code mode is a net win for an agent driving Spelunk — fewer round trips and fewer wasted
+    tokens than the direct tool surface with query(steps=[...]).
+  source: CLAUDE.md#code-mode
+  mode: affordance
+  falsifier: >
+    Agents on the code-mode arm take MORE turns, or produce worse answers, than on the direct
+    arm — e.g. by burning turns on discovery for a ~10-tool catalog, or by writing sandbox code
+    that hand-rolls what one SQL statement already does.
+  status: unverified
+  covered_by: []
+  gap: >
+    Needs the agent harness with an ablation arm (the same argument as affordance.yaml): same
+    task suite, one arm per surface, comparing turns-to-answer and answer quality. Spelunk's
+    catalog is ~10 tools, so the token-saving half of CodeMode's pitch barely applies here and
+    the discovery round trips may cost more than they save — which is precisely why this must be
+    measured rather than assumed. The two-stage discovery config (Search(default_detail=
+    "detailed")) is an attempt to pre-empt that, and is itself part of what the ablation tests.
+
+- id: CODE-009
+  claim: >
+    Under code mode an agent must zip `columns` with `sample` itself — a sample row is a list of
+    values, not a keyed object.
+  source: tests/test_code_mode.py
+  mode: invariant
+  falsifier: A sample row is a dict, or column order stops matching `columns`.
+  status: verified
+  covered_by:
+  - tests/test_code_mode.py::test_execute_chains_tool_calls_in_one_round_trip
+  note: >
+    Not new behaviour — this is `query`'s existing return shape. It is recorded HERE because code
+    mode is the first surface where the model writes code against that shape instead of reading
+    it, so positional access becomes a correctness concern rather than a display detail.

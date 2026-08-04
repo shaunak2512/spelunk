@@ -281,6 +281,28 @@ class TestSourceArguments:
         finally:
             client.close()
 
+    @pytest.mark.skipif(
+        importlib.util.find_spec("pydantic_monty") is None,
+        reason="needs the code-mode extra (pydantic-monty)",
+    )
+    def test_code_mode_collapses_the_surface_over_the_transport(self, tmp_path, sqlite_file):
+        """EXPERIMENTAL --code-mode, through the real startup path.
+
+        tests/test_code_mode.py covers the transform in-process; this asserts the CLI actually
+        plumbs the flag to build_server — the wiring the in-process tests skip past entirely.
+        """
+        client = StdioClient(
+            ["--source", f"shop={sqlite_file}",
+             "--session-dir", str(tmp_path / "s"),
+             "--code-mode"],
+            cwd=tmp_path,
+        )
+        try:
+            client.initialize()
+            assert _tool_names(client) == {"search", "get_schema", "execute"}
+        finally:
+            client.close()
+
 
 def _free_port() -> int:
     """Bind port 0, read what the OS handed out, release it. Racy in principle; the window is
