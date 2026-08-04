@@ -63,6 +63,40 @@ ROWS = [
     {"region": "AU", "revenue": 120, "orders": 9},
     {"region": "NZ", "revenue": 80, "orders": 4},
 ]
+PROFILE = {
+    "row_count": 1000,
+    "elapsed_s": 0.03,
+    "columns": {
+        "revenue": {"null_rate": 0.01, "min": 1, "max": 99, "mean": 50.0,
+                    "std": 3.0, "p50": 50, "p95": 95},
+        "region": {"null_rate": 0.0, "unique": 4, "top": "AU", "freq": 400},
+    },
+}
+#: A two-step lineage closure, in the shape `DuckSession.lineage(render="mermaid")` returns.
+LINEAGE = {
+    "nodes": [
+        {"flow": "default", "name": "clean", "kind": "query", "description": "tidy the source",
+         "deps": [], "sources": ["sales"]},
+        {"flow": "default", "name": "by_region", "kind": "query", "description": "sum per region",
+         "deps": [{"flow": "default", "name": "clean"}], "sources": []},
+    ],
+    "edges": [{"from": "default.clean", "to": "default.by_region"}],
+    "missing": [],
+    "order": ["default.clean", "default.by_region"],
+    "mermaid": 'flowchart TD\n    n0["clean"] --> n1["by_region"]',
+}
+#: What `lineage()` returns for a flow that has recorded nothing — the no-tab case.
+NO_LINEAGE = {"nodes": [], "edges": [], "missing": [], "order": [], "mermaid": ""}
+
+
+def _tabs(payload):
+    """The (title, value) pairs of the view's tab bar, or [] when there is no tab bar."""
+    return [
+        (tab.get("title"), tab.get("value"))
+        for node in _walk(payload)
+        if node.get("type") == "Tabs"
+        for tab in node["children"]
+    ]
 
 
 @pytest.fixture
@@ -161,16 +195,7 @@ class TestViewBuilders:
         assert "Select" not in types and types.count("BarChart") == 1
 
     def test_profile_splits_numeric_and_text_columns(self):
-        profile = {
-            "row_count": 1000,
-            "elapsed_s": 0.03,
-            "columns": {
-                "revenue": {"null_rate": 0.01, "min": 1, "max": 99, "mean": 50.0,
-                            "std": 3.0, "p50": 50, "p95": 95},
-                "region": {"null_rate": 0.0, "unique": 4, "top": "AU", "freq": 400},
-            },
-        }
-        types = _types(views.to_payload(views.profile_view(profile, "sales")))
+        types = _types(views.to_payload(views.profile_view(PROFILE, "sales")))
         assert types.count("DataTable") == 2  # one numeric table, one text table
         assert types.count("Metric") == 5
 
@@ -182,6 +207,72 @@ class TestViewBuilders:
             "results": [{"name": "r", "row_count": 3, "columns": COLUMNS, "description": None}],
         }))
         assert "DataTable" in _types(one)
+
+    # ------------------------------------------------------------------ the lineage tab --- #
+    @pytest.mark.parametrize(
+        "build,data_label,data_type",
+        [
+            (lambda lin: views.result_table(COLUMNS, ROWS, None, lin), "Table", "DataTable"),
+            (lambda lin: views.result_chart("bar", COLUMNS, ROWS, lineage=lin), "Chart", "BarChart"),
+        ],
+    )
+    def test_result_views_carry_a_lineage_tab(self, build, data_label, data_type):
+        """Both halves must survive in ONE payload.
+
+        This is the attachment trap in its most likely form: a component built outside its `Tab`
+        registers nothing and the tab renders empty, with no error. Asserting only that the tab
+        BAR exists would pass on a payload whose tabs are both blank — so assert the data
+        component and the diagram are each present too.
+        """
+        payload = views.to_payload(build(LINEAGE))
+        types = _types(payload)
+        assert _tabs(payload) == [(data_label, "data"), ("Lineage", "lineage")]
+        assert data_type in types, "the data component vanished from its tab"
+        assert "Mermaid" in types, "the diagram vanished from its tab"
+
+    def test_profile_view_carries_a_lineage_tab(self):
+        payload = views.to_payload(views.profile_view(PROFILE, "sales", LINEAGE))
+        assert _tabs(payload) == [("Profile", "data"), ("Lineage", "lineage")]
+        assert _types(payload).count("DataTable") == 3  # numeric + text + build order
+
+    @pytest.mark.parametrize("lineage", [None, NO_LINEAGE])
+    def test_no_recorded_lineage_means_no_tab_bar(self, lineage):
+        """A result with no provenance renders exactly as it did before the tab existed."""
+        payload = views.to_payload(views.result_chart("bar", COLUMNS, ROWS, lineage=lineage))
+        assert _tabs(payload) == []
+        assert "Tabs" not in _types(payload) and "BarChart" in _types(payload)
+
+    def test_measure_picker_still_works_inside_the_lineage_tab(self):
+        """The two client-side controls nest rather than fight: outer Tabs, inner Condition."""
+        payload = views.to_payload(
+            views.interactive_chart("bar", COLUMNS, ROWS, series=["revenue", "orders"],
+                                    lineage=LINEAGE)
+        )
+        types = _types(payload)
+        assert _tabs(payload) == [("Chart", "data"), ("Lineage", "lineage")]
+        assert "Select" in types and "Condition" in types
+        assert types.count("BarChart") == 2  # one branch per measure, both inside the data tab
+        assert "Mermaid" in types
+        assert payload["state"]["rows"] == ROWS  # rows still carried ONCE
+
+    def test_tab_state_key_is_stable_across_builds(self):
+        """Prefab auto-names stateful components off a counter that increments across calls, so
+        an auto-named Tabs would drift (tabs_1, tabs_2, ...) between successive `show` calls."""
+        names = [
+            [n["name"] for n in _walk(views.to_payload(
+                views.result_chart("bar", COLUMNS, ROWS, lineage=LINEAGE)
+            )) if n.get("type") == "Tabs"]
+            for _ in range(3)
+        ]
+        assert names == [[views.VIEW_TAB_STATE]] * 3
+
+    def test_the_tab_and_the_lineage_kind_render_the_same_body(self):
+        """One lineage look, not two that drift apart — the tab reuses `lineage`'s own body."""
+        standalone = _types(views.to_payload(views.lineage_view(LINEAGE, "default")))
+        tabbed = _types(views.to_payload(views.result_table(COLUMNS, ROWS, None, LINEAGE)))
+        # Everything the standalone view draws below its heading also appears in the tab.
+        for component in ("Metric", "Mermaid", "H4", "DataTable"):
+            assert standalone.count(component) <= tabbed.count(component)
 
     def test_lineage_view_renders_the_diagram(self):
         payload = views.to_payload(views.lineage_view({
@@ -577,6 +668,46 @@ class TestShowResult:
         result = _call(server, {"kind": "lineage"})
         assert "Mermaid" in _types(result.structured_content)
         assert _summary(result)["node_count"] == 1
+
+    @pytest.mark.parametrize("kind", ["table", "bar", "profile"])
+    def test_result_views_report_and_render_their_provenance(self, show_server, kind):
+        """The tab is on screen, so the text half must say so — the model cannot see the payload."""
+        server, _ = show_server
+        result = _call(server, {"name": "by_region", "kind": kind})
+        summary = _summary(result)
+        assert summary["provenance"]["steps"] == ["default.by_region"]
+        assert "Mermaid" in _types(result.structured_content)
+        assert ("Lineage", "lineage") in _tabs(result.structured_content)
+
+    def test_provenance_follows_the_whole_upstream_chain(self, show_server):
+        """Not just the result itself — the closure that built it, in dependency order."""
+        server, session = show_server
+        session.query("SELECT region, revenue * 2 AS doubled FROM by_region", "scaled")
+        summary = _summary(_call(server, {"name": "scaled", "kind": "table"}))
+        assert summary["provenance"]["steps"] == ["default.by_region", "default.scaled"]
+
+    @pytest.mark.parametrize("kind", ["catalog", "lineage"])
+    def test_no_provenance_key_where_there_is_no_tab(self, show_server, kind):
+        """`catalog` has no single result to trace, and `lineage` already IS the DAG."""
+        server, _ = show_server
+        result = _call(server, {"kind": kind})
+        assert "provenance" not in _summary(result)
+        assert _tabs(result.structured_content) == []
+
+    def test_a_result_whose_lineage_row_is_gone_still_renders(self, show_server):
+        """`session.lineage()` RAISES for an unrecorded result; a display path must not die of it.
+
+        Reached by deleting the row rather than mocking, so the test exercises the real
+        `ValueError` that `_provenance` catches.
+        """
+        server, session = show_server
+        session._con.execute("DELETE FROM _spelunk_meta.lineage WHERE name = 'by_region'")
+        result = _call(server, {"name": "by_region", "kind": "bar"})
+        summary = _summary(result)
+        assert "provenance" not in summary
+        assert summary["row_count"] == 3  # the chart itself is unaffected
+        assert "BarChart" in _types(result.structured_content)
+        assert _tabs(result.structured_content) == []
 
     def test_catalog_without_flow_lists_flows(self, show_server):
         server, _ = show_server

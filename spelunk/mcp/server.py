@@ -286,6 +286,35 @@ def _require_existing_flow(session: DuckSession, flow: str) -> str:
     return flow
 
 
+def _provenance(session: DuckSession, name: str, flow: str) -> dict | None:
+    """The lineage closure that built *name*, for the view's Lineage tab — or ``None``.
+
+    Read-only, and it reuses the very mermaid string `show(kind='lineage')` already serves, so the
+    graph stays server-side and deterministic rather than being reassembled per view.
+
+    The catch is load-bearing: ``lineage()`` RAISES for a result with no recorded row, and a
+    display path must not die because provenance happens to be missing. Every `query` result
+    records one, so in practice this returns a graph; the fallback is what keeps an edge case
+    (a result whose lineage row was never written) rendering as a plain chart instead of erroring.
+    """
+    try:
+        return session.lineage(name, flow, render="mermaid")
+    except ValueError:
+        return None
+
+
+def _provenance_summary(lineage: dict | None) -> dict:
+    """The text half's account of the Lineage tab — present only when the tab is.
+
+    Same obligation as the interactive picker reporting `showing`: the summary describes what is
+    on screen, so a tab the model cannot see must still be named. Only the step ORDER goes in —
+    the full DAG stays with the `lineage` tool rather than being duplicated into every view.
+    """
+    if not (lineage and lineage.get("nodes")):
+        return {}
+    return {"provenance": {"steps": lineage.get("order", []), "shown_as": "lineage tab"}}
+
+
 def _dispatch_show(
     session: DuckSession,
     *,
@@ -347,12 +376,14 @@ def _dispatch_show(
         # CREATE SCHEMA IF NOT EXISTS is a no-op, so a missing RESULT leaves nothing behind.
         _require_existing_flow(session, resolved)
         profile = session.profile(f'SELECT * FROM "{resolved}"."{name}"', resolved)
-        view = views.profile_view(profile, f"{resolved}.{name}")
+        lineage = _provenance(session, name, resolved)
+        view = views.profile_view(profile, f"{resolved}.{name}", lineage)
         summary.update({
             "flow": resolved, "name": name,
             "row_count": profile.get("row_count", 0),
             "columns": list(profile.get("columns", {})),
             "profile": profile.get("columns", {}),
+            **_provenance_summary(lineage),
         })
 
     else:  # a saved result, as a table or a chart
@@ -363,12 +394,13 @@ def _dispatch_show(
             if max_rows is not None
             else session.rows_for_display(name, resolved)
         )
+        lineage = _provenance(session, name, resolved)
         if kind == "table":
-            view = views.result_table(columns, rows, title)
+            view = views.result_table(columns, rows, title, lineage)
             plotted: dict = {}
         else:
             build = views.interactive_chart if interactive else views.result_chart
-            view = build(kind, columns, rows, x, y, series, title)
+            view = build(kind, columns, rows, x, y, series, title, lineage)
             x_col, measures = views.choose_axes(columns, x, y, series)
             plotted = {"x": x_col, "series": measures}
             # An interactive chart shows ONE measure at a time behind a picker, so say so —
@@ -387,6 +419,7 @@ def _dispatch_show(
             "sample": rows if complete else rows[:_SAMPLE_ROWS],
             "complete": complete,
             **plotted,
+            **_provenance_summary(lineage),
         })
 
     return ToolResult(
@@ -714,6 +747,10 @@ def build_server(
                 "`interactive=true` on a chart with SEVERAL measures (`series=[...]`) adds a "
                 "picker that switches between them in the browser — no extra tool call, and one "
                 "measure is on screen at a time. "
+                "Every view of a named result (table, chart, profile) also carries a **Lineage "
+                "tab** beside the data — the DAG and build order that produced it — so the reader "
+                "can see where the numbers came from without another call. It costs nothing to "
+                "ask for and needs no argument; flipping tabs happens in the browser. "
                 "The reply also carries a text summary (with the rows themselves when the result "
                 "is small), so you can keep reasoning about what you displayed."
             ),
