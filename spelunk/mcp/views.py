@@ -35,6 +35,8 @@ try:  # pragma: no cover - exercised by both installs, only one path per environ
         Row,
         Select,
         SelectOption,
+        Tab,
+        Tabs,
     )
     from prefab_ui.components.charts import (
         AreaChart,
@@ -130,6 +132,11 @@ RENDERER_URI = "ui://spelunk/renderer.html"
 # a host that behaves it never fires. Re-calling is only sound because `show` is read-only and
 # idempotent — it creates no result and records no lineage. Never copy this to a tool with side
 # effects.
+#
+# One visible consequence: recovery re-delivers a FRESH payload, so client-side view state resets
+# to its declared default — the Lineage tab flips back to the data side, the measure picker back
+# to the first measure. Only reachable on a host that is already broken, and only before the user
+# has touched anything, so it is not worth persisting state across the re-call to avoid.
 _RECOVERY_SHIM = """
 <script>
 (function () {
@@ -352,23 +359,126 @@ def _titled(title: str | None, build: Any) -> Any:
     return app
 
 
+#: State key for the data/lineage tab selection, and the two tab values.
+#:
+#: Named explicitly rather than letting Prefab auto-generate it: `_generate_key` counts up in a
+#: ContextVar, so successive `show` calls in one process would produce `tabs_1`, `tabs_2`, ... —
+#: a payload that differs run to run for no reason, and nothing stable to assert on.
+VIEW_TAB_STATE = "spelunk_view"
+_DATA_TAB = "data"
+_LINEAGE_TAB = "lineage"
+
+
+def _composed(
+    title: str | None,
+    data_label: str,
+    build_data: Any,
+    lineage: dict | None = None,
+    state: dict[str, Any] | None = None,
+) -> Any:
+    """The data view, with a **Lineage** tab beside it when there is provenance to show.
+
+    The flip is a Prefab ``Tabs`` — client-side state, no tool call, no round trip — so "a view is
+    not a result" holds while the user is driving it, exactly as the measure picker does.
+
+    ``build_data`` is a callable for the same reason ``_titled`` takes one: a component attaches to
+    whichever container is open at CONSTRUCTION time, so it has to be built *inside* the ``Tab``.
+    Passing an already-built component registers nothing and the tab renders empty — silently.
+
+    With no lineage nodes and no state this degrades to exactly the pre-existing ``_titled`` shape,
+    so a result with no recorded provenance renders as it always did.
+    """
+    tabbed = bool(lineage and lineage.get("nodes"))
+    if not tabbed and state is None:
+        return _titled(title, build_data)
+    with PrefabApp(state=state) as app:
+        with Column(gap=3):
+            if title:
+                H3(title)
+            if not tabbed:
+                build_data()
+            else:
+                with Tabs(name=VIEW_TAB_STATE, value=_DATA_TAB):
+                    with Tab(data_label, value=_DATA_TAB):
+                        build_data()
+                    with Tab("Lineage", value=_LINEAGE_TAB):
+                        _lineage_body(lineage)
+    return app
+
+
 def result_table(
     columns: list[dict[str, str]],
     rows: list[dict[str, Any]],
     title: str | None = None,
+    lineage: dict | None = None,
 ) -> Any:
     """A saved result as a sortable, searchable, paginated table.
 
     Search and pagination are the renderer's own — they run client-side over rows already in the
     payload, so browsing costs no round trip and creates no result.
     """
-    return _titled(title, lambda: DataTable(
+    return _composed(title, "Table", lambda: DataTable(
         columns=[DataTableColumn(key=c["name"], header=c["name"], sortable=True) for c in columns],
         rows=rows,
         search=len(rows) > 10,
         paginated=len(rows) > 25,
         page_size=25,
-    ))
+    ), lineage)
+
+
+def _resolve_chart(
+    kind: str,
+    columns: list[dict[str, str]],
+    x: str | None,
+    y: str | None,
+    series: list[str] | None,
+    *,
+    allow_multi_pie: bool = False,
+) -> tuple[str, list[str]]:
+    """Validate a chart request and resolve it to ``(x, measures)``.
+
+    ``allow_multi_pie`` is for the interactive path: a picker shows one slice-set at a time and the
+    summary says which, so several measures are honest there. A static pie would draw one and
+    report all of them.
+    """
+    if kind not in CHART_KINDS:
+        raise ValueError(f"Unknown chart kind {kind!r}. Choose one of {list(CHART_KINDS)}.")
+    x_col, measures = choose_axes(columns, x, y, series)
+    if kind == "pie" and len(measures) > 1 and not allow_multi_pie:
+        # A pie has one measure by construction — slices of a single whole. Refuse rather than
+        # plot measures[0] and leave the rest off: the summary would report every measure as
+        # displayed, which is the same silent misstatement the row caps exist to prevent.
+        raise ValueError(
+            f"A pie chart shows ONE measure, but {len(measures)} were named: {measures}. "
+            "Pick one (`y='<column>'`), or use kind='bar'/'line' to compare several."
+        )
+    return x_col, measures
+
+
+def _chart_body(kind: str, x_col: str, measures: list[str], data: Any) -> Any:
+    """Construct ONE chart component into the open container.
+
+    ``data`` is either the rows themselves or a state reference like ``"{{ rows }}"`` — the only
+    thing that differs between a static chart and one branch of the interactive picker.
+    """
+    if kind == "pie":
+        return PieChart(data=data, name_key=x_col, data_key=measures[0], height=320)
+    if kind == "scatter":
+        return ScatterChart(
+            data=data,
+            x_axis=x_col,
+            y_axis=measures[0],
+            series=[ChartSeries(data_key=m, label=m) for m in measures],
+            height=320,
+        )
+    component = {"bar": BarChart, "line": LineChart, "area": AreaChart}[kind]
+    return component(
+        data=data,
+        x_axis=x_col,
+        series=[ChartSeries(data_key=m, label=m) for m in measures],
+        height=320,
+        show_legend=len(measures) > 1,
+    )
 
 
 def result_chart(
@@ -379,41 +489,16 @@ def result_chart(
     y: str | None = None,
     series: list[str] | None = None,
     title: str | None = None,
+    lineage: dict | None = None,
 ) -> Any:
     """A saved result as a bar / line / area / scatter / pie chart."""
-    if kind not in CHART_KINDS:
-        raise ValueError(f"Unknown chart kind {kind!r}. Choose one of {list(CHART_KINDS)}.")
-    x_col, measures = choose_axes(columns, x, y, series)
-    if kind == "pie" and len(measures) > 1:
-        # A pie has one measure by construction — slices of a single whole. Refuse rather than
-        # plot measures[0] and leave the rest off: the summary would report every measure as
-        # displayed, which is the same silent misstatement the row caps exist to prevent.
-        raise ValueError(
-            f"A pie chart shows ONE measure, but {len(measures)} were named: {measures}. "
-            "Pick one (`y='<column>'`), or use kind='bar'/'line' to compare several."
-        )
-
-    def build() -> Any:
-        if kind == "pie":
-            return PieChart(data=rows, name_key=x_col, data_key=measures[0], height=320)
-        if kind == "scatter":
-            return ScatterChart(
-                data=rows,
-                x_axis=x_col,
-                y_axis=measures[0],
-                series=[ChartSeries(data_key=m, label=m) for m in measures],
-                height=320,
-            )
-        component = {"bar": BarChart, "line": LineChart, "area": AreaChart}[kind]
-        return component(
-            data=rows,
-            x_axis=x_col,
-            series=[ChartSeries(data_key=m, label=m) for m in measures],
-            height=320,
-            show_legend=len(measures) > 1,
-        )
-
-    return _titled(title, build)
+    x_col, measures = _resolve_chart(kind, columns, x, y, series)
+    return _composed(
+        title,
+        "Chart",
+        lambda: _chart_body(kind, x_col, measures, rows),
+        lineage,
+    )
 
 
 def interactive_chart(
@@ -424,6 +509,7 @@ def interactive_chart(
     y: str | None = None,
     series: list[str] | None = None,
     title: str | None = None,
+    lineage: dict | None = None,
 ) -> Any:
     """A chart with a measure picker — switch which column is plotted, client-side.
 
@@ -435,50 +521,38 @@ def interactive_chart(
     than each chart embedding its own copy: with N measures the naive form multiplies the payload
     by N for no benefit, since all measures already live in the same rows.
     """
-    if kind not in CHART_KINDS:
-        raise ValueError(f"Unknown chart kind {kind!r}. Choose one of {list(CHART_KINDS)}.")
-    x_col, measures = choose_axes(columns, x, y, series)
+    x_col, measures = _resolve_chart(kind, columns, x, y, series, allow_multi_pie=True)
     if len(measures) < 2:
         # Nothing to switch between — a picker with one option is furniture, not a control.
-        return result_chart(kind, columns, rows, x, y, series, title)
+        return result_chart(kind, columns, rows, x, y, series, title, lineage)
 
     picked = Rx("measure").default(measures[0])
 
-    def one(measure: str) -> Any:
-        if kind == "pie":
-            return PieChart(data="{{ rows }}", name_key=x_col, data_key=measure, height=320)
-        if kind == "scatter":
-            return ScatterChart(
-                data="{{ rows }}", x_axis=x_col, y_axis=measure,
-                series=[ChartSeries(data_key=measure, label=measure)], height=320,
-            )
-        component = {"bar": BarChart, "line": LineChart, "area": AreaChart}[kind]
-        return component(
-            data="{{ rows }}", x_axis=x_col,
-            series=[ChartSeries(data_key=measure, label=measure)],
-            height=320, show_legend=False,
-        )
+    def build() -> None:
+        with Select(name="measure"):
+            for measure in measures:
+                SelectOption(value=measure, label=measure)
+        # One branch per measure: If / Elif... / Else, so exactly one chart is ever shown. Each
+        # branch plots ONE measure, hence show_legend=False via the single-element measure list.
+        with If(picked == measures[0]):
+            _chart_body(kind, x_col, [measures[0]], "{{ rows }}")
+        for measure in measures[1:-1]:
+            with Elif(picked == measure):
+                _chart_body(kind, x_col, [measure], "{{ rows }}")
+        with Else():
+            _chart_body(kind, x_col, [measures[-1]], "{{ rows }}")
 
-    with PrefabApp(state={"rows": rows, "measure": measures[0]}) as app:
-        with Column(gap=3):
-            if title:
-                H3(title)
-            with Select(name="measure"):
-                for measure in measures:
-                    SelectOption(value=measure, label=measure)
-            # One branch per measure: If / Elif... / Else, so exactly one chart is ever shown.
-            with If(picked == measures[0]):
-                one(measures[0])
-            for measure in measures[1:-1]:
-                with Elif(picked == measure):
-                    one(measure)
-            with Else():
-                one(measures[-1])
-    return app
+    return _composed(
+        title,
+        "Chart",
+        build,
+        lineage,
+        state={"rows": rows, "measure": measures[0]},
+    )
 
 
 # ----------------------------------------------------------------------------- profile view --- #
-def profile_view(profile: dict, subject: str) -> Any:
+def profile_view(profile: dict, subject: str, lineage: dict | None = None) -> Any:
     """``profile()`` output as a dashboard: headline metrics, then per-column statistics.
 
     Numeric and text columns get separate tables — their statistics genuinely differ, and one
@@ -520,9 +594,8 @@ def profile_view(profile: dict, subject: str) -> Any:
         DataTableColumn(key="freq", header="Count", sortable=True, format="number"),
     ]
 
-    with PrefabApp() as app:
+    def build() -> None:
         with Column(gap=4):
-            H3(f"Profile — {subject}")
             with Row(gap=4):
                 Metric(label="Rows", value=f"{profile.get('row_count', 0):,}")
                 Metric(label="Columns", value=len(stats))
@@ -545,7 +618,8 @@ def profile_view(profile: dict, subject: str) -> Any:
                         rows=[_text_row(c) for c in text_names],
                         search=len(text_names) > 10,
                     )
-    return app
+
+    return _composed(f"Profile — {subject}", "Profile", build, lineage)
 
 
 # ----------------------------------------------------------------------------- catalog view --- #
@@ -605,12 +679,40 @@ def catalog_view(catalog: dict) -> Any:
 
 
 # ----------------------------------------------------------------------------- lineage view --- #
-def lineage_view(lineage: dict, subject: str) -> Any:
-    """``lineage()`` output as a rendered DAG plus the step table underneath.
+def _build_order(lineage: dict) -> list[dict]:
+    """The lineage nodes in dependency-first order — what a table headed "Build order" must show.
 
-    The diagram string is the one ``DuckSession._to_mermaid`` already produces — the same bytes
-    ``lineage(render='mermaid')`` hands back as text. Rendering it is a display concern; the
-    graph itself stays server-side and deterministic.
+    ``lineage()`` returns two orderings and they are not the same one. ``nodes`` is sorted by the
+    recorded ``seq``, and ``_record_lineage`` takes a FRESH ``MAX(seq)+1`` on every upsert — so
+    re-running an upstream step (an ordinary `CREATE OR REPLACE`) lifts it above the dependents
+    that already exist, and the recorded sequence then lists a result BEFORE the thing it reads.
+    ``order`` is the topological sort and stays correct across that. Numbering the rows by
+    ``order`` is also what keeps this table agreeing with the text summary, which reports the
+    same key (see ``server._provenance_summary``).
+
+    Nodes absent from ``order`` are appended in recorded order rather than dropped: a display
+    must not silently lose a step, and the standalone ``lineage`` payload is allowed to carry no
+    ``order`` at all.
+    """
+    nodes = lineage.get("nodes", [])
+    by_ref = {f"{n['flow']}.{n['name']}": n for n in nodes}
+    seen: set[str] = set()
+    ordered: list[dict] = []
+    for ref in lineage.get("order", []):
+        node = by_ref.get(ref)
+        if node is not None and ref not in seen:
+            seen.add(ref)
+            ordered.append(node)
+    ordered.extend(n for n in nodes if f"{n['flow']}.{n['name']}" not in seen)
+    return ordered
+
+
+def _lineage_body(lineage: dict) -> None:
+    """The DAG + build-order table, constructed into the open container.
+
+    Body-only (no ``PrefabApp``, no heading) so the SAME rendering serves both
+    ``show(kind='lineage')`` and the **Lineage** tab beside a chart or table — one lineage look,
+    not two that drift apart.
     """
     nodes = lineage.get("nodes", [])
     edges = lineage.get("edges", [])
@@ -624,32 +726,43 @@ def lineage_view(lineage: dict, subject: str) -> Any:
             "depends_on": ", ".join(f"{d['flow']}.{d['name']}" for d in n.get("deps", [])),
             "sources": ", ".join(n.get("sources", [])),
         }
-        for i, n in enumerate(nodes)
+        for i, n in enumerate(_build_order(lineage))
     ]
+    with Column(gap=4):
+        with Row(gap=4):
+            Metric(label="Steps", value=len(nodes))
+            Metric(label="Edges", value=len(edges))
+            Metric(label="Missing deps", value=len(missing))
+        if lineage.get("mermaid"):
+            Mermaid(chart=lineage["mermaid"])
+        if rows:
+            with Column(gap=2):
+                H4("Build order")
+                DataTable(
+                    columns=[
+                        DataTableColumn(key="step", header="#", sortable=True),
+                        DataTableColumn(key="name", header="Result", sortable=True),
+                        DataTableColumn(key="kind", header="Kind", sortable=True),
+                        DataTableColumn(key="description", header="Description"),
+                        DataTableColumn(key="depends_on", header="Depends on"),
+                        DataTableColumn(key="sources", header="Sources"),
+                    ],
+                    rows=rows,
+                    search=len(rows) > 10,
+                )
+        if missing:
+            Muted(f"Dependencies with no recorded lineage: {', '.join(missing)}")
+
+
+def lineage_view(lineage: dict, subject: str) -> Any:
+    """``lineage()`` output as a rendered DAG plus the step table underneath.
+
+    The diagram string is the one ``DuckSession._to_mermaid`` already produces — the same bytes
+    ``lineage(render='mermaid')`` hands back as text. Rendering it is a display concern; the
+    graph itself stays server-side and deterministic.
+    """
     with PrefabApp() as app:
-        with Column(gap=4):
+        with Column(gap=3):
             H3(f"Lineage — {subject}")
-            with Row(gap=4):
-                Metric(label="Steps", value=len(nodes))
-                Metric(label="Edges", value=len(edges))
-                Metric(label="Missing deps", value=len(missing))
-            if lineage.get("mermaid"):
-                Mermaid(chart=lineage["mermaid"])
-            if rows:
-                with Column(gap=2):
-                    H4("Build order")
-                    DataTable(
-                        columns=[
-                            DataTableColumn(key="step", header="#", sortable=True),
-                            DataTableColumn(key="name", header="Result", sortable=True),
-                            DataTableColumn(key="kind", header="Kind", sortable=True),
-                            DataTableColumn(key="description", header="Description"),
-                            DataTableColumn(key="depends_on", header="Depends on"),
-                            DataTableColumn(key="sources", header="Sources"),
-                        ],
-                        rows=rows,
-                        search=len(rows) > 10,
-                    )
-            if missing:
-                Muted(f"Dependencies with no recorded lineage: {', '.join(missing)}")
+            _lineage_body(lineage)
     return app

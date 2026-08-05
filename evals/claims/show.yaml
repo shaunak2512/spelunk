@@ -339,6 +339,52 @@ claims:
     summary has to say `showing` because only one measure is on screen at a time — a summary
     listing all of them would misdescribe what the user sees.
 
+- id: SHOW-017
+  claim: >
+    Every `show` of a named result (table, chart, profile) carries a Lineage tab beside the data
+    — the DAG and build order that produced it — flipped entirely client-side, and the text
+    summary reports it under `provenance`. A result with no recorded lineage renders with no tab
+    rather than failing.
+  source: CLAUDE.md#tool-surface
+  mode: behavioral
+  falsifier: >
+    A charted result renders with no way to see where it came from; or flipping to the Lineage
+    tab issues a tool call or creates a result; or the tab is on screen but the summary never
+    mentions it (the model describing a view it cannot see); or a result whose lineage row is
+    missing errors instead of rendering plainly; or the tab's "Build order" table lists a result
+    ahead of a step it depends on — which also puts it at odds with the `provenance.steps` the
+    summary reports in the SAME response.
+  status: verified
+  covered_by:
+  - tests/test_show.py::TestViewBuilders::test_result_views_carry_a_lineage_tab
+  - tests/test_show.py::TestViewBuilders::test_profile_view_carries_a_lineage_tab
+  - tests/test_show.py::TestViewBuilders::test_no_recorded_lineage_means_no_tab_bar
+  - tests/test_show.py::TestViewBuilders::test_measure_picker_still_works_inside_the_lineage_tab
+  - tests/test_show.py::TestViewBuilders::test_the_tab_and_the_lineage_kind_render_the_same_body
+  - tests/test_show.py::TestViewBuilders::test_build_order_table_ignores_the_recorded_order
+  - tests/test_show.py::TestViewBuilders::test_build_order_survives_a_lineage_with_no_order_key
+  - tests/test_show.py::TestShowResult::test_result_views_report_and_render_their_provenance
+  - tests/test_show.py::TestShowResult::test_provenance_follows_the_whole_upstream_chain
+  - tests/test_show.py::TestShowResult::test_rebuilt_upstream_does_not_reorder_the_rendered_build_order
+  - tests/test_show.py::TestShowResult::test_no_provenance_key_where_there_is_no_tab
+  - tests/test_show.py::TestShowResult::test_a_result_whose_lineage_row_is_gone_still_renders
+  - tests/test_show.py::TestShowIsAView::test_records_no_lineage_node
+  note: >
+    A chart is otherwise a picture with no receipt: the provenance was already recorded and
+    already renderable, just one tool call away from the thing it explains. Prefab `Tabs` is
+    client state like the SHOW-013 picker, so SHOW-001 is untouched — the tab READS lineage,
+    it never writes one, and `test_records_no_lineage_node` now drives chart and profile
+    THROUGH the new read path, which is why it appears here too.
+    "Build order" means `lineage()["order"]`, NOT the order of `nodes`: `nodes` is sorted by the
+    recorded `seq` and `_record_lineage` upserts with a fresh `MAX(seq)+1`, so re-running an
+    upstream step lifts it above its existing dependents and the recorded sequence then reads
+    dependent-first. Numbering the rows off `nodes` is what the two build-order tests pin shut.
+    Scope is the kinds that name ONE result: `catalog` is often a flow list with no single DAG,
+    and `lineage` already is the DAG. The tab reuses `lineage_view`'s own body (`_lineage_body`)
+    rather than a second rendering, so the two cannot drift.
+    The no-lineage fallback is not hypothetical politeness — `DuckSession.lineage()` RAISES for
+    an unrecorded result, so without the catch a missing row would take the whole view down.
+
 - id: SHOW-012
   claim: >
     Handed a result whose shape is the point, an agent shows a chart rather than dumping rows —
