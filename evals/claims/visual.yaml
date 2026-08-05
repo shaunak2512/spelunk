@@ -269,17 +269,29 @@ claims:
 
 - id: VIS-013
   claim: >
-    `visual` declares an outputSchema describing its summary, and every summary it returns
-    validates against it.
+    `visual` declares an outputSchema describing its **structuredContent** — the `{spec: ...}`
+    envelope the host reads — and every payload it returns validates against it.
   source: CLAUDE.md#tool-surface
   mode: invariant
-  falsifier: A returned summary fails validation against the declared VISUAL_OUTPUT_SCHEMA.
+  falsifier: >
+    The declared schema describes something other than structuredContent (the text summary, say),
+    or a returned payload fails validation against it. Either way a host that honours the schema
+    rejects the call and renders nothing.
   status: verified
   covered_by:
-  - tests/test_visual.py::TestOutputSchema::test_every_summary_validates_against_the_declared_schema
+  - tests/test_visual.py::TestOutputSchema::test_structured_content_validates_against_the_declared_schema
+  - tests/test_visual.py::TestOutputSchema::test_schema_describes_the_spec_envelope_not_the_summary
+  - tests/test_visual.py::TestRegistration::test_declared_output_schema_accepts_the_real_payload
   note: >
-    A declared schema a payload does not satisfy is worse than none — the host trusts it. The
-    test importorskips jsonschema, which is why jsonschema stays in the dev extra.
+    Inherited from SHOW-016 and immediately falsified in the field: the schema was first written
+    to describe the TEXT SUMMARY, while structuredContent carries `{spec: ...}`. FastMCP requires
+    structured_content whenever an output_schema exists (tools/base.py:313) and Claude Desktop
+    validates it, so every call failed with "missing a required displayed property" and nothing
+    rendered. The local test passed throughout because it validated the summary — the very object
+    the schema was wrongly written for. That is the lesson worth keeping: a contract test that
+    picks its own subject can agree with a bug. The third node id closes it by reading the schema
+    off the REGISTERED tool and validating an actual `call_tool` result against it, which is what
+    a host does and the only version that can catch this class of mismatch.
 
 - id: VIS-014
   claim: >

@@ -52,22 +52,26 @@ VEGA_URI = "ui://spelunk/vega.html"
 # ERRORS rather than truncating. A silently shortened chart is a picture that misstates the data.
 VEGA_MAX_ROWS = 5000
 
+# `outputSchema` describes **structuredContent** — the half the HOST reads and validates — NOT
+# the text summary the model reads. Getting that backwards ships a tool that fails on every call
+# against any host that honours the schema (Claude Desktop does): FastMCP requires
+# structured_content whenever an output_schema exists, the host validates one against the other,
+# and the mismatch surfaces to the user as "missing a required <field> property" with nothing
+# rendered. The summary's shape is a contract too, but it is prose in the tool description and is
+# asserted directly in the tests — it has no business in here.
 VISUAL_OUTPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "displayed": {"type": "string"},
-        "rendered_by_host": {"type": "boolean"},
-        "flow": {"type": "string"},
-        "name": {"type": "string"},
-        "row_count": {"type": "integer"},
-        "columns": {"type": "array", "items": {"type": "string"}},
-        "sample": {"type": "array", "items": {"type": "object"}},
-        "complete": {"type": "boolean"},
-        "fields": {"type": "array", "items": {"type": "string"}},
-        "provenance": {"type": "object"},
+        "spec": {
+            "type": "object",
+            "description": (
+                "A complete Vega-Lite spec with the result's rows already inlined under "
+                "data.values — ready to hand straight to vega-embed, with no further fetching."
+            ),
+        },
     },
-    "required": ["displayed", "name", "row_count", "columns"],
-    "additionalProperties": True,
+    "required": ["spec"],
+    "additionalProperties": False,
 }
 
 

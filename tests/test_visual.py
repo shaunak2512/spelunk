@@ -309,6 +309,21 @@ class TestRegistration:
         tool = next(t for t in _run(server.list_tools()) if t.name == "visual")
         assert tool.meta["ui"]["resourceUri"] == vega.VEGA_URI
 
+    def test_declared_output_schema_accepts_the_real_payload(self, server, session):
+        """The end-to-end version of the outputSchema contract, done the way a HOST does it:
+        read the schema off the registered tool, call the tool, validate one against the other.
+
+        The unit test alone missed a shipped bug — the schema described the text summary while
+        structuredContent carried `{spec: ...}`, so Claude Desktop rejected every call with
+        "missing a required displayed property" and rendered nothing. Nothing failed locally
+        because the test validated the summary, the object the schema was wrongly written for.
+        Going through `list_tools` + `call_tool` is what makes the two halves meet.
+        """
+        jsonschema = pytest.importorskip("jsonschema")
+        tool = next(t for t in _run(server.list_tools()) if t.name == "visual")
+        result = _run(server.call_tool("visual", {"name": "sales", "spec": BAR}))
+        jsonschema.validate(result.structured_content, tool.output_schema)
+
     def test_app_resource_is_readable(self, server):
         uris = [str(r.uri) for r in _run(server.list_resources()) if str(r.uri).startswith("ui://")]
         assert uris == [vega.VEGA_URI]
@@ -317,9 +332,43 @@ class TestRegistration:
 
 
 class TestOutputSchema:
-    def test_every_summary_validates_against_the_declared_schema(self, session):
-        """The tool declares `output_schema`; a summary that does not match it is a contract the
-        host cannot rely on."""
+    """`outputSchema` governs structuredContent — the half the HOST validates.
+
+    Aiming it at the text summary instead is not a cosmetic error: FastMCP requires
+    structured_content whenever an output_schema exists, and a host that honours the schema
+    (Claude Desktop does) rejects every call with "missing a required <field> property" and
+    renders nothing. These tests validate the object that is actually sent.
+    """
+
+    def test_structured_content_validates_against_the_declared_schema(self, session):
         jsonschema = pytest.importorskip("jsonschema")
+        result = _dispatch_visual(session, name="sales", spec=BAR, title=None, flow=None)
+        jsonschema.validate(result.structured_content, vega.VISUAL_OUTPUT_SCHEMA)
+
+    def test_schema_describes_the_spec_envelope_not_the_summary(self):
+        """A regression guard with a name: the schema's required key must be the one
+        structuredContent actually carries."""
+        assert vega.VISUAL_OUTPUT_SCHEMA["required"] == ["spec"]
+
+    def test_summary_carries_what_the_tool_description_promises(self, session):
+        """The summary's shape is a contract too — just not an MCP-declared one, so it is
+        asserted here rather than smuggled into outputSchema."""
         summary = _summary(_dispatch_visual(session, name="sales", spec=BAR, title=None, flow=None))
-        jsonschema.validate(summary, vega.VISUAL_OUTPUT_SCHEMA)
+        assert {"displayed", "name", "flow", "row_count", "columns", "fields",
+                "sample", "complete"} <= set(summary)
+
+    def test_structured_content_is_json_serialisable(self, session):
+        """FastMCP serialises structuredContent itself, with no `default=str` to fall back on.
+
+        DuckDB hands back real `date`/`Decimal` objects, which the text half survives only
+        because `json.dumps(..., default=str)` covers for them. The payload has no such
+        cover, so a result with a date column would fail at the transport with a
+        "Could not serialize structured content" error rather than anywhere useful.
+        """
+        session.query(
+            "SELECT DATE '2024-01-01' AS d, CAST(1.5 AS DECIMAL(4,2)) AS amt", "typed"
+        )
+        spec = {"mark": "line", "encoding": {"x": {"field": "d", "type": "temporal"},
+                                             "y": {"field": "amt", "type": "quantitative"}}}
+        result = _dispatch_visual(session, name="typed", spec=spec, title=None, flow=None)
+        json.dumps(result.structured_content)  # must not raise
