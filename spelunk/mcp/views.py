@@ -679,6 +679,34 @@ def catalog_view(catalog: dict) -> Any:
 
 
 # ----------------------------------------------------------------------------- lineage view --- #
+def _build_order(lineage: dict) -> list[dict]:
+    """The lineage nodes in dependency-first order — what a table headed "Build order" must show.
+
+    ``lineage()`` returns two orderings and they are not the same one. ``nodes`` is sorted by the
+    recorded ``seq``, and ``_record_lineage`` takes a FRESH ``MAX(seq)+1`` on every upsert — so
+    re-running an upstream step (an ordinary `CREATE OR REPLACE`) lifts it above the dependents
+    that already exist, and the recorded sequence then lists a result BEFORE the thing it reads.
+    ``order`` is the topological sort and stays correct across that. Numbering the rows by
+    ``order`` is also what keeps this table agreeing with the text summary, which reports the
+    same key (see ``server._provenance_summary``).
+
+    Nodes absent from ``order`` are appended in recorded order rather than dropped: a display
+    must not silently lose a step, and the standalone ``lineage`` payload is allowed to carry no
+    ``order`` at all.
+    """
+    nodes = lineage.get("nodes", [])
+    by_ref = {f"{n['flow']}.{n['name']}": n for n in nodes}
+    seen: set[str] = set()
+    ordered: list[dict] = []
+    for ref in lineage.get("order", []):
+        node = by_ref.get(ref)
+        if node is not None and ref not in seen:
+            seen.add(ref)
+            ordered.append(node)
+    ordered.extend(n for n in nodes if f"{n['flow']}.{n['name']}" not in seen)
+    return ordered
+
+
 def _lineage_body(lineage: dict) -> None:
     """The DAG + build-order table, constructed into the open container.
 
@@ -698,7 +726,7 @@ def _lineage_body(lineage: dict) -> None:
             "depends_on": ", ".join(f"{d['flow']}.{d['name']}" for d in n.get("deps", [])),
             "sources": ", ".join(n.get("sources", [])),
         }
-        for i, n in enumerate(nodes)
+        for i, n in enumerate(_build_order(lineage))
     ]
     with Column(gap=4):
         with Row(gap=4):

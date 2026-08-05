@@ -99,6 +99,16 @@ def _tabs(payload):
     ]
 
 
+def _build_order(payload):
+    """The result names in the Lineage tab's "Build order" table, top to bottom."""
+    return [
+        [row["name"] for row in node.get("rows", [])]
+        for node in _walk(payload)
+        if node.get("type") == "DataTable"
+        and any(c.get("key") == "step" for c in node.get("columns", []))
+    ]
+
+
 @pytest.fixture
 def show_server(tmp_path):
     """A session over a small CSV, with one aggregated result already saved."""
@@ -273,6 +283,26 @@ class TestViewBuilders:
         # Everything the standalone view draws below its heading also appears in the tab.
         for component in ("Metric", "Mermaid", "H4", "DataTable"):
             assert standalone.count(component) <= tabbed.count(component)
+
+    def test_build_order_table_ignores_the_recorded_order(self):
+        """A rebuilt upstream step is RE-recorded last, so `nodes` can list a dependent first.
+
+        `lineage()` sorts `nodes` by `seq` and `_record_lineage` upserts with a fresh
+        `MAX(seq)+1` — the shape below is exactly what re-running `clean` produces. Numbering
+        the rows off `nodes` would head a table called "Build order" with a step that depends
+        on the step under it.
+        """
+        rebuilt = {**LINEAGE, "nodes": list(reversed(LINEAGE["nodes"]))}
+        assert [n["name"] for n in rebuilt["nodes"]] == ["by_region", "clean"]  # the trap
+        payload = views.to_payload(views.result_table(COLUMNS, ROWS, None, rebuilt))
+        assert _build_order(payload) == [["clean", "by_region"]]  # follows `order`
+
+    def test_build_order_survives_a_lineage_with_no_order_key(self):
+        """Fall back to recorded order rather than dropping every step off the table."""
+        payload = views.to_payload(views.lineage_view(
+            {k: v for k, v in LINEAGE.items() if k != "order"}, "default"
+        ))
+        assert _build_order(payload) == [["clean", "by_region"]]
 
     def test_lineage_view_renders_the_diagram(self):
         payload = views.to_payload(views.lineage_view({
@@ -685,6 +715,30 @@ class TestShowResult:
         session.query("SELECT region, revenue * 2 AS doubled FROM by_region", "scaled")
         summary = _summary(_call(server, {"name": "scaled", "kind": "table"}))
         assert summary["provenance"]["steps"] == ["default.by_region", "default.scaled"]
+
+    def test_rebuilt_upstream_does_not_reorder_the_rendered_build_order(self, show_server):
+        """End-to-end regression: the two halves of one response must not contradict each other.
+
+        Re-running `by_region` re-records it AFTER `scaled`, so the recorded order now reads
+        `scaled, by_region` — a result before its own dependency. The tab and the summary both
+        have to keep reporting the dependency-first order.
+        """
+        server, session = show_server
+        session.query("SELECT region, revenue * 2 AS doubled FROM by_region", "scaled")
+        session.query(
+            "SELECT region, sum(revenue) AS revenue, sum(orders) AS orders "
+            "FROM sales GROUP BY region ORDER BY revenue DESC",
+            "by_region",
+        )
+        recorded = [n["name"] for n in session.lineage("scaled")["nodes"]]
+        assert recorded == ["scaled", "by_region"]  # the trap is really reachable
+
+        result = _call(server, {"name": "scaled", "kind": "table"})
+        steps = _summary(result)["provenance"]["steps"]
+        assert steps == ["default.by_region", "default.scaled"]
+        assert _build_order(result.structured_content) == [["by_region", "scaled"]]
+        # the table and the text summary tell the same story
+        assert _build_order(result.structured_content)[0] == [s.split(".", 1)[1] for s in steps]
 
     @pytest.mark.parametrize("kind", ["catalog", "lineage"])
     def test_no_provenance_key_where_there_is_no_tab(self, show_server, kind):

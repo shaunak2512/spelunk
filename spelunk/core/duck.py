@@ -1490,9 +1490,12 @@ class DuckSession:
         With ``name``: the upstream closure that produced that result — the node plus every
         result it (transitively) depends on, following cross-flow edges. With no ``name``: every
         result in ``flow``. ``missing`` lists dependency refs with no lineage row (dropped, or an
-        external input). Nodes are ordered so a dependency always precedes its dependents. Each
-        node carries its optional one-line ``description`` (``None`` when none was given) so the
-        DAG reads as a plain-English, sequential story for a non-technical audience.
+        external input). ``nodes`` is in RECORDED order (``seq``); ``order`` is the dependency-first
+        one. They coincide until a result is rebuilt — ``_record_lineage`` upserts with a fresh
+        ``MAX(seq)+1``, so re-running an upstream step lifts it above its existing dependents. Read
+        ``order`` for anything that means "build order"; ``nodes`` answers "when was this recorded".
+        Each node carries its optional one-line ``description`` (``None`` when none was given) so
+        the DAG reads as a plain-English, sequential story for a non-technical audience.
 
         ``render`` (``"mermaid"`` or ``"dot"``) adds a ready-to-display diagram string under the
         key matching the requested format — built deterministically from the same nodes/edges, so
