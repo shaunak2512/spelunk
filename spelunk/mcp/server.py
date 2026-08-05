@@ -28,7 +28,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 from urllib.parse import urlsplit
 
 from fastmcp import FastMCP
@@ -39,7 +39,7 @@ from pydantic import BaseModel, Field
 
 from spelunk import __version__
 from spelunk.core.duck import DuckSession, _full_sample_fits, _SAMPLE_ROWS, _validate_name
-from spelunk.mcp import views
+from spelunk.mcp import vega
 
 # Shared help text for the plain-English `description` — kept identical on the single-query
 # parameter and the per-step field so the agent sees one consistent instruction.
@@ -76,13 +76,13 @@ _LOGGED_ARGS = (
     "sql", "name", "flow", "target", "format", "path", "spec", "steps", "into", "dry_run",
     "description", "source", "params", "rows_from", "records", "paginate", "max_pages",
     "max_rows", "max_urls",
-    "kind", "x", "y", "series", "title",  # show
+    "kind", "title",  # visual
 )
 _LOGGED_RESULT_FIELDS = (
     "name", "flow", "row_count", "format", "path", "dropped_results", "kind",
     "step_count", "completed", "failed_step",
     "root", "source_flow", "target_flow", "dry_run",  # lineage / replay
-    "displayed", "rendered_by_host",  # show
+    "displayed", "rendered_by_host",  # visual
 )
 # lineage/replay result lists carry the full SQL of every node — log their size, not their body.
 _COUNTED_RESULT_FIELDS = ("columns", "nodes", "edges", "order", "missing", "rebuilt", "plan")
@@ -146,9 +146,9 @@ def _configure_tool_logging(tool_log: str | None) -> None:
 def _summarize_result(result: object) -> dict:
     """Compact, log-safe view of a tool result — counts and identifiers, not full row data."""
     if isinstance(result, ToolResult):
-        # `show` returns a ToolResult: a UI payload for the host plus a JSON text summary for the
-        # model. Log the summary — the Prefab component tree is a rendering detail and would bury
-        # the line in markup.
+        # `visual` returns a ToolResult: a UI payload for the host plus a JSON text summary for
+        # the model. Log the summary — the hydrated Vega-Lite spec carries every plotted row and
+        # would bury the line in data.
         texts = [b.text for b in result.content if isinstance(b, TextContent)]
         try:
             result = json.loads(texts[0]) if texts else {}
@@ -253,7 +253,7 @@ def _dispatch_query(
 def _host_renders_ui() -> bool:
     """Best-effort: did the connected client advertise the MCP Apps extension?
 
-    Used only to ANNOTATE the summary the model reads, never to decide what to send — `show`
+    Used only to ANNOTATE the summary the model reads, never to decide what to send — `visual`
     always returns both a text summary and the UI payload, because an MCP result carries both
     and a host that can't render simply ignores `structuredContent`. That matters: not every
     UI-capable host advertises the extension, and a false negative here must cost the user
@@ -267,7 +267,7 @@ def _host_renders_ui() -> bool:
     except (RuntimeError, ImportError, AttributeError):
         # No active client session (library/test caller), no apps support, or a host/FastMCP
         # build whose context lacks `client_supports_extension`. All three are cosmetic here —
-        # letting any of them escape would turn a missing annotation into a failed `show`.
+        # letting any of them escape would turn a missing annotation into a failed `visual`.
         return False
 
 
@@ -275,7 +275,7 @@ def _require_existing_flow(session: DuckSession, flow: str) -> str:
     """Reject an unknown flow BEFORE a display path can provision it.
 
     `session.catalog(flow)` and `session.profile(...)` both `CREATE SCHEMA IF NOT EXISTS` — right
-    for the tools that BUILD, wrong for `show`, which must leave nothing behind. Without this a
+    for the tools that BUILD, wrong for `visual`, which must leave nothing behind. Without this a
     typo'd flow name gets created and then shows up in `catalog`, which is precisely the way "a
     view is not a result" is observable. Checked here rather than in DuckSession so the
     `catalog`/`profile` TOOLS keep their existing provisioning behaviour.
@@ -287,144 +287,83 @@ def _require_existing_flow(session: DuckSession, flow: str) -> str:
 
 
 def _provenance(session: DuckSession, name: str, flow: str) -> dict | None:
-    """The lineage closure that built *name*, for the view's Lineage tab — or ``None``.
-
-    Read-only, and it reuses the very mermaid string `show(kind='lineage')` already serves, so the
-    graph stays server-side and deterministic rather than being reassembled per view.
+    """The lineage closure that built *name*, for the summary's provenance line — or ``None``.
 
     The catch is load-bearing: ``lineage()`` RAISES for a result with no recorded row, and a
     display path must not die because provenance happens to be missing. Every `query` result
     records one, so in practice this returns a graph; the fallback is what keeps an edge case
-    (a result whose lineage row was never written) rendering as a plain chart instead of erroring.
+    (a result whose lineage row was never written) drawing a plain chart instead of erroring.
     """
     try:
-        return session.lineage(name, flow, render="mermaid")
+        return session.lineage(name, flow)
     except ValueError:
         return None
 
 
 def _provenance_summary(lineage: dict | None) -> dict:
-    """The text half's account of the Lineage tab — present only when the tab is.
+    """The build order behind the plotted result, for the text half of the reply.
 
-    Same obligation as the interactive picker reporting `showing`: the summary describes what is
-    on screen, so a tab the model cannot see must still be named. Only the step ORDER goes in —
-    the full DAG stays with the `lineage` tool rather than being duplicated into every view.
+    Only the step ORDER goes in — the full DAG stays with the `lineage` tool rather than being
+    duplicated into every view. This is the model's half only: nothing about it reaches the
+    chart, so it makes no claim about what is on screen.
     """
     if not (lineage and lineage.get("nodes")):
         return {}
-    return {"provenance": {"steps": lineage.get("order", []), "shown_as": "lineage tab"}}
+    return {"provenance": {"steps": lineage.get("order", [])}}
 
 
-def _dispatch_show(
+def _dispatch_visual(
     session: DuckSession,
     *,
-    name: str | None,
-    kind: str,
-    x: str | None,
-    y: str | None,
-    series: list[str] | None,
+    name: str,
+    spec: Any,
     title: str | None,
     flow: str | None,
-    interactive: bool = False,
 ) -> ToolResult:
-    """Shared body for the `show` tool: build a Prefab view and a text summary of it.
+    """Shared body for the `visual` tool: check a spec against the data, then hydrate it.
 
     Returns both halves of an MCP result — `content` (JSON the model reads, mirroring `query`'s
-    sample contract) and `structuredContent` (the Prefab app a UI host renders). Read-only
-    throughout: no table is created and no lineage row is written, because a view is not a result.
+    sample contract) and `structuredContent` (the hydrated Vega-Lite spec a UI host renders).
+    Read-only throughout: no table is created and no lineage row is written, because a view is
+    not a result.
+
+    Order matters. The columns are read FIRST so `validate_spec` can check the spec's field
+    references against the result's real schema — Vega-Lite renders a missing field as an empty
+    or subtly wrong chart without erroring, and catching that here is what keeps a silent
+    mis-plot from reaching the user.
     """
-    if kind not in views.SHOW_KINDS:
-        raise ValueError(f"Unknown kind {kind!r}. Choose one of {list(views.SHOW_KINDS)}.")
+    if not name:
+        raise ValueError("`visual` needs the `name` of a saved result to plot.")
+    # Identifier validation first, existence second: junk like `a"b` should read as an invalid
+    # name, not "unknown flow". `_require_existing_flow` then stops a typo'd flow being
+    # provisioned by a display path — the way "a view is not a result" is observable.
+    resolved = _validate_name(flow or session.default_flow, "flow name")
+    _validate_name(name)
+    _require_existing_flow(session, resolved)
 
-    needs_name = kind in ("table", *views.CHART_KINDS, "profile")
-    if needs_name and not name:
-        raise ValueError(f"show(kind={kind!r}) needs the `name` of a saved result to display.")
+    columns, rows = session.rows_for_display(name, resolved, max_rows=vega.VEGA_MAX_ROWS)
+    validated = vega.validate_spec(spec, columns)
+    hydrated = vega.hydrate(validated, rows, title)
 
-    summary: dict = {"displayed": kind, "rendered_by_host": _host_renders_ui()}
-
-    if kind == "catalog":
-        if flow is not None:
-            _require_existing_flow(session, flow)
-        catalog = session.catalog(flow)
-        view = views.catalog_view(catalog)
-        summary.update({"flow": flow, **{k: v for k, v in catalog.items() if k != "results"}})
-        if "results" in catalog:
-            summary["result_count"] = len(catalog["results"])
-            summary["results"] = [r["name"] for r in catalog["results"]]
-
-    elif kind == "lineage":
-        resolved = flow or session.default_flow
-        lineage = session.lineage(name, resolved, render="mermaid")
-        view = views.lineage_view(lineage, name or resolved)
-        summary.update({
-            "flow": resolved, "name": name,
-            "node_count": len(lineage.get("nodes", [])),
-            "edge_count": len(lineage.get("edges", [])),
-            "order": lineage.get("order", []),
-            "missing": lineage.get("missing", []),
-        })
-
-    elif kind == "profile":
-        # Validate BEFORE interpolating: this is the one display path that builds its own SQL
-        # (`rows_for_display` validates internally, `catalog`/`lineage` validate the flow), and
-        # an unvalidated name with a double quote in it reaches DuckDB as broken SQL — a parse
-        # error instead of the clear "invalid result name" every other kind gives.
-        resolved = _validate_name(flow or session.default_flow, "flow name")
-        _validate_name(name)
-        # Identifier validation first, existence second: junk like `a"b` should still read as an
-        # invalid name, not "unknown flow". Once the flow is known to exist, profile's own
-        # CREATE SCHEMA IF NOT EXISTS is a no-op, so a missing RESULT leaves nothing behind.
-        _require_existing_flow(session, resolved)
-        profile = session.profile(f'SELECT * FROM "{resolved}"."{name}"', resolved)
-        lineage = _provenance(session, name, resolved)
-        view = views.profile_view(profile, f"{resolved}.{name}", lineage)
-        summary.update({
-            "flow": resolved, "name": name,
-            "row_count": profile.get("row_count", 0),
-            "columns": list(profile.get("columns", {})),
-            "profile": profile.get("columns", {}),
-            **_provenance_summary(lineage),
-        })
-
-    else:  # a saved result, as a table or a chart
-        resolved = flow or session.default_flow
-        max_rows = views.CHART_MAX_ROWS if kind in views.CHART_KINDS else None
-        columns, rows = (
-            session.rows_for_display(name, resolved, max_rows=max_rows)
-            if max_rows is not None
-            else session.rows_for_display(name, resolved)
-        )
-        lineage = _provenance(session, name, resolved)
-        if kind == "table":
-            view = views.result_table(columns, rows, title, lineage)
-            plotted: dict = {}
-        else:
-            build = views.interactive_chart if interactive else views.result_chart
-            view = build(kind, columns, rows, x, y, series, title, lineage)
-            x_col, measures = views.choose_axes(columns, x, y, series)
-            plotted = {"x": x_col, "series": measures}
-            # An interactive chart shows ONE measure at a time behind a picker, so say so —
-            # otherwise the summary reads as though all of them are on screen at once.
-            if interactive and len(measures) > 1:
-                plotted["interactive"] = True
-                plotted["showing"] = measures[0]
-        # Mirror `query`'s contract exactly: every row when the result is small on both axes,
-        # otherwise a short head. The model then reads a small deliverable straight out of the
-        # text half without needing the host to have rendered anything.
-        complete = _full_sample_fits(len(rows), len(columns))
-        summary.update({
-            "flow": resolved, "name": name,
-            "row_count": len(rows),
-            "columns": [c["name"] for c in columns],
-            "sample": rows if complete else rows[:_SAMPLE_ROWS],
-            "complete": complete,
-            **plotted,
-            **_provenance_summary(lineage),
-        })
-
+    # Mirror `query`'s contract exactly: every row when the result is small on both axes,
+    # otherwise a short head. The model then reads a small deliverable straight out of the text
+    # half without needing the host to have rendered anything.
+    complete = _full_sample_fits(len(rows), len(columns))
+    summary: dict = {
+        "displayed": "vega-lite",
+        "rendered_by_host": _host_renders_ui(),
+        "flow": resolved,
+        "name": name,
+        "row_count": len(rows),
+        "columns": [c["name"] for c in columns],
+        "fields": vega.spec_fields(validated, columns),
+        "sample": rows if complete else rows[:_SAMPLE_ROWS],
+        "complete": complete,
+        **_provenance_summary(_provenance(session, name, resolved)),
+    }
     return ToolResult(
         content=[TextContent(type="text", text=json.dumps(summary, default=str))],
-        structured_content=views.to_payload(view),
+        structured_content={"spec": hydrated},
     )
 
 
@@ -504,18 +443,17 @@ def build_server(
             "to csv/json/parquet (no row cap).\n"
             + (
                 "\n## Show it to the user\n"
-                "- `show(name, kind=...)` — DISPLAY something in the chat: an interactive "
-                "'table', a 'bar'/'line'/'area'/'scatter'/'pie' chart of a saved result, a "
-                "'profile' dashboard, the 'catalog', or a 'lineage' DAG diagram. A view is NOT a "
-                "result — `show` creates nothing and there is nothing to drop afterwards.\n"
-                "- Aggregate FIRST, then show: charts cap at "
-                f"{views.CHART_MAX_ROWS} rows and error rather than truncate, because a "
-                "shortened chart misstates the data. `query` the GROUP BY, `show` the result.\n"
+                "- `visual(name, spec)` — DRAW a saved result in the chat. `spec` is a Vega-Lite "
+                "spec WITHOUT any `data` (the server injects the rows), so you get the whole "
+                "Vega-Lite grammar: layering, faceting, binning, tooltips, interactive "
+                "selections. A view is NOT a result — `visual` creates nothing and there is "
+                "nothing to drop afterwards.\n"
+                "- Aggregate FIRST, then draw: capped at "
+                f"{vega.VEGA_MAX_ROWS} rows, erroring rather than truncating, because a "
+                "shortened chart misstates the data. `query` the GROUP BY, `visual` the result.\n"
                 "- Use it when a shape, comparison or trend is the point — a chart of 12 monthly "
                 "totals says more than 12 rows of JSON. Keep reading results from `query`; "
-                "`show` is for the human.\n"
-                if views.PREFAB_AVAILABLE
-                else ""
+                "`visual` is for the human.\n"
             )
             + (
                 "\n## Manage sources\n"
@@ -705,71 +643,58 @@ def build_server(
     ) -> dict:
         return session.lineage(name, flow, render, path)
 
-    if views.PREFAB_AVAILABLE:
-        # Spelunk serves its OWN renderer resource rather than the per-tool one FastMCP would
-        # synthesize, so the ext-apps#696 recovery shim travels with the view. Identical to
-        # Prefab's page otherwise — it is built from prefab-ui's own HTML.
-        # The CSP belongs on the RESOURCE, not the tool: that is where the host reads it from
-        # (FastMCP's own synthesized renderer puts it there, and the tool carries only
-        # resourceUri). Declaring it on the tool instead silently yields a resource with NO
-        # policy, the host blocks the renderer bundle, and the app frame stays completely blank —
-        # no error, no spinner, nothing to debug.
-        @mcp.resource(
-            views.RENDERER_URI,
-            name="spelunk_renderer",
-            description="Prefab renderer for `show`, plus a bootstrap view and the ext-apps#696 "
-                        "structuredContent recovery shim.",
-            app=AppConfig(csp=ResourceCSP(**views.renderer_csp())),
-        )
-        def _renderer() -> str:
-            return views.recovery_renderer_html()
+    # Spelunk serves the app page for `visual` as its own ui:// resource. The CSP belongs on the
+    # RESOURCE, not the tool: that is where the host reads it from (the tool carries only
+    # resourceUri). Declaring it on the tool instead silently yields a resource with NO policy,
+    # the host blocks every bundle, and the app frame stays completely blank — no error, no
+    # spinner, nothing to debug.
+    @mcp.resource(
+        vega.VEGA_URI,
+        name="spelunk_vega",
+        description="Vega-Lite renderer for `visual`, wired to the host through the "
+                    "ext-apps SDK, with the ext-apps#696 structuredContent recovery path.",
+        app=AppConfig(csp=ResourceCSP(**vega.app_csp())),
+    )
+    def _vega_app() -> str:
+        return vega.app_html()
 
-        @mcp.tool(
-            name="show",
-            app=AppConfig(resource_uri=views.RENDERER_URI),
-            output_schema=views.SHOW_OUTPUT_SCHEMA,
-            description=(
-                "DISPLAY something in the chat as an interactive table, chart, dashboard or "
-                "diagram. Read-only and non-destructive: `show` creates NO result and NO lineage "
-                "node — it is a VIEW of what already exists, not a new result, so there is "
-                "nothing to `drop` afterwards. `kind` picks what to draw: 'table' (sortable, "
-                "searchable, paginated) or 'bar'/'line'/'area'/'scatter'/'pie' for a saved "
-                "result named by `name`; 'profile' for that result's per-column statistics as a "
-                "dashboard; 'catalog' to browse flows (or one flow's results, with `flow`); "
-                "'lineage' for the pipeline DAG as a rendered diagram (`name` narrows it to one "
-                "result's upstream closure). For charts, `x` names the label column and the "
-                "measure comes from `y` (ONE column) or `series` (SEVERAL) — omit them and the "
-                "first label column and first numeric column are used. "
-                "AGGREGATE FIRST: charts are capped at "
-                f"{views.CHART_MAX_ROWS} rows and tables at a few thousand; past that `show` "
-                "ERRORS rather than truncating, because a silently shortened view is a picture "
-                "that misstates the data. Group or top-N with `query`, then show that result. "
-                "`interactive=true` on a chart with SEVERAL measures (`series=[...]`) adds a "
-                "picker that switches between them in the browser — no extra tool call, and one "
-                "measure is on screen at a time. "
-                "Every view of a named result (table, chart, profile) also carries a **Lineage "
-                "tab** beside the data — the DAG and build order that produced it — so the reader "
-                "can see where the numbers came from without another call. It costs nothing to "
-                "ask for and needs no argument; flipping tabs happens in the browser. "
-                "The reply also carries a text summary (with the rows themselves when the result "
-                "is small), so you can keep reasoning about what you displayed."
-            ),
-        )
-        @_logged
-        def _show(
-            name: str | None = None,
-            kind: str = "table",
-            x: str | None = None,
-            y: str | None = None,
-            series: list[str] | None = None,
-            title: str | None = None,
-            interactive: bool = False,
-            flow: str | None = None,
-        ) -> ToolResult:
-            return _dispatch_show(
-                session, name=name, kind=kind, x=x, y=y, series=series, title=title, flow=flow,
-                interactive=interactive,
-            )
+    @mcp.tool(
+        name="visual",
+        app=AppConfig(resource_uri=vega.VEGA_URI),
+        output_schema=vega.VISUAL_OUTPUT_SCHEMA,
+        description=(
+            "DRAW a saved result in the chat as an interactive Vega-Lite chart. Read-only and "
+            "non-destructive: `visual` creates NO result and NO lineage node — it is a VIEW of "
+            "what already exists, so there is nothing to `drop` afterwards.\n"
+            "`name` is the saved result to plot. `spec` is a Vega-Lite spec (object or JSON "
+            "string) with **no `data` key** — the server injects the result's rows for you, so "
+            "write the spec as though `data` were already there. That gives you the whole "
+            "Vega-Lite grammar: `mark`, `encoding`, `transform`, `layer`, `facet`, `hconcat`/"
+            "`vconcat`, `params` for interactive selections, tooltips, and binning.\n"
+            'Example — `{"mark": "bar", "encoding": {"x": {"field": "region", '
+            '"type": "nominal"}, "y": {"field": "revenue", "type": '
+            '"quantitative"}}}`.\n'
+            "Every `field` you name must be a column of the result (or one your own `transform` "
+            "creates) — a field that exists in neither is an ERROR, never a silently blank "
+            "chart. `data.url` is refused: every row comes from a saved result.\n"
+            "AGGREGATE FIRST: capped at "
+            f"{vega.VEGA_MAX_ROWS} rows, and past that `visual` ERRORS rather than truncating, "
+            "because a silently shortened chart is a picture that misstates the data. Group or "
+            "top-N with `query`, then draw that result. "
+            "`title` sets the chart title when the spec has none. "
+            "The reply also carries a text summary (with the rows themselves when the result is "
+            "small), so you can keep reasoning about what you displayed."
+        ),
+    )
+    @_logged
+    def _visual(
+        name: str,
+        spec: dict | str,
+        title: str | None = None,
+        flow: str | None = None,
+    ) -> ToolResult:
+        return _dispatch_visual(session, name=name, spec=spec, title=title, flow=flow)
+
 
     @mcp.tool(
         name="replay",

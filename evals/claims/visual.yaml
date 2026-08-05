@@ -1,0 +1,316 @@
+area: >
+  The `visual` tool and the Vega-Lite / MCP Apps rendering layer — what gets drawn, what must
+  never be drawn silently, and the boundary that keeps a view from becoming a result.
+
+  This file REPLACES show.yaml. `show` (a fixed set of Prefab component kinds) was removed in
+  favour of `visual` (an agent-authored Vega-Lite spec), so its claims were re-derived rather
+  than marked refuted: the behaviour they asserted is mostly intact, but the mechanism changed.
+  Four claims were dropped outright because the thing they described no longer exists —
+  SHOW-009 (Prefab's construction-time container trap), SHOW-010 (the profile/catalog/lineage
+  view kinds), SHOW-013 (the client-side measure picker) and SHOW-017 (the Lineage tab). That
+  is a deliberate scope reduction, not a silent loss: the picker and the tab were client-side
+  state on a Prefab component tree, and re-expressing them as Vega-Lite `params` and a `concat`
+  is future work, not a shipped behaviour.
+prefix: VIS
+claims:
+
+- id: VIS-001
+  claim: >
+    `visual` is read-only: it creates NO result and records NO lineage node. A view is not a
+    result, so there is nothing to drop after drawing something.
+  source: CLAUDE.md#tool-surface
+  mode: invariant
+  falsifier: >
+    A `visual` call leaves a new table in the flow, adds a row to _spelunk_meta.lineage, or
+    brings a new FLOW into existence.
+  status: verified
+  covered_by:
+  - tests/test_visual.py::TestVisualTool::test_creates_no_result_and_no_lineage_row
+  - tests/test_visual.py::TestVisualTool::test_unknown_flow_is_not_provisioned
+  - tests/test_visual.py::TestRowsForDisplay::test_reads_without_creating_anything
+  note: >
+    The load-bearing claim of the whole feature, and it survived the Prefab-to-Vega swap
+    unchanged. The flow-provisioning half is the one that hid a real leak under `show`:
+    `session.catalog(flow)` and `session.profile(...)` both CREATE SCHEMA IF NOT EXISTS, so a
+    typo'd flow was PROVISIONED by a display path and `catalog` then listed it — "nothing in
+    catalog" was false in the one way it is observable. `_require_existing_flow` still guards
+    it, and `visual` now touches neither of those methods, so the surface for the bug is
+    smaller than it was.
+
+- id: VIS-002
+  claim: >
+    Past its row cap, `visual` ERRORS rather than truncating — a silently shortened chart is a
+    picture that misstates the data. The error names the real row count and the way out.
+  source: CLAUDE.md#tool-surface
+  mode: behavioral
+  falsifier: >
+    A result larger than the cap renders anyway, with rows quietly dropped and no indication in
+    the reply that anything is missing.
+  status: verified
+  covered_by:
+  - tests/test_visual.py::TestVisualTool::test_refuses_rather_than_truncates_past_the_row_cap
+  - tests/test_visual.py::TestRowsForDisplay::test_refuses_past_the_row_cap_instead_of_truncating
+  - tests/test_visual.py::TestRowsForDisplay::test_cell_cap_catches_a_wide_result_the_row_cap_misses
+  note: >
+    The cap moved UP (200 for a Prefab chart, VEGA_MAX_ROWS=5000 now) because Vega-Lite holds
+    the rows in the browser and can aggregate or bin client-side, so legibility is no longer
+    bounded by the row count the way a fixed bar chart's was. The stance did not move: refuse,
+    do not truncate. SHOW-003 — charts capping far lower than tables because the limit is
+    legibility, not payload size — no longer holds and was dropped with the `table` kind.
+
+- id: VIS-003
+  claim: >
+    `visual` returns BOTH halves of an MCP result: a JSON text summary the model reads and the
+    hydrated Vega-Lite spec a UI host renders. The model is never handed a placeholder.
+  source: CLAUDE.md#key-concepts
+  mode: invariant
+  falsifier: >
+    A `visual` call returns only structuredContent, or returns the FastMCP `app=True`
+    placeholder string in place of the summary, leaving the model unable to reason about what
+    it just displayed.
+  status: verified
+  covered_by:
+  - tests/test_visual.py::TestVisualTool::test_returns_both_halves
+  note: >
+    This is why `query` was never made an app tool: FastMCP replaces an app tool's
+    model-visible content with the literal "[Rendered Prefab UI]". Building a ToolResult by
+    hand keeps both audiences served, and it is what lets a text-only host degrade by simply
+    ignoring structuredContent rather than needing a host-detection branch.
+
+- id: VIS-004
+  claim: >
+    The text half mirrors `query`'s sample contract — every row when the result is small on
+    both axes (complete: true), otherwise a short head — and reports only the fields the spec
+    actually plots, not every column of the result.
+  source: CLAUDE.md#tool-surface
+  mode: behavioral
+  falsifier: >
+    A small result comes back as a truncated head, or the summary claims columns are on screen
+    that the spec never encodes.
+  status: verified
+  covered_by:
+  - tests/test_visual.py::TestVisualTool::test_summary_mirrors_query_sample_contract
+  - tests/test_visual.py::TestVisualTool::test_summary_reports_only_the_plotted_fields
+  note: >
+    The `fields` half is new with `visual` and it matters more than it did under `show`: a
+    Vega-Lite spec can read a two-column subset of a forty-column result, so reporting
+    `columns` alone would overstate what the reader is looking at. Same obligation the old
+    interactive picker had when it reported `showing`.
+
+- id: VIS-005
+  claim: >
+    `visual` is registered unconditionally — it needs no optional Python package, because a
+    Vega-Lite spec is JSON and the app page is a string.
+  source: CLAUDE.md#tool-surface
+  mode: invariant
+  falsifier: >
+    A lean install (no extras) starts a server whose tool list is missing `visual`.
+  status: verified
+  covered_by:
+  - tests/test_cli.py::TestStdioTransport::test_visual_is_always_registered
+  note: >
+    Inverts SHOW-006, which claimed the opposite as a feature: `show` was absent without
+    prefab-ui, so a lean install silently lost the display surface. Dropping the Python
+    rendering dependency removed the whole conditional, and the [ui] extra now carries only the
+    fastmcp floor. The test asserts presence rather than deriving the expectation from an
+    import guard, so there is no way for the implementation and the expectation to fail
+    together.
+
+- id: VIS-006
+  claim: >
+    The tool carries _meta.ui.resourceUri pointing at a readable ui:// resource, which is what
+    makes a host render it as an MCP App.
+  source: CLAUDE.md#architecture
+  mode: invariant
+  falsifier: >
+    The registered tool has no resourceUri, or the URI it names cannot be read back from the
+    server as a resource.
+  status: verified
+  covered_by:
+  - tests/test_visual.py::TestRegistration::test_visual_is_registered_with_ui_metadata
+  - tests/test_visual.py::TestRegistration::test_app_resource_is_readable
+  note: >
+    Unchanged in substance from SHOW-007; only the URI moved (ui://spelunk/renderer.html ->
+    ui://spelunk/vega.html). A tool pointing at a resource the server does not serve fails
+    silently — the host fetches, gets nothing, and renders an empty frame.
+
+- id: VIS-007
+  claim: >
+    Every `field` a spec names must be a real column of the result, or one the spec's own
+    transforms produce. A field that is neither is an ERROR — a chart is never silently plotted
+    against a column that does not exist.
+  source: CLAUDE.md#tool-surface
+  mode: behavioral
+  falsifier: >
+    A spec encoding a misspelled field renders as an empty or partial chart instead of raising,
+    or a legitimate `calculate`/`aggregate`/`fold` output is rejected as a missing column.
+  status: verified
+  covered_by:
+  - tests/test_visual.py::TestValidateSpec::test_rejects_a_field_that_is_not_a_column
+  - tests/test_visual.py::TestValidateSpec::test_allows_a_field_a_transform_invents
+  - tests/test_visual.py::TestValidateSpec::test_allows_fold_output_fields
+  - tests/test_visual.py::TestVisualTool::test_bad_field_errors_before_anything_renders
+  note: >
+    The successor to SHOW-008, and the sharpest reason a declarative spec was chosen over
+    agent-authored JSX: the artifact is data, so it can be checked BEFORE it draws. Vega-Lite's
+    own failure mode here is silent — a missing encoding field yields a blank or subtly wrong
+    chart with no error anywhere — which is exactly the mis-plot this refuses to ship. The
+    both-directions falsifier is deliberate: a guard that rejected transform outputs would be
+    worse than no guard, because it would push an agent away from transforms entirely.
+
+- id: VIS-008
+  claim: >
+    `data.url` is refused anywhere in a spec, and a spec may not carry its own top-level
+    `data` — every row comes from a saved result the server injects.
+  source: CLAUDE.md#key-concepts
+  mode: invariant
+  falsifier: >
+    A spec with `data: {url: ...}` (at the top level or nested in a layer/concat) is accepted
+    and reaches the renderer, making the viewer's browser fetch a host the server never saw.
+  status: verified
+  covered_by:
+  - tests/test_visual.py::TestValidateSpec::test_rejects_data_url
+  - tests/test_visual.py::TestValidateSpec::test_rejects_data_url_nested_in_a_layer
+  - tests/test_visual.py::TestValidateSpec::test_rejects_a_top_level_data_key
+  - tests/test_visual.py::TestValidateSpec::test_image_mark_url_encoding_is_not_mistaken_for_data_url
+  note: >
+    `data.url` is the one genuine egress channel in an otherwise declarative artifact, and it
+    is the reason the app page declares no connect_domains: both halves of the same stance.
+    The check is scoped to blocks reached through a `data` key rather than hunting for `url`
+    anywhere, because the image mark takes a legitimate `url` ENCODING channel — a false
+    positive there would reject a valid spec, which is its own failure.
+
+- id: VIS-009
+  claim: >
+    The stored/authored spec carries no data; the server hydrates it with inline `values` at
+    call time, so the renderer needs no round trip to draw.
+  source: CLAUDE.md#key-concepts
+  mode: invariant
+  falsifier: >
+    The payload sent to the host omits the rows, forcing the app to call back through the
+    tools/call proxy before it can render anything.
+  status: verified
+  covered_by:
+  - tests/test_visual.py::TestHydrate::test_injects_rows_as_inline_values
+  - tests/test_visual.py::TestHydrate::test_does_not_mutate_the_input_spec
+  note: >
+    The rule for anything added to a view: if a control would need a round trip, it does not
+    belong on a view. Hydrating server-side is what makes that affordable — the spec stays
+    portable and data-free for authoring, and the payload is self-contained for rendering. It
+    is also what will make a stored visual artifact replay cleanly against refreshed data
+    without being re-authored.
+
+- id: VIS-010
+  claim: >
+    The app page needs no `script-src 'unsafe-eval'`: Vega's expressions run through the
+    AST interpreter (`ast: true`), not the Function constructor.
+  source: CLAUDE.md#key-concepts
+  mode: invariant
+  falsifier: >
+    The page omits `ast: true`, so a deny-by-default sandbox CSP blocks expression compilation
+    and every chart with a signal, selection or sized axis fails to render.
+  status: verified
+  covered_by:
+  - tests/test_visual.py::TestAppPage::test_page_uses_the_csp_safe_expression_interpreter
+  note: >
+    Worth stating as a claim because it is invisible until it breaks, and because it was the
+    decisive technical argument for Vega-Lite over agent-authored JSX: JSX needs an in-browser
+    transpiler and therefore `unsafe-eval`, which is the directive that turns injected data
+    into a code-execution path. A declarative spec needs neither.
+
+- id: VIS-011
+  claim: >
+    `visual` serves its own ui:// app resource and declares the CSP ON THE RESOURCE, naming
+    every CDN host the page loads, at pinned versions.
+  source: CLAUDE.md#key-concepts
+  mode: invariant
+  falsifier: >
+    The CSP is declared on the tool instead of the resource (yielding a resource with no
+    policy), a bundle host is missing from resource_domains, or a version is floating.
+  status: verified
+  covered_by:
+  - tests/test_visual.py::TestAppPage::test_csp_declares_both_bundle_hosts
+  - tests/test_visual.py::TestAppPage::test_csp_grants_no_connect_domains
+  - tests/test_visual.py::TestAppPage::test_page_pins_every_bundle_version
+  - tests/test_visual.py::TestAppPage::test_page_is_deterministic
+  note: >
+    Inherits the hard-won part of SHOW-014: taking over the resource means FastMCP no longer
+    attaches a CSP for you, and declaring it on the TOOL yields a resource with no policy at
+    all — the host blocks every bundle and the frame stays blank with no error to debug. The
+    pins matter for the same reason prefab-ui was pinned exactly: the version selects the
+    JavaScript users' browsers fetch, not just what the server imports. `connect_domains` is
+    asserted ABSENT, which is the CSP half of VIS-008.
+
+- id: VIS-012
+  claim: >
+    A host that strips `structuredContent` from the tool-result it forwards (Claude Desktop,
+    modelcontextprotocol/ext-apps#696) still renders: the app captures the arguments from the
+    intact tool-input notification and re-fetches through the tools/call proxy.
+  source: CLAUDE.md#key-concepts
+  mode: behavioral
+  falsifier: >
+    On a host that strips structuredContent, the view stays on its loading message forever with
+    no recovery attempt and no diagnosis.
+  status: partial
+  covered_by:
+  - tests/test_visual.py::TestAppPage::test_page_has_a_static_fallback_naming_the_bundle_hosts
+  gap: >
+    The recovery path is JavaScript running in the host's iframe, so nothing in the Python
+    suite exercises it — the tests can assert the page CONTAINS the branch and the fallback
+    text, not that the branch works against a real stripping host. Closing this needs a
+    browser-driven test with a stub host, which is the same gap SHOW-015 carried.
+  note: >
+    Much smaller than the shim it replaces. Under Prefab the recovery had to monkey-patch
+    window.addEventListener to reach inside a transport we did not own; the ext-apps SDK
+    exposes both halves as documented API (`ontoolinput` for the arguments, `callServerTool`
+    for the re-fetch), so the whole path is a dozen lines guarded by
+    `if (!structuredContent && !isError)`. Re-calling is sound only because `visual` is
+    idempotent and read-only. Temporary: `grep -rn "ext-apps#696"` finds every line to delete.
+
+- id: VIS-013
+  claim: >
+    `visual` declares an outputSchema describing its summary, and every summary it returns
+    validates against it.
+  source: CLAUDE.md#tool-surface
+  mode: invariant
+  falsifier: A returned summary fails validation against the declared VISUAL_OUTPUT_SCHEMA.
+  status: verified
+  covered_by:
+  - tests/test_visual.py::TestOutputSchema::test_every_summary_validates_against_the_declared_schema
+  note: >
+    A declared schema a payload does not satisfy is worse than none — the host trusts it. The
+    test importorskips jsonschema, which is why jsonschema stays in the dev extra.
+
+- id: VIS-014
+  claim: >
+    A `visual` call logs one JSON line summarising the view — not the hydrated spec.
+  source: CLAUDE.md#running-the-server
+  mode: invariant
+  falsifier: >
+    The tool log contains the plotted rows, turning a usage log into a data dump.
+  status: verified
+  covered_by:
+  - tests/test_mcp_server.py::TestToolLogging::test_each_call_logs_one_json_line
+  note: >
+    The hydrated spec carries every plotted row inline, so logging the payload would bury the
+    line in data — the same reason `_summarize_result` unwrapped the Prefab component tree.
+
+- id: VIS-015
+  claim: >
+    Handed a result whose shape is the point, an agent draws a chart rather than dumping rows —
+    and aggregates first instead of hitting the cap.
+  source: CLAUDE.md#tool-surface
+  mode: affordance
+  falsifier: >
+    With `visual` available, an agent still answers a "which region grew fastest" question with
+    a wall of JSON, or reaches for a spec over a 100k-row result and takes the error as a dead
+    end rather than aggregating.
+  status: unverified
+  covered_by: []
+  gap: >
+    An affordance claim cannot be closed by unit tests: it is about what an agent DOES when
+    handed this surface, which needs a harness with an ablation arm (the same server with and
+    without `visual` registered). Inherited unchanged from SHOW-012 — and it is now the more
+    interesting of the two, because `visual` asks the agent to author a spec rather than pick a
+    `kind`, so the question is not only whether it draws but whether what it authors is any
+    good. That is the assumption the whole stored-artifact design rests on.

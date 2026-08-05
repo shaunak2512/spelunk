@@ -17,7 +17,7 @@ Postgres table to a result you built two steps ago — all in DuckDB SQL.
 | `spelunk/core/sources.py` | Source registry — maps a spec to a DuckDB attach/scan. DuckDB-only: a source it can't attach (e.g. SQL Server) is rejected. |
 | `spelunk/core/guard.py` | sqlglot AST safety: read-only enforcement (`assert_read_only`). |
 | `spelunk/mcp/server.py` | Thin FastMCP wrapper over `DuckSession`. |
-| `spelunk/mcp/views.py` | MCP Apps rendering for `show` (optional `[ui]` extra). |
+| `spelunk/mcp/vega.py` | MCP Apps rendering for `visual` — Vega-Lite spec guard + hydration, and the app page. |
 | `tests` | Acceptance tests. |
 
 ## Tools
@@ -32,58 +32,52 @@ catalog(flow?)              # list flows, or the results in one flow
 drop(name?, flow?)          # drop one result, or a whole flow
 lineage(name?, flow?)       # provenance DAG: the SQL + deps that built a result (or a whole flow)
 replay(flow?, into?)        # rebuild a flow from its recorded SQL, in dependency order
-show(name?, kind?, ...)     # [ui extra] DISPLAY it in the chat: an interactive table, a bar/
-                            #   line/area/scatter/pie chart, a profile dashboard, the catalog,
-                            #   or the lineage DAG as a diagram. A view, never a new result.
+visual(name, spec, ...)     # DRAW a saved result in the chat as an interactive Vega-Lite
+                            #   chart. `spec` is a Vega-Lite spec with NO `data` — the server
+                            #   injects the rows. A view, never a new result.
 ```
 
 Discovery resources: `db://tables` (queryable source objects) and `db://{table}` (columns, PK,
 sample, row count). A **flow** is an isolated result namespace (a DuckDB schema); give each
 concurrent line of analysis its own flow.
 
-### Charts and tables in the chat
+### Charts in the chat
 
-Install the `ui` extra and Spelunk registers `show`, which renders results as
-[MCP Apps](https://modelcontextprotocol.io/docs/extensions/apps) — interactive components that
-appear inline in Claude Desktop, claude.ai, VS Code Copilot, Goose and other UI-capable hosts:
-
-```bash
-uvx --from "spelunk-mcp[ui]" spelunk --source sales=./data/sales.parquet
-```
+`visual` renders a saved result as an [MCP App](https://modelcontextprotocol.io/docs/extensions/apps)
+— an interactive chart that appears inline in Claude Desktop, claude.ai, VS Code Copilot, Goose
+and other UI-capable hosts. No extra to install: a Vega-Lite spec is JSON and the app page is a
+string, so the display surface ships in the core package.
 
 ```text
 query("SELECT region, sum(revenue) AS revenue FROM sales GROUP BY region", "by_region")
-show("by_region", kind="bar")        # -> a real bar chart in the conversation
-show("by_region", kind="profile")    # -> per-column stats as a dashboard
-show(kind="lineage")                 # -> the pipeline DAG, drawn
+visual("by_region", {"mark": "bar", "encoding": {
+    "x": {"field": "region", "type": "nominal"},
+    "y": {"field": "revenue", "type": "quantitative"}}})
 ```
 
-Two things worth knowing. **A view is not a result** — `show` creates no table and records no
-lineage, so there is nothing to clean up afterwards. And **aggregate before you show**: charts
-cap at 200 rows and error rather than truncating, because a quietly shortened chart misstates
-the data. Group in SQL, render the small thing. Hosts that can't display MCP Apps lose nothing —
-`show` also returns a text summary, so the tool still works in a terminal.
+You write a [Vega-Lite](https://vega.github.io/vega-lite/) spec **without a `data` key** — the
+server injects the result's rows for you. That is the whole point: instead of picking from a
+fixed menu of chart kinds, you get the full grammar (layering, faceting, binning, tooltips,
+`params` selections for brushing and cross-filtering) and the data never has to be named twice.
 
-To see a view without any chat client, render it to a standalone HTML file — Prefab inlines the
-whole renderer, so the page opens offline:
+Three things worth knowing:
 
-```python
-from prefab_ui.app import PrefabApp
-from spelunk.core.duck import DuckSession
-from spelunk.mcp import views
+- **A view is not a result.** `visual` creates no table and records no lineage, so there is
+  nothing to clean up afterwards.
+- **Every `field` is checked against the real schema** before anything renders. Vega-Lite draws a
+  misspelled field as a blank chart *silently*; Spelunk errors instead and names the columns you
+  actually have. Fields your own `transform` creates are fine.
+- **Aggregate first.** Capped at 5000 rows, erroring rather than truncating, because a quietly
+  shortened chart misstates the data. Group in SQL, draw the small thing.
 
-session = DuckSession.open(["sales=./data/sales.parquet"])
-session.query("SELECT region, sum(revenue) AS revenue FROM sales GROUP BY region", "by_region")
-
-cols, rows = session.rows_for_display("by_region")
-page = PrefabApp(view=views.result_chart("bar", cols, rows)).html(renderer_mode="bundled")
-```
+Hosts that can't display MCP Apps lose nothing — `visual` also returns a text summary (with the
+rows themselves when the result is small), so the tool still works in a terminal.
 
 > **Claude Desktop note.** Claude Desktop currently strips `structuredContent` from the tool
 > result it forwards to an app view ([ext-apps#696](https://github.com/modelcontextprotocol/ext-apps/issues/696)),
-> which leaves every MCP App — not just Spelunk's — stuck on "Waiting for content…". Spelunk ships
-> a recovery shim in its renderer that re-fetches through the host's `tools/call` proxy, which is
-> unaffected. It is a no-op on hosts that deliver the field correctly (claude.ai, MCP Jam).
+> which leaves every MCP App — not just Spelunk's — stuck with no data. Spelunk's app recovers by
+> re-fetching through the host's `tools/call` proxy, which is unaffected. It is a no-op on hosts
+> that deliver the field correctly (claude.ai, MCP Jam).
 
 ## Install & run
 

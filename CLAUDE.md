@@ -19,9 +19,9 @@ Parquet file to a Postgres table to a result built two steps ago — all in Duck
 ## Commands
 
 ```powershell
-uv sync --extra dev                                   # install (dev pulls in prefab-ui, so
-                                                      #   tests/test_show.py runs, not skips)
-uv sync --extra ui                                    # runtime install WITH the `show` tool
+uv sync --extra dev                                   # install (dev pulls in jsonschema, so
+                                                      #   the output-schema test runs, not skips)
+uv sync                                               # runtime install — `visual` is always on
 uv run --extra dev python -m pytest -q                # all tests
 .\.venv\Scripts\python.exe -m pytest tests\test_duck.py -q   # one file
 uv run --extra dev ruff check spelunk/                # lint
@@ -138,25 +138,28 @@ spelunk/core/
 
 spelunk/mcp/
   server.py      # FastMCP wrapper: build_server(session) registers 7 tools + 2 resources
-                 #   (+3 behind --allow-add-source: add_source/remove_source/fetch; +`show`
-                 #   when the [ui] extra is installed);
+                 #   (+3 behind --allow-add-source: add_source/remove_source/fetch);
                  #   main() parses --source specs and serves over stdio (default) or
                  #   streamable HTTP (--transport http, 127.0.0.1:8080/mcp — with an
                  #   Origin/Host guard against DNS rebinding)
-  views.py       # The MCP Apps layer: pure `data -> Prefab component` builders behind ONE
-                 #   import guard (PREFAB_AVAILABLE), which is what decides whether `show` is
-                 #   registered. No DuckDB, no FastMCP — every builder takes plain dicts, so the
-                 #   whole rendering surface unit-tests without a client. Prefab traps worth
-                 #   knowing: a component attaches to whichever container is open at
-                 #   CONSTRUCTION time, so building one and then naming it inside a `with` block
-                 #   registers NOTHING and drops it from the payload silently (hence `_titled`
-                 #   and `_composed` take a callable, not a component); the chart components live
-                 #   in `prefab_ui.components.charts`, not the top-level `components` namespace;
-                 #   and a stateful component left to auto-name itself gets its key from a
-                 #   ContextVar COUNTER, so it drifts (tabs_1, tabs_2, ...) across successive
-                 #   calls in one process — pass `name=` (see VIEW_TAB_STATE) for a payload that
-                 #   is the same every time and has something stable to assert on.
-```
+  vega.py        # The MCP Apps layer: pure `spec -> hydrated Vega-Lite spec` builders plus the
+                 #   app page. No DuckDB, no FastMCP — every function takes plain dicts, so the
+                 #   whole rendering surface unit-tests without a client OR a browser. That is
+                 #   the property a DECLARATIVE spec was chosen for over agent-authored JSX: the
+                 #   artifact is data, so it can be inspected before it draws.
+                 #   Server half: validate_spec() (the guard — refuses `data.url`, a top-level
+                 #   `data`, and any `field` that is neither a real column nor produced by the
+                 #   spec's own transforms) + hydrate() (injects the rows as inline `values`).
+                 #   Client half: app_html() (a hand-written page wired to the host through
+                 #   @modelcontextprotocol/ext-apps, drawing with vega-embed) + app_csp().
+                 #   Traps worth knowing: `ast: true` is NOT optional — Vega compiles
+                 #   expressions with the Function constructor by default, which a
+                 #   deny-by-default sandbox CSP refuses, and the bundled AST interpreter is what
+                 #   avoids needing `script-src 'unsafe-eval'`; a field a `transform` INVENTS is
+                 #   not a column, so validate_spec collects every `as` output first or it would
+                 #   reject perfectly good specs; and the data-url check is scoped to blocks under
+                 #   a `data` key, because the image mark takes a legitimate `url` ENCODING
+                 #   channel.
 
 **`__init__.py` files do not re-export submodules** — import from the submodule directly
 (`from spelunk.core.duck import DuckSession`).
@@ -174,7 +177,7 @@ One row-returning tool (`query`) owns every SELECT; inspection lives on the reso
 | `drop(name?, flow?)` | Drop one result, or a whole flow (name omitted). |
 | `lineage(name?, flow?, render?, path?)` | Provenance graph: with `name`, the upstream closure (transitive, cross-flow) that built a result; without, the whole flow's DAG. Returns nodes (SQL, deps, sources, kind), edges, a dependency-first `order`, and `missing` deps. `render="mermaid"` (or `"dot"`) adds a deterministic, ready-to-display diagram string (key = the format name) built server-side from the same nodes/edges — no agent parsing; Mermaid pastes into markdown/artifacts, DOT runs through `dot -Tsvg`. `path` writes it to a file (implies `render="mermaid"`, echoes `rendered_to`). Read-only. |
 | `replay(flow?, into?, dry_run?)` | Rebuild a flow from its recorded SQL in dependency order (re-run each `query`). `into` → non-destructive rebuild into a fresh flow; omitted → in-place refresh; `dry_run` → plan only. Errors on a dependency cycle. Sources + cross-flow results are read, not rebuilt. |
-| `show(name?, kind?, x?, y?, series?, title?, flow?, interactive?)` | **Only registered with the `[ui]` extra** — DISPLAY something in the chat as an MCP App: an interactive `table`, a `bar`/`line`/`area`/`scatter`/`pie` chart of a saved result, a `profile` dashboard, the `catalog`, or a `lineage` DAG as a rendered Mermaid diagram. **A view is not a result:** creates no table, records no lineage node, nothing to `drop`. Every kind that names ONE result (table, charts, profile) also gets a **Lineage tab** beside the data — the same `_lineage_body` `kind='lineage'` draws, so the two can't drift — flipped client-side like the measure picker; the summary reports it under `provenance` (step order only, not the whole DAG). `catalog` is excluded (often a flow *list*, no single DAG) and so is `lineage` itself. A result with no recorded lineage row renders with no tab rather than failing — `DuckSession.lineage()` **raises** for an unrecorded result, so `_provenance` catches it. Returns *both* halves of an MCP result — a JSON text summary the model reads (mirroring `query`'s sample contract: every row when small, else a 5-row head) **and** the Prefab payload a UI host renders — so there is no host-detection branch to get wrong and a text-only host degrades by simply ignoring `structuredContent`. Charts cap at 200 rows, tables at a few thousand; past the cap it **errors rather than truncating**, because a silently shortened view is a picture that misstates the data. Axes default to the first label column + first numeric column; a named column that doesn't exist is an error, never a silent mis-plot. `interactive=true` on a multi-measure chart adds a measure picker that swaps charts **in the renderer** (a Prefab `Condition` node) — no tool call, rows carried once in app state; the summary then reports `showing` because only one measure is on screen. |
+| `visual(name, spec, title?, flow?)` | DRAW a saved result in the chat as an interactive Vega-Lite chart. Registered **unconditionally** — a spec is JSON and the app page is a string, so there is no optional rendering package to be missing. `spec` is a Vega-Lite spec **with no `data` key**: the server injects the result's rows, so the agent gets the whole grammar (`mark`, `encoding`, `transform`, `layer`, `facet`, `hconcat`/`vconcat`, `params` for selections, tooltips, binning) without ever naming a data source. **A view is not a result:** creates no table, records no lineage node, nothing to `drop`; an unknown `flow` is refused rather than provisioned. Three refusals, all server-side, all before anything renders: a top-level `data` (the server owns the rows), `data.url` anywhere (the one real egress channel — it would make the *viewer's* browser fetch a host we never see), and any `field` that is neither a column of the result nor produced by the spec's own `transform` (Vega-Lite draws a missing field as a blank chart *silently*, which is exactly the mis-plot to refuse). Returns *both* halves of an MCP result — a JSON text summary the model reads (mirroring `query`'s sample contract: every row when small, else a 5-row head, plus `fields` naming only what the spec actually plots) **and** the hydrated spec a UI host renders — so there is no host-detection branch to get wrong and a text-only host degrades by simply ignoring `structuredContent`. Caps at 5000 rows and **errors rather than truncating**, because a silently shortened chart is a picture that misstates the data. |
 | `add_source(spec)` / `remove_source(name)` | **Only registered with `--allow-add-source`** — attach/detach a file or DB at runtime (`spec` is the same grammar as `--source`). Connection-global: a source is visible in **every flow**, not flow-scoped (DuckDB `ATTACH` can't be per-schema). Isolation comes from the process-per-agent model. |
 | `fetch(source, path, name, params?, rows_from?, …)` | **Only registered with `--allow-add-source`** (agent-initiated network reach is one capability, one gate) — call ONE endpoint of an attached `openapi:` **connection** and materialize the response as result `name`. Same return shape as `query`. **One API is one source:** attach it once, then fetch as many endpoints as you like — each response is a flow-scoped *result* (droppable, in `lineage`), never a new source. `params` is a JSON object; a `{placeholder}` in `path` consumes the param of that name as a path segment. `rows_from=<result>` binds remaining placeholders to that result's columns and fetches **one URL per distinct row** (list→detail fan-out), stamping `_key_<placeholder>` for the join back. `steps=[…]` batches several fetches per round trip (fail-fast, like `query`). |
 
@@ -213,41 +216,41 @@ views named bare) and `db://{table}` (columns, PK, sample, row count).
   deterministic rebuilding would import network latency, rate limits, and a changed upstream. They
   are reported under `preserved` (and copied when rebuilding `into` a fresh flow); refresh =
   `fetch` again.
-- **A view is not a result.** `show` renders; it never builds. No `CREATE TABLE`, no lineage row,
+- **A view is not a result.** `visual` renders; it never builds. No `CREATE TABLE`, no lineage row,
   nothing in `catalog`, nothing to `drop` — the mirror of "a fetched endpoint is a result, not a
-  source". This survives the interactive surfaces because every control is *client-side state*:
-  the measure picker and the Lineage tab both compile to renderer nodes (`Condition`, `Tabs`), so
-  the user drives them without a tool call ever firing. The rule for anything added here: if a
-  control would need a round trip, it doesn't belong on a view. That boundary is why the data tools were left alone: `query` was **not** made an
-  `app=True` tool, because FastMCP replaces the model-visible content of an app tool with the
-  literal string `[Rendered Prefab UI]` (`fastmcp/tools/base.py`), which would make every result
-  pretty for the human and invisible to the agent — breaking the `complete: true` contract and
-  the agent's ability to chain a result into the next step. One display verb beside the data
-  tools, rather than four app tools replacing them. The corollary for anything added later:
-  **never return a bare Prefab component from a tool** — build a `ToolResult` with a real text
-  summary, or the model is handed the placeholder and nothing else.
-- **Rendering needs the client online.** The `ui://` renderer resource is a stub whose JS/CSS come
-  from `cdn.jsdelivr.net` at the pinned `prefab-ui` version (declared in the resource's own CSP,
-  so a compliant host allows it). The *server* needs no network, but the *viewer's* browser does —
-  an air-gapped host shows the text half only. This is why `[ui]` pins `prefab-ui` **exactly**, as
-  the Prefab/FastMCP guide instructs: the version selects the JS bundle users' browsers fetch, not
-  just the Python import.
-- **Spelunk serves its own renderer resource** (`ui://spelunk/renderer.html`, built from
-  `prefab_ui.renderer.get_renderer_html()` — see `views.recovery_renderer_html`), instead of the
-  per-tool one FastMCP synthesizes. Two additions, both ours: a **bootstrap view** baked into
-  `prefab:initial-data` (Prefab seeds its view state from that tag, so something renders
-  immediately rather than sitting on "Waiting for content…"), and a **recovery shim** for
+  source". It survives interactivity because every control is *client-side state*: a Vega-Lite
+  `params` selection is a renderer node, so the user drives it without a tool call ever firing.
+  The rule for anything added here: if a control would need a round trip, it doesn't belong on a
+  view. That is also why the spec arrives data-free and the server **hydrates** it with inline
+  `values` — the payload is self-contained, so the app never has to call back to draw. The same
+  boundary is why the data tools were left alone: `query` was **not** made an `app=True` tool,
+  because FastMCP replaces the model-visible content of an app tool with a literal placeholder
+  string (`fastmcp/tools/base.py`), which would make every result pretty for the human and
+  invisible to the agent — breaking the `complete: true` contract and the agent's ability to
+  chain a result into the next step. One display verb beside the data tools. The corollary for
+  anything added later: **never return a bare UI payload from a tool** — build a `ToolResult`
+  with a real text summary, or the model is handed the placeholder and nothing else.
+- **Rendering needs the client online.** The `ui://spelunk/vega.html` app loads vega, vega-lite
+  and vega-embed from `cdn.jsdelivr.net` and the ext-apps SDK from `unpkg.com`, at versions pinned
+  exactly in `vega.py` and declared in the resource's own CSP. The *server* needs no network, but
+  the *viewer's* browser does — an air-gapped host shows the text half only, and the page carries
+  a static fallback that names the blocked hosts rather than rendering a blank rectangle. The pins
+  are load-bearing for the same reason the old `prefab-ui` pin was: the version selects the JS
+  users' browsers fetch, not just what the server imports. The CSP grants `resource_domains` only
+  — **no `connect_domains`**, because a view that could fetch would be a view that could
+  exfiltrate; that is the client-side half of refusing `data.url`.
+- **Spelunk serves its own app resource** rather than one FastMCP synthesizes, and the CSP belongs
+  on the **resource**, not the tool — that is where the host reads it from. Declaring it on the
+  tool instead silently yields a resource with no policy: the host blocks every bundle and the
+  frame stays blank, with no error and nothing to debug. The page also carries a recovery path for
   [ext-apps#696](https://github.com/modelcontextprotocol/ext-apps/issues/696) — Claude Desktop
-  strips `structuredContent` from the tool-result it forwards to a view, so the shim captures the
+  strips `structuredContent` from the tool-result it forwards to a view, so the app captures the
   args from the intact `tool-input` notification and re-fetches through the host's `tools/call`
-  proxy, which is unaffected. It re-delivers by calling Prefab's own message listener directly
-  with a plain object carrying `source: window.parent`, because Prefab's transport discards any
-  message whose source isn't the parent frame — and the shim applies that same identity check to
-  the recovery response it accepts, since the request id is fixed and guessable. **Taking over the resource means FastMCP no longer attaches Prefab's CSP for you**
-  — `show` must declare it (`views.renderer_csp()`) or a strict host blocks the bundle. The whole
-  shim is behind `if (!structuredContent && !isError)`, so it never fires on a healthy host, and
-  re-calling is sound *only* because `show` is idempotent. Temporary: `grep -rn "ext-apps#696"`
-  finds every line to delete.
+  proxy, which is unaffected. Both halves are documented ext-apps SDK API (`ontoolinput`,
+  `callServerTool`), so unlike the hand-rolled shim this replaced there is no transport internal
+  to reach into. It is behind `if (!structuredContent && !isError)`, so it never fires on a
+  healthy host, and re-calling is sound *only* because `visual` is idempotent. Temporary:
+  `grep -rn "ext-apps#696"` finds every line to delete.
 - **Disk-backed always + out-of-core:** the workspace is a real DuckDB file (under `--session-dir`,
   else a temp dir). Sources are read on demand with pushdown; buffering operators spill to
   `temp_directory`, so a source larger than `memory_limit` is the normal case, not a failure.

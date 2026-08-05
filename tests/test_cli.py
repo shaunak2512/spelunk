@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import importlib.util
 import json
 import socket
 import subprocess
@@ -30,17 +29,12 @@ from pathlib import Path
 
 import pytest
 
-DOCUMENTED_TOOLS = {"query", "profile", "export", "catalog", "drop", "lineage", "replay"}
-# `show` is registered only when the optional [ui] extra (prefab-ui) is installed. Decide that
-# from whether prefab-ui is INSTALLED — deliberately NOT from views.PREFAB_AVAILABLE, which is
-# the very flag the server consults: deriving the expectation from the implementation's own
-# signal means a broken detection (prefab-ui present, import guard wrongly False) drops `show`
-# from both sides at once and the assertion passes on a server that lost the tool. find_spec is
-# an independent answer, so the two can disagree and the test says so. The subprocess under
-# test runs this same interpreter, so what is importable here is importable there.
-PREFAB_INSTALLED = importlib.util.find_spec("prefab_ui") is not None
-if PREFAB_INSTALLED:
-    DOCUMENTED_TOOLS |= {"show"}
+# `visual` is unconditional: a Vega-Lite spec is JSON and the app page is a string, so the
+# display surface needs no optional Python package. (It replaced `show`, which was registered
+# only when prefab-ui happened to be installed.)
+DOCUMENTED_TOOLS = {
+    "query", "profile", "export", "catalog", "drop", "lineage", "replay", "visual",
+}
 GATED_TOOLS = {"add_source", "remove_source", "fetch"}
 
 STARTUP_TIMEOUT = 90.0  # cold DuckDB + extension load on Windows CI is not fast
@@ -183,20 +177,14 @@ class TestStdioTransport:
         """MCP-001 as set EQUALITY: an undocumented tool fails here too."""
         assert _tool_names(server) == DOCUMENTED_TOOLS
 
-    @pytest.mark.skipif(not PREFAB_INSTALLED, reason="prefab-ui not installed (lean install)")
-    def test_show_is_registered_when_prefab_is_installed(self, server):
-        """The UI-enabled half, stated outright rather than folded into DOCUMENTED_TOOLS.
+    def test_visual_is_always_registered(self, server):
+        """`visual` has no optional dependency, so it can never be silently missing.
 
-        Named directly so the [ui] expectation cannot be satisfied by the same guard that
-        registers the tool: if prefab-ui is importable and `show` is still missing, that is a
-        detection or registration failure and it must fail HERE, loudly.
+        The old `show` was gated on prefab-ui being importable, which meant a lean install lost
+        the display surface entirely. Nothing gates `visual` — if this fails, the registration
+        was made conditional again.
         """
-        assert "show" in _tool_names(server)
-
-    @pytest.mark.skipif(PREFAB_INSTALLED, reason="prefab-ui is installed (ui/dev install)")
-    def test_show_is_absent_without_prefab(self, server):
-        """The lean-install half: no prefab-ui means no `show`, and no import error either."""
-        assert "show" not in _tool_names(server)
+        assert "visual" in _tool_names(server)
 
     def test_gated_tools_absent_without_the_flag(self, server):
         assert _tool_names(server) & GATED_TOOLS == set()
