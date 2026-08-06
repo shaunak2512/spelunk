@@ -215,6 +215,135 @@ class TestToolLogging:
         assert rec["error"]
 
 
+class TestConsoleLogging:
+    """The human-readable stderr mirror — what makes `--transport http` legible in a terminal.
+
+    Records are captured off the `fastmcp.spelunk` logger directly rather than through `caplog`:
+    FastMCP sets `propagate = False` on the `fastmcp` logger, so nothing reaches pytest's root
+    handler and caplog would see an empty list whether the feature worked or not.
+    """
+
+    @staticmethod
+    def _sink():
+        import logging
+
+        records: list[logging.LogRecord] = []
+
+        class _Sink(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        handler = _Sink()
+        logging.getLogger("fastmcp.spelunk").addHandler(handler)
+        return records, handler
+
+    @staticmethod
+    def _detach(handler):
+        import logging
+
+        logging.getLogger("fastmcp.spelunk").removeHandler(handler)
+
+    def test_silent_unless_enabled(self, sqlite_file):
+        records, handler = self._sink()
+        session = DuckSession.open([f"shop={sqlite_file}"])
+        try:
+            srv = build_server(session)  # console_log defaults off, like tool_log
+            _run(srv.call_tool("query", {"sql": "SELECT 1 AS x", "name": "x"}))
+        finally:
+            session.close()
+            self._detach(handler)
+        assert records == []
+
+    def test_success_logs_one_info_line(self, sqlite_file):
+        records, handler = self._sink()
+        session = DuckSession.open([f"shop={sqlite_file}"])
+        try:
+            srv = build_server(session, console_log=True)
+            _run(srv.call_tool("query", {"sql": 'SELECT * FROM "shop"."customers"', "name": "c"}))
+        finally:
+            session.close()
+            self._detach(handler)
+
+        assert len(records) == 1
+        assert records[0].levelname == "INFO"
+        msg = records[0].getMessage()
+        assert "query(name='c' flow='default')" in msg and "ok in" in msg and "rows" in msg
+
+    def test_raised_error_logs_message_and_sql(self, sqlite_file):
+        from fastmcp.exceptions import ToolError
+
+        records, handler = self._sink()
+        session = DuckSession.open([f"shop={sqlite_file}"])
+        try:
+            srv = build_server(session, console_log=True)
+            with pytest.raises(ToolError):
+                _run(srv.call_tool("query", {"sql": "SELECT * FROM nope", "name": "x"}))
+        finally:
+            session.close()
+            self._detach(handler)
+
+        assert [r.levelname for r in records] == ["ERROR"]
+        msg = records[0].getMessage()
+        assert "failed in" in msg
+        assert "nope" in msg  # the DuckDB message
+        assert "sql: SELECT * FROM nope" in msg  # ...and the query that caused it
+
+    def test_failed_batch_step_logs_error(self, sqlite_file):
+        """The case that would otherwise be invisible: a batch fails fast but RETURNS normally,
+        so nothing raises and neither uvicorn nor FastMCP reports anything gone wrong."""
+        records, handler = self._sink()
+        session = DuckSession.open([f"shop={sqlite_file}"])
+        try:
+            srv = build_server(session, console_log=True)
+            _run(srv.call_tool("query", {"steps": [
+                {"sql": 'SELECT * FROM "shop"."customers"', "name": "base"},
+                {"sql": "SELECT * FROM missing_table", "name": "bad"},
+                {"sql": "SELECT 1 AS z", "name": "never"},
+            ]}))
+        finally:
+            session.close()
+            self._detach(handler)
+
+        assert [r.levelname for r in records] == ["ERROR"]
+        msg = records[0].getMessage()
+        assert "step 2/3 'bad' failed" in msg
+        assert "missing_table" in msg
+        assert "1 completed, 1 skipped" in msg
+
+    def test_credentials_redacted_in_batch_step_error(self, tmp_path):
+        """Same masking rule as the JSONL sink — an error path must not print what the arg path
+        withholds. `fetch`/`add_source` errors quote the DSN straight back."""
+        from spelunk.mcp.server import _console_report
+
+        records, handler = self._sink()
+        from spelunk.mcp import server as server_mod
+
+        server_mod._configure_console_logging(True)
+        try:
+            _console_report(
+                {"tool": "add_source", "args": {}, "outcome": "ok", "duration_ms": 1.0},
+                {"failed_step": 0, "completed": 0, "steps": [
+                    {"name": "s", "status": "failed",
+                     "error": "could not connect: postgresql://bob:hunter2@db/x password=hunter2"},
+                ]},
+            )
+        finally:
+            server_mod._configure_console_logging(False)
+            self._detach(handler)
+
+        msg = records[0].getMessage()
+        assert "hunter2" not in msg and "//***@" in msg and "password=***" in msg
+
+    def test_auto_stands_down_when_tool_log_is_stderr(self):
+        from spelunk.mcp.server import _resolve_console_log
+
+        assert _resolve_console_log("auto", "/tmp/tool-calls.jsonl") is True
+        assert _resolve_console_log("auto", None) is True
+        assert _resolve_console_log("auto", "-") is False  # would double every call on stderr
+        assert _resolve_console_log("on", "-") is True
+        assert _resolve_console_log("off", "/tmp/tool-calls.jsonl") is False
+
+
 class TestDescriptionGating:
     def test_param_absent_without_flag(self, mcp_server):
         q = next(t for t in _run(mcp_server.list_tools()) if t.name == "query")

@@ -34,6 +34,7 @@ from urllib.parse import urlsplit
 from fastmcp import FastMCP
 from fastmcp.apps.config import AppConfig, ResourceCSP
 from fastmcp.tools.base import ToolResult
+from fastmcp.utilities.logging import get_logger as _fastmcp_get_logger
 from mcp.types import TextContent
 from pydantic import BaseModel, Field
 
@@ -69,6 +70,19 @@ _tool_logger = logging.getLogger("spelunk.toolcalls")
 _tool_logger.addHandler(logging.NullHandler())
 _tool_logger.setLevel(logging.INFO)
 _tool_logger.propagate = False
+
+# Human-readable mirror of that log, on FastMCP's OWN logger tree (`fastmcp.spelunk`) rather than
+# a handler of ours: FastMCP configures the `fastmcp` logger with rich handlers on stderr, so a
+# child logger inherits the exact formatting of the startup/uvicorn lines beside it and there is
+# no second logging stack to keep in sync. Purely additive — the JSONL sink is untouched.
+#
+# The reason it exists is `--transport http`, where the terminal is the operator's only view of
+# the server: uvicorn prints one `POST /mcp 200 OK` per request no matter what happened inside,
+# so a tool that RAISED is indistinguishable from one that succeeded. Off unless switched on, so
+# library/test callers stay silent (same rule as `tool_log`). Never stdout — that channel is the
+# stdio MCP transport.
+_console_logger = _fastmcp_get_logger("spelunk")
+_console_enabled = False
 
 # Args worth recording verbatim (SQL kept full — that's the point of the log); long head samples
 # and row payloads are summarised, never dumped. `steps` is a batch of {sql, name} — full SQL kept.
@@ -143,6 +157,106 @@ def _configure_tool_logging(tool_log: str | None) -> None:
     _tool_logger.addHandler(handler)
 
 
+def _configure_console_logging(enabled: bool) -> None:
+    """Turn the human-readable per-call console line on or off.
+
+    A module-level flag rather than a handler swap: the handlers belong to FastMCP's `fastmcp`
+    logger, which is shared process-wide and must not be reconfigured by us.
+    """
+    global _console_enabled
+    _console_enabled = enabled
+
+
+def _resolve_console_log(choice: str, tool_log: str | None) -> bool:
+    """Turn ``--console-log {auto,on,off}`` into a boolean.
+
+    ``auto`` stands down when the JSONL sink is already stderr: both lines would carry the same
+    call to the same stream, and an operator who passed ``--tool-log -`` asked for the
+    machine-readable one by name.
+    """
+    return choice == "on" or (choice == "auto" and tool_log != "-")
+
+
+# Args that identify WHICH call a console line is about, in the order they read best. `sql` is
+# deliberately absent — it goes on its own continuation line, and only when something failed.
+_CONSOLE_IDENT_ARGS = ("name", "flow", "target", "source", "path", "format", "into", "kind")
+_CONSOLE_SQL_LIMIT = 300
+
+
+def _console_trim(text: str, limit: int = _CONSOLE_SQL_LIMIT) -> str:
+    """Collapse a SQL string to one line for the terminal — the log file keeps the full text."""
+    flat = " ".join(str(text).split())
+    return flat if len(flat) <= limit else flat[: limit - 1] + "…"
+
+
+def _console_ident(args: dict) -> str:
+    """`name='top_albums' flow='default'` — enough to tell two concurrent calls apart."""
+    parts = [f"{k}={args[k]!r}" for k in _CONSOLE_IDENT_ARGS if args.get(k) is not None]
+    steps = args.get("steps")
+    if isinstance(steps, list):
+        parts.append(f"steps={len(steps)}")
+    return " ".join(parts)
+
+
+def _console_outcome(summary: dict) -> str:
+    """The few result numbers worth a terminal line — row/step counts, not row data."""
+    bits = []
+    if "row_count" in summary:
+        n = summary["row_count"]
+        bits.append(f"{n} row" if n == 1 else f"{n} rows")
+    if "step_count" in summary:
+        bits.append(f"{summary.get('completed', 0)}/{summary['step_count']} steps ok")
+    for key, label in (("nodes_count", "nodes"), ("dropped_results", "dropped"),
+                       ("rebuilt_count", "rebuilt")):
+        if key in summary:
+            bits.append(f"{summary[key]} {label}")
+    return f" — {', '.join(bits)}" if bits else ""
+
+
+def _console_report(record: dict, result: object = None) -> None:
+    """Emit one human-readable line for a finished tool call, at INFO or ERROR.
+
+    Takes the SAME ``record`` the JSONL line is built from, so the two can't describe different
+    things. ``result`` is the RAW tool return (not the summary) because a batch reports failure
+    *in* its return value: `query(steps=[...])` is fail-fast but does not raise — it comes back
+    with ``failed_step`` and a per-step ``error``. Logging only raised exceptions would miss the
+    single most common failure an agent produces, since agents are told to always batch.
+    """
+    if not _console_enabled:
+        return
+
+    tool, args = record["tool"], record.get("args", {})
+    call = f"{tool}({_console_ident(args)})"
+    took = f"{record.get('duration_ms')}ms"
+
+    if record["outcome"] == "error":
+        detail = ""
+        if args.get("sql"):
+            detail = f"\n    sql: {_console_trim(args['sql'])}"
+        _console_logger.error(f"{call} failed in {took} — {record['error']}{detail}")
+        return
+
+    step_failure = (
+        isinstance(result, dict) and result.get("failed_step") is not None
+    )
+    if step_failure:
+        index = result["failed_step"]
+        steps = result.get("steps") or []
+        failed = steps[index] if index < len(steps) else {}
+        skipped = sum(1 for s in steps if s.get("status") == "skipped")
+        sent = args.get("steps") or []
+        sql = sent[index].get("sql") if index < len(sent) and isinstance(sent[index], dict) else None
+        detail = f"\n    sql: {_console_trim(sql)}" if sql else ""
+        _console_logger.error(
+            f"{call} step {index + 1}/{len(steps)} {failed.get('name')!r} failed in {took} — "
+            f"{_redact(failed.get('error', ''))} "
+            f"[{result.get('completed', 0)} completed, {skipped} skipped]{detail}"
+        )
+        return
+
+    _console_logger.info(f"{call} ok in {took}{_console_outcome(record.get('result', {}))}")
+
+
 def _summarize_result(result: object) -> dict:
     """Compact, log-safe view of a tool result — counts and identifiers, not full row data."""
     if isinstance(result, ToolResult):
@@ -196,11 +310,13 @@ def _logged(fn):
             record["error"] = _redact(f"{type(exc).__name__}: {exc}")
             record["duration_ms"] = round((time.perf_counter() - start) * 1000, 1)
             _tool_logger.info(json.dumps(record, default=str))
+            _console_report(record)
             raise
         record["outcome"] = "ok"
         record["result"] = _summarize_result(result)
         record["duration_ms"] = round((time.perf_counter() - start) * 1000, 1)
         _tool_logger.info(json.dumps(record, default=str))
+        _console_report(record, result)
         return result
 
     return wrapper
@@ -344,6 +460,10 @@ def _dispatch_visual(
     columns, rows = session.rows_for_display(name, resolved, max_rows=vega.VEGA_MAX_ROWS)
     validated = vega.validate_spec(spec, columns)
     hydrated = vega.hydrate(validated, rows, title)
+    # The row cap bounds legibility; this bounds DELIVERY. A payload past the host's threshold is
+    # diverted to a sandbox file and the view is handed a pointer, so it renders blank with no
+    # error — refuse it here where the message can say so.
+    payload_chars = vega.assert_payload_fits(hydrated, len(rows), name)
 
     # Mirror `query`'s contract exactly: every row when the result is small on both axes,
     # otherwise a short head. The model then reads a small deliverable straight out of the text
@@ -357,6 +477,13 @@ def _dispatch_visual(
         "row_count": len(rows),
         "columns": [c["name"] for c in columns],
         "fields": vega.spec_fields(validated, columns),
+        # Named so the agent can see how close a working chart is to the delivery ceiling, and
+        # aggregate BEFORE the next one errors rather than after.
+        "payload_chars": payload_chars,
+        # The fingerprint of the app page THIS server would serve. The view stamps the same value
+        # into its own error readout, so a mismatch between the two says the host is rendering a
+        # cached page — the one question that otherwise costs an afternoon.
+        "app_build": vega.app_build(),
         "sample": rows if complete else rows[:_SAMPLE_ROWS],
         "complete": complete,
         **_provenance_summary(_provenance(session, name, resolved)),
@@ -373,6 +500,7 @@ def build_server(
     *,
     allow_add_source: bool = False,
     require_descriptions: bool = False,
+    console_log: bool = False,
 ) -> FastMCP:
     """Build a FastMCP instance wired to an open :class:`DuckSession`.
 
@@ -390,8 +518,14 @@ def build_server(
     the ``query`` tool exposes a required one-line ``description`` on every single query and every
     batch step (stored in lineage, surfaced by ``lineage`` / ``catalog``); when off, the parameter
     is absent from the tool schema entirely.
+
+    ``console_log`` (off by default) additionally mirrors each call as one human-readable line on
+    FastMCP's own stderr logger — INFO for a success, ERROR (with the message and the offending
+    SQL) for a raised exception or a failed batch step. It's what makes `--transport http` legible
+    in the terminal, where uvicorn's access log reports `200 OK` regardless of the outcome.
     """
     _configure_tool_logging(tool_log)
+    _configure_console_logging(console_log)
 
     source_list = ", ".join(f"{s.name} ({s.kind})" for s in session.sources) or "(none configured)"
 
@@ -661,6 +795,13 @@ def build_server(
     @mcp.tool(
         name="visual",
         app=AppConfig(resource_uri=vega.VEGA_URI),
+        # The flat `ui/resourceUri` key is what Claude Desktop / claude.ai ACTUALLY key on to
+        # decide a tool has an app — they ignore the nested `_meta.ui.resourceUri` FastMCP
+        # writes (the official ext-apps SDK emits BOTH keys for exactly this reason, which is
+        # why its example servers render and a FastMCP server silently doesn't: the host
+        # fetches the page, runs the tool, and never mounts the iframe). Keep both until
+        # Claude honours the nested form.
+        meta={"ui/resourceUri": vega.VEGA_URI},
         output_schema=vega.VISUAL_OUTPUT_SCHEMA,
         description=(
             "DRAW a saved result in the chat as an interactive Vega-Lite chart. Read-only and "
@@ -670,7 +811,10 @@ def build_server(
             "string) with **no `data` key** — the server injects the result's rows for you, so "
             "write the spec as though `data` were already there. That gives you the whole "
             "Vega-Lite grammar: `mark`, `encoding`, `transform`, `layer`, `facet`, `hconcat`/"
-            "`vconcat`, `params` for interactive selections, tooltips, and binning.\n"
+            "`vconcat`, `params` for interactive selections, tooltips, and binning. One grammar "
+            "trap: in a `layer`/concat/facet spec, selection `params` go INSIDE the unit that "
+            "uses them (e.g. the first `layer` entry), never at the top level — Vega-Lite only "
+            "allows selections in unit specs.\n"
             'Example — `{"mark": "bar", "encoding": {"x": {"field": "region", '
             '"type": "nominal"}, "y": {"field": "revenue", "type": '
             '"quantitative"}}}`.\n'
@@ -1051,8 +1195,30 @@ class _OriginGuard:
         await send({"type": "http.response.body", "body": body})
 
 
+def _force_utf8_stderr() -> None:
+    """Make stderr UTF-8, because a Windows default of cp1252 emits bytes no client can read.
+
+    Python picks the console codepage for stderr on Windows, so an em-dash in a log line goes out
+    as the single byte 0x97 — which is not valid UTF-8. MCP clients read a stdio server's stderr
+    as UTF-8 and a strict decoder DIES on it: the reader thread is torn down mid-stream and the
+    host reports the server as unreachable, moments after a tool call it actually answered
+    successfully. (tests/test_cli.py's own stderr pump hit exactly this, which is what surfaced
+    it.) stdout is deliberately untouched — that is the JSON-RPC stream and its framing belongs
+    to the transport, not to us.
+
+    `errors="replace"` rather than strict: a diagnostic must never be the thing that raises.
+    """
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError, OSError):
+        # Not a reconfigurable text stream (redirected, wrapped, already closed). Losing the
+        # guarantee is survivable; losing startup over a logging nicety is not.
+        pass
+
+
 def main() -> None:
     """CLI entry point: build a DuckSession from --source specs, serve over stdio."""
+    _force_utf8_stderr()
     parser = argparse.ArgumentParser(
         description="Spelunk MCP server — one DuckDB engine over files and databases."
     )
@@ -1186,6 +1352,17 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--console-log",
+        choices=("auto", "on", "off"),
+        default="auto",
+        help=(
+            "Print one human-readable line per tool call to stderr, beside FastMCP's own log — "
+            "INFO on success, ERROR with the message and the offending SQL when a call raises or "
+            "a batch step fails. 'auto' (the default) enables it unless --tool-log is already "
+            "writing JSON to stderr, which would double every call."
+        ),
+    )
+    parser.add_argument(
         "--env-file",
         default=None,
         metavar="PATH",
@@ -1254,11 +1431,14 @@ def main() -> None:
     else:
         tool_log = "-"  # stderr
 
+    console_log = _resolve_console_log(args.console_log, tool_log)
+
     server = build_server(
         session,
         tool_log=tool_log,
         allow_add_source=args.allow_add_source,
         require_descriptions=args.require_descriptions,
+        console_log=console_log,
     )
     try:
         if args.transport == "http":
@@ -1293,6 +1473,7 @@ def main() -> None:
         # then leaves no empty <pid>-<rand> dirs behind. A hard kill skips this; the next
         # server's startup sweep reclaims the dir instead.
         _configure_tool_logging(None)
+        _configure_console_logging(False)
         session.close(reclaim_if_empty=True)
 
 

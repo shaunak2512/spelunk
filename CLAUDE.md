@@ -150,8 +150,11 @@ spelunk/mcp/
                  #   Server half: validate_spec() (the guard — refuses `data.url`, a top-level
                  #   `data`, and any `field` that is neither a real column nor produced by the
                  #   spec's own transforms) + hydrate() (injects the rows as inline `values`).
-                 #   Client half: app_html() (a hand-written page wired to the host through
-                 #   @modelcontextprotocol/ext-apps, drawing with vega-embed) + app_csp().
+                 #   Client half: app_html() (a hand-written page speaking RAW `ui/` JSON-RPC
+                 #   over postMessage via an inline transport, window.SpelunkApp, drawing with
+                 #   vega-embed) + app_csp(). No ext-apps SDK, no ES modules — a failed module
+                 #   import aborts silently, which is how the SDK-built page died on Claude
+                 #   Desktop while this dialect renders.
                  #   Traps worth knowing: `ast: true` is NOT optional — Vega compiles
                  #   expressions with the Function constructor by default, which a
                  #   deny-by-default sandbox CSP refuses, and the bundled AST interpreter is what
@@ -231,25 +234,34 @@ views named bare) and `db://{table}` (columns, PK, sample, row count).
   anything added later: **never return a bare UI payload from a tool** — build a `ToolResult`
   with a real text summary, or the model is handed the placeholder and nothing else.
 - **Rendering needs the client online.** The `ui://spelunk/vega.html` app loads vega, vega-lite
-  and vega-embed from `cdn.jsdelivr.net` and the ext-apps SDK from `unpkg.com`, at versions pinned
-  exactly in `vega.py` and declared in the resource's own CSP. The *server* needs no network, but
-  the *viewer's* browser does — an air-gapped host shows the text half only, and the page carries
-  a static fallback that names the blocked hosts rather than rendering a blank rectangle. The pins
-  are load-bearing for the same reason the old `prefab-ui` pin was: the version selects the JS
-  users' browsers fetch, not just what the server imports. The CSP grants `resource_domains` only
-  — **no `connect_domains`**, because a view that could fetch would be a view that could
-  exfiltrate; that is the client-side half of refusing `data.url`.
+  and vega-embed from `cdn.jsdelivr.net` at versions pinned exactly in `vega.py` and declared in
+  the resource's own CSP (jsDelivr is the ONLY external origin — the `ui/` transport is an
+  inline ~60-line `window.SpelunkApp` classic script, not a CDN-imported SDK; the ext-apps SDK
+  arrived as the page's one ES module import, whose failure is silent, and the SDK-built page
+  never completed the handshake on Claude Desktop while this raw postMessage dialect renders).
+  The *server* needs no network, but the *viewer's* browser does — an air-gapped host shows the
+  text half only, and the page carries a static fallback that names the blocked host rather than
+  rendering a blank rectangle. The pins are load-bearing for the same reason the old `prefab-ui`
+  pin was: the version selects the JS users' browsers fetch, not just what the server imports.
+  The CSP grants `resource_domains` only — **no `connect_domains`**, because a view that could
+  fetch would be a view that could exfiltrate; that is the client-side half of refusing
+  `data.url`.
 - **Spelunk serves its own app resource** rather than one FastMCP synthesizes, and the CSP belongs
   on the **resource**, not the tool — that is where the host reads it from. Declaring it on the
   tool instead silently yields a resource with no policy: the host blocks every bundle and the
-  frame stays blank, with no error and nothing to debug. The page also carries a recovery path for
+  frame stays blank, with no error and nothing to debug. The tool side has a twin trap:
+  Claude Desktop/claude.ai recognize an app tool by the **deprecated flat `_meta["ui/resourceUri"]`
+  key** and ignore the nested `_meta.ui.resourceUri` that FastMCP's `app=AppConfig(...)` writes —
+  a tool carrying only the nested key gets its resource fetched and its call answered, and the
+  iframe silently never mounts. The official ext-apps SDK emits both keys; `visual` passes
+  `meta={"ui/resourceUri": vega.VEGA_URI}` beside `app=` to do the same. The page also carries a recovery path for
   [ext-apps#696](https://github.com/modelcontextprotocol/ext-apps/issues/696) — Claude Desktop
   strips `structuredContent` from the tool-result it forwards to a view, so the app captures the
   args from the intact `tool-input` notification and re-fetches through the host's `tools/call`
-  proxy, which is unaffected. Both halves are documented ext-apps SDK API (`ontoolinput`,
-  `callServerTool`), so unlike the hand-rolled shim this replaced there is no transport internal
-  to reach into. It is behind `if (!structuredContent && !isError)`, so it never fires on a
-  healthy host, and re-calling is sound *only* because `visual` is idempotent. Temporary:
+  proxy, which is unaffected. Both halves (`ontoolinput`, `callServerTool`) are methods of the
+  inline transport, so there is no foreign transport internal to reach into. It is behind
+  `if (!structuredContent && !isError)`, so it never fires on a healthy host, and re-calling is
+  sound *only* because `visual` is idempotent. Temporary:
   `grep -rn "ext-apps#696"` finds every line to delete.
 - **Disk-backed always + out-of-core:** the workspace is a real DuckDB file (under `--session-dir`,
   else a temp dir). Sources are read on demand with pushdown; buffering operators spill to
@@ -396,6 +408,24 @@ the sink: a file path, `-` for stderr, or `off` to disable. Default: `<session-d
 when `--session-dir` is set, else stderr — never stdout (that's the stdio MCP transport). Library
 callers of `build_server(session)` log nowhere unless passed `tool_log=`. The JSONL is queryable by
 Spelunk itself via `read_json_auto(...)`.
+
+**Console log (`--console-log {auto,on,off}`, default `auto`):** the same calls, one
+human-readable line each, on **FastMCP's own logger** (`fastmcp.spelunk` via
+`fastmcp.utilities.logging.get_logger`) rather than a handler of ours — so the lines inherit the
+rich stderr formatting FastMCP already installed and sit beside the startup/uvicorn output instead
+of forming a second logging stack. INFO on success (`query(name='top' flow='default') ok in 18.3ms
+— 1240 rows`), ERROR with the full error message *and* the offending SQL when a call fails.
+`auto` = on unless `--tool-log -` is already putting JSON on stderr, which would double every call.
+
+This exists for `--transport http`, where the terminal is the operator's only view of the server
+and uvicorn prints `POST /mcp 200 OK` whatever happened inside. The load-bearing case is a **failed
+batch step**: `query(steps=[...])` is fail-fast but *returns normally* with `failed_step` set, so
+nothing raises — FastMCP logs nothing, uvicorn logs a 200, and a broken pipeline looks exactly like
+a working one. `_console_report` therefore inspects the raw tool return, not just the exception
+path, and agents are told to always batch, so that is the *common* failure. A raised exception is
+also logged here, one compact line ahead of the rich traceback FastMCP prints for itself. Same
+credential masking as the JSONL sink (`_redact`) — the console is a second egress for the same
+secrets. `build_server(..., console_log=True)` for library callers; off by default, like `tool_log`.
 
 ## Claim register (`evals/`)
 

@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
+import subprocess
 
 import pytest
 
@@ -129,6 +131,55 @@ class TestValidateSpec:
         spec = {"mark": "image", "encoding": {"url": {"field": "region", "type": "nominal"}}}
         assert vega.validate_spec(spec, COLUMNS) == spec
 
+    def test_rejects_a_top_level_selection_param_on_a_layered_spec(self):
+        """Found in the field: Vega-Lite only allows selections inside UNIT specs, and a
+        top-level select param on a `layer` spec compiles to duplicate signals — the chart dies
+        in the RENDERER (`Duplicate signal name: "<name>_tuple"`) after the tool has already
+        returned success, so only the human sees the wreckage. Reproduced headlessly on
+        vega-lite 5.21, 5.23 and 6.4: no pin bump fixes it, so the server refuses it where the
+        agent can read the message and move the params."""
+        spec = {
+            "params": [{"name": "sel", "select": {"type": "point", "fields": ["region"]}}],
+            "layer": [{"mark": "line", "encoding": {
+                "x": {"field": "region", "type": "nominal"},
+                "y": {"field": "revenue", "type": "quantitative"},
+            }}],
+        }
+        with pytest.raises(ValueError, match="unit specs"):
+            vega.validate_spec(spec, COLUMNS)
+
+    def test_allows_selection_params_inside_the_layer_unit(self):
+        """The documented placement — the refusal must name it, not block it."""
+        spec = {
+            "layer": [{
+                "params": [{"name": "sel", "select": {"type": "point", "fields": ["region"]}}],
+                "mark": "line",
+                "encoding": {
+                    "x": {"field": "region", "type": "nominal"},
+                    "y": {"field": "revenue", "type": "quantitative"},
+                },
+            }],
+        }
+        assert vega.validate_spec(spec, COLUMNS) == spec
+
+    def test_allows_a_top_level_selection_param_on_a_unit_spec(self):
+        spec = dict(BAR, params=[
+            {"name": "sel", "select": {"type": "point", "fields": ["region"]}}
+        ])
+        assert vega.validate_spec(spec, COLUMNS) == spec
+
+    def test_allows_a_top_level_variable_param_on_a_layered_spec(self):
+        """Variable params (no `select`) are legal at the top level of ANY spec — the refusal
+        is scoped to selections, the thing the grammar actually restricts."""
+        spec = {
+            "params": [{"name": "cutoff", "value": 5}],
+            "layer": [{"mark": "line", "encoding": {
+                "x": {"field": "region", "type": "nominal"},
+                "y": {"field": "revenue", "type": "quantitative"},
+            }}],
+        }
+        assert vega.validate_spec(spec, COLUMNS) == spec
+
 
 # --------------------------------------------------------------------------- hydration --- #
 class TestHydrate:
@@ -162,12 +213,11 @@ class TestHydrate:
 
 # -------------------------------------------------------------------------- the app page --- #
 class TestAppPage:
-    def test_csp_declares_both_bundle_hosts(self):
+    def test_csp_declares_the_bundle_host_and_nothing_else(self):
         """Serving our own resource means declaring its policy — a resource with no CSP renders
-        as a blank frame with no error to debug."""
-        csp = vega.app_csp()
-        assert "https://cdn.jsdelivr.net" in csp["resource_domains"]
-        assert "https://unpkg.com" in csp["resource_domains"]
+        as a blank frame with no error to debug. jsDelivr ONLY: the transport is inline now, so
+        an extra origin here would be pure attack surface."""
+        assert vega.app_csp()["resource_domains"] == ["https://cdn.jsdelivr.net"]
 
     def test_csp_grants_no_connect_domains(self):
         """A view that could fetch would be a view that could exfiltrate. `data.url` is refused
@@ -179,7 +229,7 @@ class TestAppPage:
         a floating major would change what renders without changing this repo."""
         html = vega.app_html()
         for pin in (vega.VEGA_VERSION, vega.VEGA_LITE_VERSION,
-                    vega.VEGA_EMBED_VERSION, vega.EXT_APPS_VERSION):
+                    vega.VEGA_EMBED_VERSION, vega.UI_PROTOCOL_VERSION):
             assert pin in html
 
     def test_page_uses_the_csp_safe_expression_interpreter(self):
@@ -190,6 +240,41 @@ class TestAppPage:
         """Same page every call — nothing derived from a counter or a clock, so a redeploy is a
         no-op and there is something stable to assert on."""
         assert vega.app_html() == vega.app_html()
+
+    def test_every_script_is_classic_and_boot_runs_first(self):
+        """No ES modules anywhere on the page — a failed module import aborts the whole module
+        SILENTLY, which is how the SDK-built page died on Claude Desktop: no handler attached,
+        no message, an empty frame and nothing in DevTools that names the cause. Classic
+        scripts fail loudly and independently, and the boot script (first) reports for all of
+        them. The transport must also be defined before the app script that reads it.
+        """
+        html = vega.app_html()
+        assert 'type="module"' not in html
+        boot = html.index("__spelunkStatus")
+        transport = html.index("window.SpelunkApp = function")
+        app = html.index("const App = window.SpelunkApp")
+        assert boot < transport < app
+
+    def test_page_reports_a_failed_bundle_load_to_the_user(self):
+        """`e.target.src` is the only signal separating "bundle blocked" from "bundle threw",
+        and it is what turns a blank rectangle into a sentence naming the blocked URL."""
+        html = vega.app_html()
+        assert "failed to load" in html
+        assert "e.target.src" in html
+
+    def test_page_records_the_stage_it_reached(self):
+        """Every failure here looks identical from the outside — blocked bundle, incomplete
+        handshake, missing structuredContent, zero-size chart. The stage is what tells them
+        apart without a developer attached."""
+        html = vega.app_html()
+        assert "stage: " in html
+        for stage in ("connecting to host", "tool result received", "drawing", "drawn"):
+            assert stage in html
+
+    def test_page_stamps_the_build_it_was_generated_from(self):
+        """The stamp the view prints must be the one this server computes, or the mismatch
+        check — the only way to tell a cached page from a current one — reads backwards."""
+        assert f'build: "{vega.app_build()}"' in vega.app_html()
 
     def test_page_has_a_static_fallback_naming_the_bundle_hosts(self):
         """The one thing that must render without the bundles: a diagnosis instead of a blank
@@ -252,6 +337,112 @@ class TestVisualTool:
         with pytest.raises(ValueError):
             _dispatch_visual(session, name="big", spec=BAR, title=None, flow=None)
 
+    def test_refuses_a_payload_the_host_would_divert(self, session):
+        """The delivery ceiling, which the ROW cap does not bound.
+
+        Claude writes a tool result over ~150k characters to its sandbox filesystem and hands the
+        view a pointer, so the chart renders blank with no error anywhere — and it renders fine in
+        MCP Inspector, which has no such sandbox. Refusing here is the only place the failure can
+        be given a name.
+        """
+        session.query(
+            "SELECT i AS region, i*1.5 AS revenue, 'a fairly long label ' || i AS note "
+            "FROM range(4000) t(i)",
+            "chunky",
+        )
+        spec = {"mark": "bar", "encoding": {
+            "x": {"field": "region", "type": "nominal"},
+            "y": {"field": "revenue", "type": "quantitative"},
+            "tooltip": {"field": "note", "type": "nominal"}}}
+        with pytest.raises(ValueError, match="characters") as exc:
+            _dispatch_visual(session, name="chunky", spec=spec, title=None, flow=None)
+        message = str(exc.value)
+        assert "Nothing was truncated" in message
+        assert "blank" in message  # names the symptom the user would otherwise just see
+        assert "`query`" in message  # and the way out
+
+    def test_reports_payload_size_on_a_chart_that_fits(self, session):
+        """So the agent can see the headroom before it runs out, not after."""
+        summary = _summary(_dispatch_visual(session, name="sales", spec=BAR, title=None, flow=None))
+        assert 0 < summary["payload_chars"] < vega.PAYLOAD_MAX_CHARS
+
+
+@pytest.fixture
+def node():
+    exe = shutil.which("node")
+    if not exe:
+        pytest.skip("node not installed")
+    return exe
+
+
+class TestAppScriptIsValidJavaScript:
+    """Parse the page's scripts with node, when node is available.
+
+    Nothing else in the suite executes a single line of this JavaScript, which is how a real bug
+    shipped twice: a syntax or semantic error here is invisible to pytest and shows up only as a
+    blank frame in a host. Parsing is cheap and catches the whole class of "the module never ran".
+    """
+
+    def _check(self, node, tmp_path, source: str, name: str):
+        # .cjs everywhere, and it is load-bearing: a bare .js makes modern node AUTO-DETECT
+        # module syntax and re-parse as a module, which would make top-level `await` — a syntax
+        # error in the classic <script> the page actually ships — pass the check.
+        path = tmp_path / name
+        path.write_text(source, encoding="utf-8")
+        # --check parses without executing, so nothing external is ever resolved.
+        proc = subprocess.run(
+            [node, "--check", str(path)], capture_output=True, text=True,
+        )
+        assert proc.returncode == 0, f"{name} does not parse:\n{proc.stderr}"
+
+    def test_boot_script_parses(self, node, tmp_path):
+        self._check(node, tmp_path, vega._BOOT_SCRIPT, "boot.cjs")
+
+    def test_transport_script_parses(self, node, tmp_path):
+        source = vega._TRANSPORT_SCRIPT.replace("__UI_PROTOCOL_VERSION__", "test")
+        self._check(node, tmp_path, source, "transport.cjs")
+
+    def test_app_script_parses_as_a_classic_script(self, node, tmp_path):
+        """The page ships this as a classic <script>, where top-level `await` (the way the old
+        module version connected) is a SYNTAX error. Parsing it in script mode is what keeps
+        that from regressing."""
+        self._check(node, tmp_path, vega._APP_SCRIPT, "app.cjs")
+
+    def test_the_parse_check_actually_fails_on_broken_source(self, node, tmp_path):
+        """Guard the guard: a `node --check` that silently exits 0 would make the tests above
+        decorative, which is precisely the trap the outputSchema test fell into."""
+        with pytest.raises(AssertionError, match="does not parse"):
+            self._check(node, tmp_path, "const x = (;", "broken.cjs")
+
+    def test_classic_check_rejects_top_level_await(self, node, tmp_path):
+        """Proves the script-mode parse would actually catch a reintroduced top-level await."""
+        with pytest.raises(AssertionError, match="does not parse"):
+            self._check(node, tmp_path, "await Promise.resolve(1);", "bad.cjs")
+
+
+class TestSingleViewPerElement:
+    """A second Vega view on one element collides with the first's signals.
+
+    Vega names a selection's signals `<param>_tuple` etc. in a per-element namespace, so
+    re-embedding without tearing down throws `Duplicate signal name: "<param>_tuple"` and renders
+    nothing — but ONLY for a spec with `params`. A plain chart survives the same double-embed, so
+    this stays hidden until someone writes an interactive spec.
+    """
+
+    def test_previous_view_is_finalized_before_re_embedding(self):
+        script = vega._APP_SCRIPT
+        assert "currentView.finalize()" in script
+        assert 'chartEl.innerHTML = ""' in script
+
+    def test_draws_are_serialized(self):
+        """The tool result and a host-context change can both draw; overlapping embeds put two
+        views on the element even with teardown, because teardown runs before the first await."""
+        assert "drawing = (drawing || Promise.resolve())" in vega._APP_SCRIPT
+
+    def test_theme_change_redraws_only_on_an_actual_theme_change(self):
+        """`onhostcontextchanged` also carries locale and display-mode, and fires on connect."""
+        assert "hostTheme() !== lastTheme" in vega._APP_SCRIPT
+
 
 # ------------------------------------------------------------------- the read side of it --- #
 class TestRowsForDisplay:
@@ -306,8 +497,14 @@ class TestRegistration:
         return build_server(session)
 
     def test_visual_is_registered_with_ui_metadata(self, server):
+        """BOTH meta keys, deliberately. FastMCP writes the nested `ui.resourceUri` (the current
+        MCP Apps wire form), but Claude Desktop / claude.ai key on the deprecated flat
+        `ui/resourceUri` and ignore the nested one — a tool carrying only the nested key gets
+        its resource fetched and its call answered, and the iframe never mounts, with no error
+        anywhere. The official ext-apps SDK emits both for exactly this reason; so do we."""
         tool = next(t for t in _run(server.list_tools()) if t.name == "visual")
         assert tool.meta["ui"]["resourceUri"] == vega.VEGA_URI
+        assert tool.meta["ui/resourceUri"] == vega.VEGA_URI
 
     def test_declared_output_schema_accepts_the_real_payload(self, server, session):
         """The end-to-end version of the outputSchema contract, done the way a HOST does it:

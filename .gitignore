@@ -26,3 +26,5 @@ data/
 dag/
 # Local output of scripts/preview_views.py (self-contained ~6.5MB HTML previews).
 preview_out/
+minimal_vega_server*
+test_tool_call.md

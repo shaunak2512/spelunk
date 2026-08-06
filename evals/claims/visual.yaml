@@ -118,21 +118,27 @@ claims:
 
 - id: VIS-006
   claim: >
-    The tool carries _meta.ui.resourceUri pointing at a readable ui:// resource, which is what
-    makes a host render it as an MCP App.
+    The tool carries BOTH resource-URI meta keys — the nested _meta.ui.resourceUri (current MCP
+    Apps wire form, what FastMCP writes) and the deprecated flat _meta["ui/resourceUri"] (what
+    Claude Desktop / claude.ai actually key on) — pointing at a readable ui:// resource.
   source: CLAUDE.md#architecture
   mode: invariant
   falsifier: >
-    The registered tool has no resourceUri, or the URI it names cannot be read back from the
+    The registered tool lacks either meta key, or the URI it names cannot be read back from the
     server as a resource.
   status: verified
   covered_by:
   - tests/test_visual.py::TestRegistration::test_visual_is_registered_with_ui_metadata
   - tests/test_visual.py::TestRegistration::test_app_resource_is_readable
   note: >
-    Unchanged in substance from SHOW-007; only the URI moved (ui://spelunk/renderer.html ->
-    ui://spelunk/vega.html). A tool pointing at a resource the server does not serve fails
-    silently — the host fetches, gets nothing, and renders an empty frame.
+    Revised from "nested key is what makes a host render": that was refuted in the field.
+    Claude ignores the nested key, so a FastMCP tool carrying only it gets its resource
+    fetched and its call answered while the iframe silently never mounts — the official
+    ext-apps SDK's registerAppTool emits both keys for exactly this reason, and its example
+    servers rendering while FastMCP servers didn't is what located the bug. Drop the flat key
+    only when Claude honours the nested form. A tool pointing at a resource the server does
+    not serve fails the same silent way — the host fetches, gets nothing, renders an empty
+    frame.
 
 - id: VIS-007
   claim: >
@@ -221,15 +227,16 @@ claims:
 - id: VIS-011
   claim: >
     `visual` serves its own ui:// app resource and declares the CSP ON THE RESOURCE, naming
-    every CDN host the page loads, at pinned versions.
+    the ONE CDN host the page loads (jsDelivr — the transport is inline), at pinned versions.
   source: CLAUDE.md#key-concepts
   mode: invariant
   falsifier: >
     The CSP is declared on the tool instead of the resource (yielding a resource with no
-    policy), a bundle host is missing from resource_domains, or a version is floating.
+    policy), the bundle host is missing from resource_domains, an extra origin crept in, or a
+    version is floating.
   status: verified
   covered_by:
-  - tests/test_visual.py::TestAppPage::test_csp_declares_both_bundle_hosts
+  - tests/test_visual.py::TestAppPage::test_csp_declares_the_bundle_host_and_nothing_else
   - tests/test_visual.py::TestAppPage::test_csp_grants_no_connect_domains
   - tests/test_visual.py::TestAppPage::test_page_pins_every_bundle_version
   - tests/test_visual.py::TestAppPage::test_page_is_deterministic
@@ -254,18 +261,22 @@ claims:
   status: partial
   covered_by:
   - tests/test_visual.py::TestAppPage::test_page_has_a_static_fallback_naming_the_bundle_hosts
+  - tests/test_visual_runtime.py::TestMissingStructuredContent::test_re_fetches_through_the_tool_proxy_and_draws
+  - tests/test_visual_runtime.py::TestMissingStructuredContent::test_says_so_when_there_are_no_arguments_to_re_fetch_with
+  - tests/test_visual_runtime.py::TestMissingStructuredContent::test_does_not_loop_when_the_re_fetch_also_comes_back_empty
   gap: >
-    The recovery path is JavaScript running in the host's iframe, so nothing in the Python
-    suite exercises it — the tests can assert the page CONTAINS the branch and the fallback
-    text, not that the branch works against a real stripping host. Closing this needs a
-    browser-driven test with a stub host, which is the same gap SHOW-015 carried.
+    The runtime tests DRIVE the recovery branch under node (re-fetches once, reports when it
+    cannot, never loops), but against a stub transport — no test speaks to a real stripping
+    host, so the claim that the host's tools/call proxy is unaffected rests on field
+    observation only.
   note: >
-    Much smaller than the shim it replaces. Under Prefab the recovery had to monkey-patch
-    window.addEventListener to reach inside a transport we did not own; the ext-apps SDK
-    exposes both halves as documented API (`ontoolinput` for the arguments, `callServerTool`
-    for the re-fetch), so the whole path is a dozen lines guarded by
-    `if (!structuredContent && !isError)`. Re-calling is sound only because `visual` is
-    idempotent and read-only. Temporary: `grep -rn "ext-apps#696"` finds every line to delete.
+    Much smaller than the Prefab-era shim, which had to monkey-patch window.addEventListener
+    to reach inside a transport it did not own. The transport is now OURS (the inline
+    `window.SpelunkApp`, raw `ui/` postMessage — the ext-apps SDK's CDN module import died
+    silently on Claude Desktop and was removed), so `ontoolinput` and `callServerTool` are a
+    dozen honest lines guarded by `if (!structuredContent && !isError)`. Re-calling is sound
+    only because `visual` is idempotent and read-only. Temporary: `grep -rn "ext-apps#696"`
+    finds every line to delete.
 
 - id: VIS-013
   claim: >
@@ -306,6 +317,113 @@ claims:
   note: >
     The hydrated spec carries every plotted row inline, so logging the payload would bury the
     line in data — the same reason `_summarize_result` unwrapped the Prefab component tree.
+
+- id: VIS-016
+  claim: >
+    Only ONE Vega view is ever alive on the chart element: each embed finalizes the previous one
+    and draws are serialized, so a spec carrying `params` selections re-renders instead of dying
+    on a duplicate signal name.
+  source: CLAUDE.md#key-concepts
+  mode: invariant
+  falsifier: >
+    A second draw (a host theme change, a #696 re-fetch) embeds over a live view, and a spec with
+    a selection fails with `Duplicate signal name: "<param>_tuple"` — rendering nothing.
+  status: verified
+  covered_by:
+  - tests/test_visual.py::TestSingleViewPerElement::test_previous_view_is_finalized_before_re_embedding
+  - tests/test_visual.py::TestSingleViewPerElement::test_draws_are_serialized
+  - tests/test_visual.py::TestSingleViewPerElement::test_theme_change_redraws_only_on_an_actual_theme_change
+  note: >
+    Found in the field, not by testing. Vega registers a selection's signals (`<name>_tuple` and
+    friends) in a per-element namespace, so a second view on the same element collides with the
+    first. What makes it nasty is that a spec WITHOUT `params` survives the identical double
+    embed silently — so the bug is invisible until an agent writes its first interactive chart,
+    which is exactly the expressiveness `visual` exists to offer. Teardown alone is not enough:
+    it runs before the first `await`, so two overlapping embeds still race, hence the promise
+    chain as well.
+
+- id: VIS-017
+  claim: >
+    Every script on the app page is parsed by `node --check` in the test suite, in SCRIPT mode
+    (.cjs) — boot, transport, and app alike — so a reintroduced top-level `await` (legal only
+    in the ES module the page no longer ships) is a test failure, not a blank frame.
+  source: tests/test_visual.py
+  mode: invariant
+  falsifier: >
+    A syntax error in a page script ships green, because nothing in the suite parses the
+    JavaScript — or the parse runs in module mode, where the classic-script syntax errors that
+    matter (top-level await) are legal.
+  status: verified
+  covered_by:
+  - tests/test_visual.py::TestAppScriptIsValidJavaScript::test_boot_script_parses
+  - tests/test_visual.py::TestAppScriptIsValidJavaScript::test_transport_script_parses
+  - tests/test_visual.py::TestAppScriptIsValidJavaScript::test_app_script_parses_as_a_classic_script
+  - tests/test_visual.py::TestAppScriptIsValidJavaScript::test_the_parse_check_actually_fails_on_broken_source
+  - tests/test_visual.py::TestAppScriptIsValidJavaScript::test_classic_check_rejects_top_level_await
+  note: >
+    The suite asserted on the page as a STRING and never as code, which is how two shipped bugs
+    (the outputSchema mismatch, the duplicate-signal crash) both passed locally. Parsing is not
+    execution and will not catch a logic error, but it closes the whole "the script never ran"
+    class for free. .cjs is load-bearing: modern node auto-detects module syntax in a bare .js,
+    which would silently re-legalize top-level await. The guard-the-guard ids prove `--check`
+    actually fails on broken source and on top-level await, so the checks cannot go vacuous the
+    way the outputSchema test did. Skips when node is absent.
+
+- id: VIS-018
+  claim: >
+    The app page ships NO ES modules and no ext-apps SDK: it speaks raw `ui/` JSON-RPC over
+    postMessage through an inline transport that ignores any message whose source is not
+    `window.parent` and correlates `tools/call` responses by request id.
+  source: CLAUDE.md#architecture
+  mode: invariant
+  falsifier: >
+    A `type="module"` script reappears on the page (a failed module import aborts silently —
+    the SDK-built page never completed the handshake on Claude Desktop); or the transport
+    accepts a notification or a `tools/call` answer postMessage'd by a frame other than the
+    host, letting a hostile frame feed the view a payload.
+  status: verified
+  covered_by:
+  - tests/test_visual.py::TestAppPage::test_every_script_is_classic_and_boot_runs_first
+  - tests/test_visual_runtime.py::TestTransportHandshake::test_connect_performs_the_documented_handshake
+  - tests/test_visual_runtime.py::TestTransportHandshake::test_notifications_route_to_their_handlers
+  - tests/test_visual_runtime.py::TestTransportHandshake::test_call_server_tool_correlates_request_and_response
+  - tests/test_visual_runtime.py::TestTransportHandshake::test_messages_not_from_the_host_are_ignored
+  - tests/test_visual_runtime.py::TestTransportHandshake::test_a_jsonrpc_error_rejects_the_pending_request
+  note: >
+    The dialect (ui/initialize -> initialized -> tool-input/tool-result, protocol 2026-01-26)
+    is the one the develop-ui recovery shim verified message-by-message against Claude, and the
+    rewrite that made minimal_vega_server's chart_raw render. The SDK spoke the same method
+    names; what killed it was the DELIVERY — one CDN ES-module import, whose failure mode is
+    total silence. The source-identity check is the transport's security property and gets its
+    own spoofing test.
+
+- id: VIS-019
+  claim: >
+    A selection param at the top level of a multi-view spec (layer/concat/facet/repeat) is
+    refused server-side, because Vega-Lite only allows selections inside unit specs and the
+    compiled chart dies in the renderer with `Duplicate signal name: "<name>_tuple"` — after
+    the tool has already returned success, invisibly to the agent. Params inside a unit, and
+    variable (non-select) params anywhere, pass.
+  source: spelunk/mcp/vega.py
+  mode: behavioral
+  falsifier: >
+    validate_spec accepts a layered spec with a top-level select param (the chart then renders
+    as an error card only the human sees), or over-blocks the legal placements — a selection
+    inside a layer entry, a selection on a unit spec, or a top-level variable param.
+  status: verified
+  covered_by:
+  - tests/test_visual.py::TestValidateSpec::test_rejects_a_top_level_selection_param_on_a_layered_spec
+  - tests/test_visual.py::TestValidateSpec::test_allows_selection_params_inside_the_layer_unit
+  - tests/test_visual.py::TestValidateSpec::test_allows_a_top_level_selection_param_on_a_unit_spec
+  - tests/test_visual.py::TestValidateSpec::test_allows_a_top_level_variable_param_on_a_layered_spec
+  note: >
+    Found in the field on the first agent-authored interactive layered chart. Reproduced
+    headlessly (vega-lite compile + vega parse under node) on 5.21.0, 5.23.0 AND 6.4.3 — a
+    single-layer spec with one top-level select param fails on the FIRST compile — so this is
+    a grammar limitation, not a version bug, and refusing loudly beats silently relocating the
+    params (which for a multi-layer spec would mean guessing the owning unit). The `visual`
+    tool description teaches the placement at authoring time; this refusal teaches it at
+    failure time with the fix named.
 
 - id: VIS-015
   claim: >

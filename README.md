@@ -136,6 +136,21 @@ spelunk --transport http --source sales=./data/sales.parquet
 `--host` (default `127.0.0.1`, loopback only), `--port` (default `8080`) and `--http-path` (default
 `/mcp`) control the bind. The tool and resource surface is identical on both transports.
 
+Each tool call prints one line to the terminal beside FastMCP's own log — the call and its
+arguments, then `ok` with a row count, or `ERROR` with the database's message and the SQL that
+caused it:
+
+```
+INFO   query(name='top_albums' flow='default') ok in 18.3ms — 1240 rows
+ERROR  query(flow='default' steps=3) step 2/3 'scores' failed in 4.1ms — Catalog Error: Table with
+       name reviws does not exist! Did you mean "reviews"? [1 completed, 1 skipped]
+           sql: SELECT artist, AVG(score) FROM reviws GROUP BY 1
+```
+
+That second line is the point: a batch is fail-fast but *returns* rather than raising, so without
+it a failed step is invisible — uvicorn logs `POST /mcp 200 OK` either way. Use
+`--console-log off` to silence it, or `--tool-log` for the machine-readable JSONL of the same calls.
+
 Requests are screened for **DNS rebinding**: an `Origin` header, when present, must name this
 endpoint, and on a loopback bind the `Host` header must too — otherwise the request is refused with
 **403**. A normal MCP client sends no `Origin` and is unaffected; this stops a web page the user

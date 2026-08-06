@@ -252,3 +252,43 @@ claims:
     MCP session legitimately draws a 400 from the layer BELOW the guard, and asserting 200 there would
     couple the claim to the handshake instead of the guard. If FastMCP later ships its own guard,
     delete ours rather than stacking them, and re-point this claim.'
+- id: MCP-017
+  claim: 'With console logging on, every tool call also emits ONE human-readable line on stderr through
+    FastMCP''s own logger — INFO on success, ERROR carrying the error message and the offending SQL
+    when the call raises OR when a batch step fails. Off unless enabled; never stdout.
+
+    '
+  source: CLAUDE.md#tool-call-logging
+  mode: behavioral
+  falsifier: 'A failed call produces no console line (or one without the error message); a library
+    caller that never asked for it gets output; or the line reaches stdout and corrupts the stdio
+    transport.'
+  status: verified
+  covered_by:
+  - tests/test_mcp_server.py::TestConsoleLogging::test_silent_unless_enabled
+  - tests/test_mcp_server.py::TestConsoleLogging::test_success_logs_one_info_line
+  - tests/test_mcp_server.py::TestConsoleLogging::test_raised_error_logs_message_and_sql
+  - tests/test_mcp_server.py::TestConsoleLogging::test_failed_batch_step_logs_error
+  - tests/test_mcp_server.py::TestConsoleLogging::test_credentials_redacted_in_batch_step_error
+  - tests/test_cli.py::TestStdoutPurity::test_console_log_writes_to_stderr_not_stdout
+  note: 'The batch case is the load-bearing one and the reason this exists: `query(steps=[...])` is
+    fail-fast but RETURNS normally, so a failed step raises nothing — under --transport http, uvicorn
+    logs `POST /mcp 200 OK` and FastMCP logs nothing at all, leaving a broken pipeline indistinguishable
+    from a working one in the operator''s only view. Agents are instructed to always batch, so that is
+    the common failure, not the rare one. Redaction is asserted separately because the console line is
+    a second egress for the same secrets the JSONL sink masks.'
+- id: MCP-018
+  claim: '--console-log takes auto|on|off, default auto — which enables the console line unless --tool-log
+    is already writing JSON to stderr, where both would carry the same call to the same stream.
+
+    '
+  source: CLAUDE.md#tool-call-logging
+  mode: behavioral
+  falsifier: auto double-logs every call under --tool-log -, or stays silent when the JSONL sink is a
+    file (the default, and the case the feature exists for).
+  status: verified
+  covered_by:
+  - tests/test_mcp_server.py::TestConsoleLogging::test_auto_stands_down_when_tool_log_is_stderr
+  - tests/test_cli.py::TestStdoutPurity::test_console_log_writes_to_stderr_not_stdout
+  note: Resolution is pinned at unit level (_resolve_console_log) because the CLI default depends on the
+    tool-log default, which is itself resolved after DuckSession.open() picks the per-process workspace.

@@ -235,6 +235,89 @@ class TestStdoutPurity:
 
         assert "tool" in stderr, "expected the tool log on stderr with --tool-log -"
 
+    def test_console_log_writes_to_stderr_not_stdout(self, tmp_path, sqlite_file):
+        """MCP-017: the human-readable per-call line is a second writer on the same process —
+        it goes through FastMCP's stderr logger, so stdout purity has to survive it too."""
+        client = StdioClient(
+            ["--source", f"shop={sqlite_file}",
+             "--session-dir", str(tmp_path / "s"),
+             "--console-log", "on",
+             "--tool-log", "off"],  # console line is then the ONLY tool output
+            cwd=tmp_path,
+        )
+        try:
+            client.initialize()
+            client.call_tool("query", {"sql": "SELECT 1 AS n", "name": "one"})
+            client.call_tool("query", {"steps": [
+                {"sql": "SELECT 1 AS a", "name": "s1"},
+                {"sql": "SELECT * FROM no_such_table", "name": "s2"},
+            ]})
+        finally:
+            stderr, _ = client.close()
+
+        for line in client.raw_stdout:
+            if not line.strip():
+                continue
+            msg = json.loads(line)
+            assert msg.get("jsonrpc") == "2.0", f"non-protocol line on stdout: {line!r}"
+
+        # Rich wraps at the console width AND injects the source location mid-line, so assert on
+        # short tokens rather than a whole rendered message.
+        flat = " ".join(stderr.split())
+        assert "query(name='one' flow='default')" in flat, "expected the success line on stderr"
+        assert "[1 completed, 0 skipped]" in flat, "expected the batch failure line on stderr"
+        assert "no_such_table" in flat, "expected the failing step's error on stderr"
+
+    def test_stderr_is_valid_utf8(self, tmp_path, sqlite_file):
+        """MCP-018: every byte on stderr must decode as UTF-8, or clients tear the server down.
+
+        Windows gives stderr the console codepage, so an em-dash in a log line goes out as the
+        single byte 0x97 — not valid UTF-8. An MCP client reading a stdio server's stderr with a
+        strict decoder dies on it mid-stream, and the host then reports the server as
+        UNREACHABLE moments after a tool call it answered successfully. The failure looks like a
+        transport fault and is nothing of the kind.
+
+        Read as raw BYTES on purpose: `StdioClient` decodes as UTF-8, so its reader thread would
+        simply die and this would pass on a broken server while asserting nothing.
+        """
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "spelunk.mcp.server",
+             "--source", f"shop={sqlite_file}",
+             "--session-dir", str(tmp_path / "s"),
+             "--console-log", "on"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            cwd=str(tmp_path),  # bytes mode: no encoding=, no text=
+        )
+        request = json.dumps({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                       "clientInfo": {"name": "t", "version": "0"}},
+        }).encode()
+        call = json.dumps({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "query", "arguments": {"sql": "SELECT 1 AS n", "name": "one"}},
+        }).encode()
+        try:
+            out, err = proc.communicate(
+                request + b"\n"
+                + b'{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}\n'
+                + call + b"\n",
+                timeout=STARTUP_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, err = proc.communicate()
+
+        assert b"query(" in err, "expected the console line on stderr (nothing to check otherwise)"
+        try:
+            err.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            offending = err[max(0, exc.start - 40):exc.start + 40]
+            pytest.fail(
+                f"stderr is not valid UTF-8: {exc}. Around the bad byte: "
+                f"{offending.decode('cp1252', errors='replace')!r}"
+            )
+
 
 class TestSourceArguments:
     def test_source_is_repeatable_and_dsn_is_an_alias(self, tmp_path, sqlite_file, csv_file, sample_db):

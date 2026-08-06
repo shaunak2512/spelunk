@@ -12,7 +12,11 @@ Two halves:
   the artifact is data, so it is checked *before* it is handed to a renderer, not after it
   silently draws the wrong picture.
 * **Client side** (:func:`app_html`, :func:`app_csp`) — a self-contained page that talks to the
-  host through ``@modelcontextprotocol/ext-apps`` and draws with ``vega-embed``.
+  host over raw ``ui/`` JSON-RPC postMessage (an inline ~60-line transport, no ext-apps SDK)
+  and draws with ``vega-embed``. Classic scripts throughout: the SDK was the page's one ES
+  module import, and on Claude Desktop that page never completed the handshake — a failed
+  module import aborts silently — while this dialect, proven by the develop-ui recovery shim
+  and minimal_vega_server's ``chart_raw``, renders.
 
 Traps worth knowing:
 
@@ -29,6 +33,7 @@ Traps worth knowing:
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any
 
@@ -39,10 +44,15 @@ from typing import Any
 VEGA_VERSION = "5.30.0"
 VEGA_LITE_VERSION = "5.21.0"
 VEGA_EMBED_VERSION = "6.26.0"
-EXT_APPS_VERSION = "0.4.0"
+# The `ui/` protocol dialect the inline transport speaks (ui/initialize's protocolVersion).
+# There is no ext-apps SDK pin any more: the page carries its own ~60-line postMessage
+# transport (`_TRANSPORT_SCRIPT`) instead of importing the SDK from a CDN. That import was the
+# one ES module on the page, and a failed module import aborts silently — on Claude Desktop the
+# SDK-built page never completed the handshake, while this raw dialect (proven first by the
+# develop-ui recovery shim, then by minimal_vega_server's chart_raw) renders.
+UI_PROTOCOL_VERSION = "2026-01-26"
 
 _JSDELIVR = "https://cdn.jsdelivr.net"
-_UNPKG = "https://unpkg.com"
 
 VEGA_URI = "ui://spelunk/vega.html"
 
@@ -51,6 +61,19 @@ VEGA_URI = "ui://spelunk/vega.html"
 # aggregate client-side, but it is still a ceiling — and, like `rows_for_display`, passing it
 # ERRORS rather than truncating. A silently shortened chart is a picture that misstates the data.
 VEGA_MAX_ROWS = 5000
+
+# The OTHER ceiling, and the one that actually bites: Claude.ai and Claude Desktop divert a tool
+# result over ~150,000 characters to their code-execution sandbox's filesystem and hand the app a
+# POINTER instead of the payload, so the view never hydrates — it renders nothing, with no error
+# anywhere. (See "App doesn't render when tool results are large" in Claude's MCP Apps
+# troubleshooting.) A hydrated spec carries every plotted row inline, so the row cap alone does
+# not bound it: 5000 rows x 3 columns is ~238,000 characters, comfortably past the threshold.
+# Budgeted below the limit because the measurement here cannot be exact — the host counts the
+# whole result envelope, not just the two halves we build.
+#
+# This is a HOST limit, not a Vega one, which is why it is invisible in MCP Inspector: no
+# sandbox, no diversion, so the identical payload renders there and fails in Claude.
+PAYLOAD_MAX_CHARS = 120_000
 
 # `outputSchema` describes **structuredContent** — the half the HOST reads and validates — NOT
 # the text summary the model reads. Getting that backwards ships a tool that fails on every call
@@ -151,7 +174,8 @@ def _field_refs(spec: dict) -> set[str]:
 def validate_spec(spec: Any, columns: list[dict[str, str]]) -> dict:
     """Check a data-free Vega-Lite spec against a result's real schema. Raises ``ValueError``.
 
-    Three refusals, each one a silent failure if it were left to the renderer:
+    Four refusals, each one a silent (or agent-invisible) failure if it were left to the
+    renderer:
 
     1. **``data`` at the top level** — the server owns the data. A spec that carried its own
        would render something other than the result it claims to display.
@@ -160,6 +184,9 @@ def validate_spec(spec: Any, columns: list[dict[str, str]]) -> dict:
     3. **A field that is not a column** and is not produced by the spec's own transforms.
        Vega-Lite draws an empty or subtly wrong chart for a missing field without erroring,
        which is precisely the mis-plot this refuses to ship.
+    4. **A selection param at the top level of a multi-view spec** — a Vega-Lite grammar
+       limitation (selections live in unit specs only) that compiles to duplicate signals and
+       kills the chart in the renderer, after the tool has already returned success.
     """
     if isinstance(spec, str):
         try:
@@ -185,6 +212,31 @@ def validate_spec(spec: Any, columns: list[dict[str, str]]) -> dict:
             "`spec` must not carry its own top-level `data` — the rows come from the result "
             "named by `name`, and the server injects them. Remove the `data` key."
         )
+
+    # A SELECTION param at the top level of a multi-view spec is a grammar limitation, not a
+    # style choice: Vega-Lite only allows selections inside UNIT specs, and the compiled chart
+    # dies in the RENDERER with `Duplicate signal name: "<param>_tuple"` — after the tool has
+    # already returned success, so the agent never sees the failure and only the human sees the
+    # wreckage. Verified against vega-lite 5.21, 5.23 and 6.4 (a single-layer spec with one
+    # top-level select param fails on the FIRST compile), so no pin bump fixes it — refuse it
+    # here, where the message reaches the author. Variable params (no `select`) are legal at
+    # the top level of any spec and pass untouched.
+    composite = [k for k in ("layer", "hconcat", "vconcat", "concat", "facet", "repeat")
+                 if k in spec]
+    if composite:
+        selections = sorted(
+            p["name"] for p in spec.get("params", [])
+            if isinstance(p, dict) and "select" in p and isinstance(p.get("name"), str)
+        )
+        if selections:
+            raise ValueError(
+                f"Selection param(s) {selections} cannot sit at the top level of a "
+                f"multi-view spec (this one has `{composite[0]}`): Vega-Lite only allows "
+                "selections inside unit specs, and the chart dies in the renderer with "
+                "`Duplicate signal name` after the tool has already succeeded. Move the "
+                "`params` array into the view that uses it — for a layered chart, the first "
+                "entry of `layer`."
+            )
 
     known = {c["name"] for c in columns}
     produced = _produced_fields(spec)
@@ -224,6 +276,26 @@ def hydrate(
     return out
 
 
+def assert_payload_fits(hydrated: dict, row_count: int, name: str) -> int:
+    """Refuse a payload the host will divert instead of delivering. Returns its size in chars.
+
+    Same stance as the row cap and for a sharper reason: past ~150k characters Claude writes the
+    result to its sandbox filesystem and the app receives a pointer, so the view silently renders
+    nothing. Erroring here turns an invisible host behaviour into a message that names the real
+    size and the way out.
+    """
+    size = len(json.dumps(hydrated, default=str))
+    if size > PAYLOAD_MAX_CHARS:
+        raise ValueError(
+            f"The chart payload for {name!r} is {size:,} characters ({row_count:,} rows inlined), "
+            f"over the {PAYLOAD_MAX_CHARS:,} budget. Nothing was truncated. Claude diverts a tool "
+            "result this large to its sandbox filesystem and hands the view a pointer instead of "
+            "the data, so the chart would render blank with no error. Aggregate, bin, or top-N "
+            "with `query` first and draw that result — or plot fewer columns."
+        )
+    return size
+
+
 def spec_fields(spec: dict, columns: list[dict[str, str]]) -> list[str]:
     """The result columns the spec actually plots, for the text summary.
 
@@ -244,9 +316,10 @@ def app_csp() -> dict[str, Any]:
 
     Only ``resource_domains`` — the page loads scripts and never calls out. There is deliberately
     no ``connect_domains``: a view that could fetch would be a view that could exfiltrate, and
-    ``data.url`` is already refused server-side for the same reason.
+    ``data.url`` is already refused server-side for the same reason. jsDelivr alone: the vega
+    bundles are the only external load left now that the transport is inline.
     """
-    return {"resource_domains": [_JSDELIVR, _UNPKG]}
+    return {"resource_domains": [_JSDELIVR]}
 
 
 # Plain HTML shown until the app mounts. It exists so a failure to load the bundles at all — a
@@ -265,36 +338,185 @@ body { margin: 0; padding: 12px; font: 13px/1.5 system-ui, sans-serif; }
 #status .hint { margin-top: 6px; font-size: 12px; }
 #status.error { color: #b00020; }
 @media (prefers-color-scheme: dark) { #status.error { color: #ff6b6b; } }
-#chart { width: 100%; }
+/* An app iframe with zero height is invisible, and it is one of the two causes Claude's own
+   troubleshooting page names first. The deadlock to avoid: `width: "container"` measures 0 in a
+   frame the host has not sized yet, the chart draws at 0x0, we then report ~0 height back, and
+   the host keeps the frame collapsed. A floor on both axes breaks the cycle before it starts. */
+#chart { width: 100%; min-width: 320px; min-height: 320px; }
 #chart .vega-embed { width: 100%; }
+"""
+
+# A CLASSIC script, deliberately, and loaded FIRST: it runs even when the module below never
+# does. A failed `import` — blocked origin, wrong MIME, network error — aborts the whole module
+# silently: no handler is ever attached, the page just sits on its fallback text, and there is
+# nothing obviously wrong to see. This captures that case and every later uncaught error into the
+# visible status line, so the page diagnoses ITSELF instead of needing someone with DevTools open.
+_BOOT_SCRIPT = """
+window.__spelunk = { build: "__APP_BUILD__", stage: "loading chart bundles", errors: [] };
+window.__spelunkStatus = function (text, isError) {
+  var el = document.getElementById("status");
+  if (!el) { return; }
+  el.hidden = false;
+  el.className = isError ? "error" : "";
+  el.textContent = text;
+  if (isError) {
+    var d = document.createElement("div");
+    d.className = "hint";
+    d.textContent = "build " + window.__spelunk.build
+      + " | stage: " + window.__spelunk.stage
+      + (window.__spelunk.errors.length ? " | " + window.__spelunk.errors.join(" | ") : "");
+    el.appendChild(d);
+  }
+};
+window.addEventListener("error", function (e) {
+  // A failed <script src> or module import surfaces here with the element as the target, which
+  // is the only signal that distinguishes "blocked bundle" from "bundle ran and then threw".
+  var what = (e && e.target && e.target.src) ? ("failed to load " + e.target.src)
+           : (e && e.message ? e.message : "script error");
+  window.__spelunk.errors.push(what);
+  window.__spelunkStatus("This view could not start.", true);
+}, true);
+window.addEventListener("unhandledrejection", function (e) {
+  var r = e && e.reason;
+  window.__spelunk.errors.push("unhandled: " + (r && r.message ? r.message : String(r)));
+  window.__spelunkStatus("This view could not start.", true);
+});
+"""
+
+# The transport: a raw `ui/` JSON-RPC client over postMessage, presenting the same surface the
+# app script used when it came from the ext-apps SDK (`connect` / `getHostContext` /
+# `sendSizeChanged` / `callServerTool` / `ontoolinput` / `ontoolresult` /
+# `onhostcontextchanged`). Inline and CLASSIC, deliberately: the SDK arrived as the page's one
+# ES module import, and a failed module import aborts silently — which on Claude Desktop is
+# exactly what happened, the handshake never completing while this dialect (the same one the
+# develop-ui recovery shim verified on the wire, message name for message name) renders. The
+# `ev.source !== window.parent` identity check is the security half: a sandboxed frame can be
+# postMessage'd by anything, and without it a hostile frame could feed the view a payload or
+# answer its `tools/call`.
+_TRANSPORT_SCRIPT = """
+window.SpelunkApp = function (appInfo) {
+  var self = this;
+  this.ontoolinput = null;
+  this.ontoolresult = null;
+  this.onhostcontextchanged = null;
+  this._hostContext = null;
+  this._hostInfo = null;
+  this._pending = {};
+  this._nextId = 2;
+
+  window.addEventListener("message", function (ev) {
+    if (ev.source !== window.parent) { return; }
+    var d = ev.data;
+    if (!d || d.jsonrpc !== "2.0") { return; }
+    if (d.id !== undefined && (d.result !== undefined || d.error !== undefined)) {
+      var waiter = self._pending[d.id];
+      if (!waiter) { return; }
+      delete self._pending[d.id];
+      if (d.error) { waiter.reject(new Error(d.error.message || "host error")); }
+      else { waiter.resolve(d.result); }
+      return;
+    }
+    var params = d.params || {};
+    if (d.method === "ui/notifications/tool-input") {
+      if (self.ontoolinput) { self.ontoolinput(params); }
+    } else if (d.method === "ui/notifications/tool-result") {
+      if (self.ontoolresult) { self.ontoolresult(params); }
+    } else if (d.method === "ui/notifications/host-context-changed") {
+      // The SDK spreads the params straight into its stored context; some hosts nest the
+      // partial under `hostContext`. Accept both, so a theme flip lands either way.
+      var partial = params.hostContext || params;
+      self._hostContext = Object.assign({}, self._hostContext, partial);
+      if (self.onhostcontextchanged) { self.onhostcontextchanged(params); }
+    }
+  });
+
+  this._post = function (msg) { window.parent.postMessage(msg, "*"); };
+
+  this._request = function (method, params) {
+    var id = self._nextId++;
+    return new Promise(function (resolve, reject) {
+      self._pending[id] = { resolve: resolve, reject: reject };
+      self._post({ jsonrpc: "2.0", id: id, method: method, params: params });
+      setTimeout(function () {
+        if (self._pending[id]) {
+          delete self._pending[id];
+          reject(new Error(method + ": no response from the host after 30s"));
+        }
+      }, 30000);
+    });
+  };
+
+  this.connect = function () {
+    return self._request("ui/initialize", {
+      appInfo: appInfo,
+      appCapabilities: {},
+      protocolVersion: "__UI_PROTOCOL_VERSION__",
+    }).then(function (result) {
+      self._hostContext = (result && result.hostContext) || null;
+      self._hostInfo = (result && result.hostInfo) || null;
+      self._post({ jsonrpc: "2.0", method: "ui/notifications/initialized" });
+    });
+  };
+
+  this.getHostContext = function () { return self._hostContext; };
+
+  this.callServerTool = function (call) {
+    return self._request("tools/call", { name: call.name, arguments: call.arguments || {} });
+  };
+
+  this.sendSizeChanged = function () {
+    var root = document.documentElement;
+    self._post({
+      jsonrpc: "2.0", method: "ui/notifications/size-changed",
+      params: { width: root ? root.scrollWidth : undefined,
+                height: (root && root.scrollHeight) || 360 },
+    });
+  };
+};
 """
 
 # `ast: true` routes Vega's expression evaluation through the bundled AST interpreter instead of
 # the Function constructor, so the page needs no `script-src 'unsafe-eval'` from the host.
 #
-# The structuredContent recovery branch is ext-apps#696: Claude Desktop strips structuredContent
-# from the result it forwards to a view, while the tools/call proxy is unaffected. Unlike the
-# hand-rolled shim this replaces, the SDK exposes both halves as documented API — `ontoolinput`
-# for the arguments and `callServerTool` for the re-fetch — so there is no transport to reach
-# into. It is sound only because `visual` is idempotent and read-only. Temporary:
-# `grep -rn "ext-apps#696"` finds every line to delete.
+# The structuredContent recovery branch covers ext-apps#696 (Claude Desktop strips
+# structuredContent from the result it forwards to a view) AND the >150k-character sandbox
+# diversion, which present identically to the app; the tools/call proxy is unaffected by both.
+# `ontoolinput` captures the arguments and `callServerTool` re-fetches — both methods of the
+# inline transport above. It is sound only because `visual` is idempotent and read-only.
+# Temporary: `grep -rn "ext-apps#696"` finds every line to delete.
+#
+# Every branch records WHICH stage it reached, because these failures are otherwise
+# indistinguishable from one another AND from success-into-an-invisible-frame: a blocked bundle,
+# a handshake that never completes, a result that arrives without structuredContent, and a chart
+# drawn at zero size all look the same to someone staring at an empty rectangle.
 _APP_SCRIPT = """
-import { App } from "https://unpkg.com/@modelcontextprotocol/ext-apps@%(ext_apps)s/app-with-deps";
+// A CLASSIC script, like everything else on the page — the transport is inline
+// (window.SpelunkApp), so there is no module import whose silent failure could take the whole
+// script down. The boot script still owns the "still loading" stage: a blocked vega bundle
+// surfaces there, not here.
+const App = window.SpelunkApp;
 
-const statusEl = document.getElementById("status");
+const boot = window.__spelunk;
+const setStatus = window.__spelunkStatus;
 const chartEl = document.getElementById("chart");
 let lastArgs = null, lastSpec = null, recovered = false;
+let currentView = null, drawing = null, lastTheme = null;
 
-const app = new App({ name: "Spelunk Vega", version: "1.0.0" }, {}, { autoResize: true });
+boot.stage = "transport ready";
+if (typeof vegaEmbed !== "function") {
+  setStatus("The chart library did not load.", true);
+}
 
-function fail(message) {
-  statusEl.className = "error";
-  statusEl.textContent = message;
+const app = new App({ name: "Spelunk Vega", version: "1.0.0" });
+
+function fail(message) { setStatus(message, true); }
+
+function hostTheme() {
+  try { return app.getHostContext()?.theme ?? null; } catch (e) { return null; }
 }
 
 function themeConfig() {
-  let dark = false;
-  try { dark = app.getHostContext()?.theme === "dark"; } catch (e) { /* host may not say */ }
+  const dark = hostTheme() === "dark";
   if (!dark) return {};
   return {
     background: "transparent",
@@ -306,48 +528,123 @@ function themeConfig() {
   };
 }
 
+// Draws are SERIALIZED through one promise chain, and each embed tears the previous view down
+// first. Both halves are needed, and skipping either breaks any spec carrying a `params`
+// selection:
+//
+//   Vega registers a signal per selection (`<name>_tuple` and friends) in a GLOBAL-per-element
+//   namespace. Put a second view on the same element and the names collide — vegaEmbed throws
+//   `Duplicate signal name: "<name>_tuple"` and the chart dies, having rendered nothing. A plain
+//   chart with no params survives the same double-embed silently, which is what makes this a
+//   bug you only meet once someone writes an interactive spec.
+//
+// Two callers race here: the tool result draws once, and `onhostcontextchanged` (theme, locale)
+// can fire again while that first embed is still awaiting.
 async function draw(spec) {
   if (!spec) { fail("No chart spec arrived from the server."); return; }
   lastSpec = spec;
+  drawing = (drawing || Promise.resolve()).then(() => embed(spec), () => embed(spec));
+  return drawing;
+}
+
+async function embed(spec) {
+  boot.stage = "drawing";
   try {
-    statusEl.hidden = true;
-    await vegaEmbed(chartEl, spec, {
+    // Tear down the previous view before building another. `finalize()` releases its signals and
+    // listeners; clearing the container drops the DOM vega-embed left behind.
+    if (currentView) {
+      try { currentView.finalize(); } catch (e) { /* already gone */ }
+      currentView = null;
+    }
+    chartEl.innerHTML = "";
+    // `width: "container"` needs a container that has already been laid out. In a frame the host
+    // has not sized yet it measures 0 and the chart draws invisibly, so fall back to a concrete
+    // width for this embed rather than shipping a 0x0 picture.
+    if (spec.width === "container" && !chartEl.clientWidth) {
+      spec = Object.assign({}, spec, { width: 600 });
+    }
+    lastTheme = hostTheme();
+    const result = await vegaEmbed(chartEl, spec, {
       ast: true,                 // CSP-safe expression interpreter; see module docstring
       actions: { export: true, source: false, compiled: false, editor: false },
       config: themeConfig(),
     });
+    currentView = (result && result.view) || null;
+    document.getElementById("status").hidden = true;
+    boot.stage = "drawn";
     try { app.sendSizeChanged(); } catch (e) { /* host may not accept a size hint */ }
   } catch (err) {
-    statusEl.hidden = false;
-    fail("Could not render the chart: " + (err && err.message ? err.message : String(err)));
+    boot.errors.push(err && err.message ? err.message : String(err));
+    fail("Could not render the chart.");
   }
 }
 
-app.ontoolinput = ({ arguments: args }) => { lastArgs = args || null; };
+app.ontoolinput = (params) => { lastArgs = (params && params.arguments) || null; };
 
 app.ontoolresult = async (result) => {
+  boot.stage = "tool result received";
   if (result?.structuredContent?.spec) { await draw(result.structuredContent.spec); return; }
   if (result?.isError) { fail("The server reported an error building this chart."); return; }
-  // ext-apps#696: structuredContent was stripped in transit — ask for it again through the
-  // tools/call proxy, which the host leaves intact.
-  if (recovered || !lastArgs) { fail("No chart spec arrived from the server."); return; }
+  // ext-apps#696, or the >150k-character sandbox diversion — identical from here. Ask for the
+  // payload again through the tools/call proxy, which neither affects.
+  boot.stage = "result arrived WITHOUT structuredContent; re-fetching";
+  if (recovered || !lastArgs) {
+    fail("The chart data did not reach this view."
+      + (lastArgs ? "" : " No tool arguments arrived either, so it cannot be re-fetched."));
+    return;
+  }
   recovered = true;
   try {
     const again = await app.callServerTool({ name: "visual", arguments: lastArgs });
-    await draw(again?.structuredContent?.spec);
+    if (!again?.structuredContent?.spec) {
+      fail("Re-fetching the chart data returned nothing. If the result is large, aggregate it "
+         + "with `query` first — Claude diverts oversized tool results away from the view.");
+      return;
+    }
+    await draw(again.structuredContent.spec);
   } catch (err) {
-    fail("Could not recover the chart spec from the server.");
+    boot.errors.push("re-fetch: " + (err && err.message ? err.message : String(err)));
+    fail("Could not recover the chart data from the server.");
   }
 };
 
 app.onhostcontextchanged = () => {
   // Theme lives in the host context, and the config is baked in at embed time, so a theme flip
-  // means re-embedding rather than restyling in place.
-  if (lastSpec) { draw(lastSpec); }
+  // means re-embedding rather than restyling in place. Gate on the theme ACTUALLY changing:
+  // this notification also carries locale and display-mode changes, and the host fires one on
+  // connect, so redrawing unconditionally means re-embedding for no reason.
+  if (lastSpec && hostTheme() !== lastTheme) { draw(lastSpec); }
 };
 
-await app.connect();
+boot.stage = "connecting to host";
+app.connect().then(() => {
+  // Only while still waiting: connect resolves asynchronously, and on a host that delivered
+  // the tool result first this would otherwise overwrite a later stage (or a failure status)
+  // with "waiting".
+  if (boot.stage === "connecting to host") {
+    boot.stage = "connected; waiting for the tool result";
+    setStatus("Connected. Waiting for chart data\\u2026", false);
+  }
+}, (err) => {
+  boot.errors.push("connect: " + (err && err.message ? err.message : String(err)));
+  fail("Could not connect to the host.");
+});
 """
+
+
+def app_build() -> str:
+    """A short fingerprint of the exact page this server would serve.
+
+    The single most expensive unknown when a view misbehaves is whether the host is running the
+    code you just changed or a cached copy of the last one. Stamping the page and ALSO reporting
+    the stamp in the tool summary settles it in one look: same stamp on both sides means the host
+    is current, different means it cached and no amount of editing will change what you see.
+    """
+    material = "|".join(
+        [_STYLE, _BOOT_SCRIPT, _TRANSPORT_SCRIPT, _APP_SCRIPT, VEGA_VERSION,
+         VEGA_LITE_VERSION, VEGA_EMBED_VERSION, UI_PROTOCOL_VERSION]
+    )
+    return hashlib.sha256(material.encode()).hexdigest()[:8]
 
 
 def app_html() -> str:
@@ -357,19 +654,24 @@ def app_html() -> str:
     rather than generated, because unlike the Prefab renderer it replaces there is no upstream
     page to inherit — which is also why it is far shorter.
     """
-    script = _APP_SCRIPT % {"ext_apps": EXT_APPS_VERSION}
+    # `.replace`, not `%` — the script is JavaScript, and a stray `%` in it (a CSS width, a
+    # modulo) would blow up percent-formatting at import time.
+    transport = _TRANSPORT_SCRIPT.replace("__UI_PROTOCOL_VERSION__", UI_PROTOCOL_VERSION)
+    boot = _BOOT_SCRIPT.replace("__APP_BUILD__", app_build())
     return (
         "<!doctype html>\n"
         '<html lang="en">\n<head>\n<meta charset="utf-8" />\n'
         '<meta name="viewport" content="width=device-width, initial-scale=1" />\n'
         "<title>Spelunk chart</title>\n"
         f"<style>{_STYLE}</style>\n"
+        f"<script>{boot}</script>\n"
+        f"<script>{transport}</script>\n"
         f'<script src="{_JSDELIVR}/npm/vega@{VEGA_VERSION}"></script>\n'
         f'<script src="{_JSDELIVR}/npm/vega-lite@{VEGA_LITE_VERSION}"></script>\n'
         f'<script src="{_JSDELIVR}/npm/vega-embed@{VEGA_EMBED_VERSION}"></script>\n'
         "</head>\n<body>\n"
         f"{_FALLBACK}\n"
         '<div id="chart"></div>\n'
-        f'<script type="module">{script}</script>\n'
+        f"<script>{_APP_SCRIPT}</script>\n"
         "</body>\n</html>\n"
     )
