@@ -62,8 +62,8 @@ _ATTACHED_SYSTEM_SCHEMAS = frozenset({"information_schema", "pg_catalog"})
 _ATTACHED_DEFAULT_SCHEMA = {"sqlite": "main", "postgres": "public", "ducklake": "main"}
 
 # The numeric-type predicate (`is_numeric_type`, imported above) lives in core/types.py, beside
-# the ColumnInfo.type it interprets, so the DuckDB-free rendering layer (mcp/views.py) can share
-# it without importing this module and dragging the whole engine along.
+# the ColumnInfo.type string it interprets, so anything reading that contract can classify a
+# column without importing this module and dragging the whole engine along.
 
 _SAMPLE_ROWS = 5
 # When a result is small on BOTH axes, query() returns EVERY row as the `sample` (and reports
@@ -75,13 +75,14 @@ _FULL_SAMPLE_CELL_CAP = 1000
 # A materialized result larger than this, produced by an unfiltered SELECT * over a source,
 # triggers a nudge: you probably wanted a slice, and DuckDB would have pushed the filter down.
 _LARGE_MATERIALIZE = 100_000
-# Caps for `show`: a rendered view crosses the wire as JSON inside structuredContent and is then
+# Caps for display: a rendered view crosses the wire as JSON inside structuredContent and is then
 # held in a browser DOM, so a result that is perfectly fine as a *table* is not fine as a
 # *payload*. Bounded on rows AND cells, like the full-sample caps above — 2000 rows of 60 columns
 # is 120k values nobody reads. rows_for_display REFUSES past these rather than truncating: a
 # silently shortened result renders as a chart that misstates the data, which is worse than no
-# chart. Charts pass a far lower max_rows (see _CHART_MAX_ROWS in mcp/views.py) — 200 bars is
-# already past the point of legibility.
+# chart. `visual` overrides max_rows UPWARD (vega.VEGA_MAX_ROWS, 5000) because Vega-Lite holds the
+# rows client-side and can bin or aggregate there, so legibility is no longer bounded by the row
+# count; the cell cap below is what still bounds a wide result.
 _DISPLAY_MAX_ROWS = 2000
 _DISPLAY_MAX_CELLS = 40_000
 # After this many consecutive single-statement query() calls, nudge once toward query_steps —
@@ -303,13 +304,21 @@ class DuckSession:
 
     # ------------------------------------------------------------------ lineage store - #
     def _ensure_meta(self) -> None:
-        """Create the internal lineage store (idempotent). One row per live result.
+        """Create the internal metadata stores (idempotent): lineage, and visual definitions.
 
         A result is keyed by (flow, name); ``CREATE OR REPLACE`` of a result overwrites its
         row, so the store always reflects the *current* definition. ``deps`` and ``sources``
         are JSON arrays; ``seq`` is a monotonic creation counter used as a stable tie-break
         when ordering independent nodes for replay. ``description`` is an optional one-line,
         plain-English label (nullable) carried through to ``lineage`` / ``catalog``.
+
+        ``visuals`` holds chart DEFINITIONS, not renderings: a data-free Vega-Lite spec plus the
+        result names it reads. It deliberately mirrors ``lineage``'s conventions rather than
+        picking its own — JSON as VARCHAR, ISO-8601 timestamps, nullable description — because
+        an agent reads both with ``query`` and consistency beats elegance there. It is keyed
+        (flow, name) with REPLACE semantics for the same reason lineage is: the store reflects
+        the current definition, not an authoring history. No ``seq``: lineage carries one as a
+        topological tie-break, and visuals are never ordered.
         """
         self._con.execute(f'CREATE SCHEMA IF NOT EXISTS "{_META_SCHEMA}"')
         self._con.execute(
@@ -323,6 +332,17 @@ class DuckSession:
         # (a shared/per-process workspace created before this feature). No-op on a fresh table.
         self._con.execute(
             f'ALTER TABLE "{_META_SCHEMA}".lineage ADD COLUMN IF NOT EXISTS description VARCHAR'
+        )
+        # `reads` is a JSON ARRAY holding exactly one name today. Stored as an array from the
+        # start so widening to multi-result charts (Vega-Lite `datasets`) is a code change and
+        # not a table rebuild — DuckDB cannot ALTER a primary key, so the shape of this table is
+        # the one thing here that does not reverse cheaply.
+        self._con.execute(
+            f'CREATE TABLE IF NOT EXISTS "{_META_SCHEMA}".visuals ('
+            "flow VARCHAR NOT NULL, name VARCHAR NOT NULL, reads VARCHAR NOT NULL, "
+            "spec VARCHAR NOT NULL, fields VARCHAR NOT NULL, title VARCHAR, "
+            "description VARCHAR, created_at VARCHAR NOT NULL, "
+            "PRIMARY KEY (flow, name))"
         )
 
     # ------------------------------------------------------------------ open / close --- #
@@ -687,6 +707,140 @@ class DuckSession:
             self._con.execute(
                 f'DELETE FROM "{_META_SCHEMA}".lineage WHERE flow = ? AND name = ?', [flow, name]
             )
+
+    # ------------------------------------------------------------------ visual store -- #
+    def record_visual(
+        self,
+        flow: str | None,
+        name: str,
+        reads: list[str],
+        spec: str,
+        fields: list[str],
+        title: str | None = None,
+        description: str | None = None,
+    ) -> dict:
+        """Store a chart DEFINITION under (flow, name), replacing any prior one.
+
+        *spec* is Vega-Lite JSON that must be **data-free** — the caller passes the validated
+        spec, never the hydrated one. Storing the hydrated spec would write every drawn row into
+        the meta table as text and make a redraw ignore the live result entirely.
+
+        *fields* is the set of result COLUMNS the spec needs (field references minus whatever
+        the spec's own transforms invent). It is stored rather than re-derived because deriving
+        it means parsing Vega-Lite grammar, which belongs to the rendering layer — the caller
+        computes it there and this module compares name sets. That keeps ``replay``'s staleness
+        check pure set arithmetic and keeps ``core`` free of any Vega dependency.
+
+        Replace semantics, deliberately mirroring ``_record_lineage``: the store reflects the
+        current definition, not an authoring history. This does NOT write a lineage row — a
+        stored spec is a definition, not a result, and a ``kind='visual'`` node would reach
+        replay's SQL execution path and be executed as SQL.
+        """
+        flow = self._resolve_flow(flow)
+        _validate_name(name)
+        if not reads:
+            raise ValueError("A visual must read at least one result.")
+        if len(reads) > 1:
+            raise ValueError(
+                f"A visual reads exactly one result today, got {reads}. Multi-result charts "
+                "need Vega-Lite's `datasets` block, which is not supported yet."
+            )
+        for ref in reads:
+            _validate_name(ref)
+        with self._lock:
+            self._write_visual(flow, name, reads, spec, fields, title, description)
+        return {"flow": flow, "name": name, "reads": list(reads)}
+
+    def _write_visual(
+        self,
+        flow: str,
+        name: str,
+        reads: list[str],
+        spec: str,
+        fields: list[str],
+        title: str | None,
+        description: str | None,
+    ) -> None:
+        """Upsert one visual row (caller holds ``_lock``). Blank title/description → NULL."""
+        self._delete_visuals(flow, name)
+        self._con.execute(
+            f'INSERT INTO "{_META_SCHEMA}".visuals '
+            "(flow, name, reads, spec, fields, title, description, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            [
+                flow,
+                name,
+                json.dumps(list(reads)),
+                spec,
+                json.dumps(list(fields)),
+                (title or "").strip() or None,
+                (description or "").strip() or None,
+                datetime.now(timezone.utc).isoformat(),
+            ],
+        )
+
+    def load_visual(self, flow: str | None, name: str) -> dict:
+        """Read one stored visual, or raise naming the visuals that do exist."""
+        flow = self._resolve_flow(flow)
+        _validate_name(name)
+        with self._lock:
+            found = self._select_visual(flow, name)
+            if found is None:
+                known = [v["name"] for v in self._visuals_for_flow(flow)]
+                raise ValueError(
+                    f"No visual named {name!r} in flow {flow!r}. "
+                    f"Flow {flow!r} holds: {known or ['(none)']}."
+                )
+        return found
+
+    def _select_visual(self, flow: str, name: str) -> dict[str, Any] | None:
+        """One visual row as a dict, or None (caller holds ``_lock``)."""
+        row = self._con.execute(
+            f'SELECT name, reads, spec, fields, title, description, created_at '
+            f'FROM "{_META_SCHEMA}".visuals WHERE flow = ? AND name = ?',
+            [flow, name],
+        ).fetchone()
+        return None if row is None else self._visual_row(flow, row)
+
+    def _visuals_for_flow(self, flow: str) -> list[dict[str, Any]]:
+        """Every stored visual in *flow*, ordered by name (caller holds ``_lock``)."""
+        rows = self._con.execute(
+            f'SELECT name, reads, spec, fields, title, description, created_at '
+            f'FROM "{_META_SCHEMA}".visuals WHERE flow = ? ORDER BY name',
+            [flow],
+        ).fetchall()
+        return [self._visual_row(flow, r) for r in rows]
+
+    @staticmethod
+    def _visual_row(flow: str, row: tuple) -> dict[str, Any]:
+        name, reads, spec, fields, title, description, created_at = row
+        return {
+            "flow": flow,
+            "name": name,
+            "reads": json.loads(reads),
+            "spec": spec,
+            "fields": json.loads(fields),
+            "title": title,
+            "description": description,
+            "created_at": created_at,
+        }
+
+    def _delete_visuals(self, flow: str, name: str | None) -> int:
+        """Forget one visual (*name* given) or a whole flow's. Returns the count (holds lock)."""
+        if name is None:
+            n = self._con.execute(
+                f'SELECT COUNT(*) FROM "{_META_SCHEMA}".visuals WHERE flow = ?', [flow]
+            ).fetchone()[0]
+            self._con.execute(f'DELETE FROM "{_META_SCHEMA}".visuals WHERE flow = ?', [flow])
+            return int(n)
+        n = self._con.execute(
+            f'SELECT COUNT(*) FROM "{_META_SCHEMA}".visuals WHERE flow = ? AND name = ?',
+            [flow, name],
+        ).fetchone()[0]
+        self._con.execute(
+            f'DELETE FROM "{_META_SCHEMA}".visuals WHERE flow = ? AND name = ?', [flow, name]
+        )
+        return int(n)
 
     def _result_names(self, flow: str) -> list[str]:
         rows = self._con.execute(
@@ -1412,7 +1566,13 @@ class DuckSession:
                 flows = []
                 for (sname,) in rows:
                     count = len(self._result_names(sname))
-                    flows.append({"flow": sname, "result_count": count})
+                    entry = {"flow": sname, "result_count": count}
+                    # A flow holding only charts would otherwise report result_count 0 and read
+                    # as empty, which is the kind of quietly-wrong answer this surface refuses.
+                    visuals = len(self._visuals_for_flow(sname))
+                    if visuals:
+                        entry["visual_count"] = visuals
+                    flows.append(entry)
                 return {"flows": flows}
 
             _validate_name(flow, "flow name")
@@ -1427,7 +1587,24 @@ class DuckSession:
                     "columns": self._columns_of(flow, tname),
                     "description": descriptions.get(tname),
                 })
-            return {"flow": flow, "results": results}
+            # Visuals are a separate section, not merged into `results`, because a name may
+            # legitimately appear in both: they are different kinds of object sharing a namespace.
+            # The spec itself is deliberately NOT listed — a catalog is an index, and inlining
+            # every chart's JSON would bury the results it sits beside. Read one with `load` or
+            # by querying _spelunk_meta.visuals directly.
+            out = {"flow": flow, "results": results}
+            visuals = [
+                {
+                    "name": v["name"],
+                    "reads": v["reads"],
+                    "title": v["title"],
+                    "description": v["description"],
+                }
+                for v in self._visuals_for_flow(flow)
+            ]
+            if visuals:
+                out["visuals"] = visuals
+            return out
 
     def drop(self, name: str | None = None, flow: str | None = None) -> dict:
         """Drop one result (``name`` given) or an entire flow (``name`` omitted)."""
@@ -1445,12 +1622,29 @@ class DuckSession:
                 ).fetchone()[0] > 0
                 self._con.execute(f'DROP TABLE IF EXISTS "{flow}"."{name}"')
                 self._delete_lineage(flow, name)
-                return {"flow": flow, "name": name, "dropped": bool(existed)}
+                # A result and a visual may share a name — nothing checks them against each
+                # other, because enforcing that would need guards on three separate materialize
+                # paths (_materialize_query, the fetch materialize, replay's rebuild) and only
+                # partial enforcement is worse than none. So `name` may address either or BOTH:
+                # drop whatever is there and report each half. The collision is resolved by
+                # saying what happened, not by prohibiting it.
+                dropped_visual = self._delete_visuals(flow, name) > 0
+                return {
+                    "flow": flow,
+                    "name": name,
+                    "dropped": bool(existed),
+                    "dropped_visual": dropped_visual,
+                }
 
             dropped = len(self._result_names(flow))
+            dropped_visuals = self._delete_visuals(flow, None)
             self._con.execute(f'DROP SCHEMA IF EXISTS "{flow}" CASCADE')
             self._delete_lineage(flow, None)
-            return {"flow": flow, "dropped_results": dropped}
+            return {
+                "flow": flow,
+                "dropped_results": dropped,
+                "dropped_visuals": dropped_visuals,
+            }
 
     # ------------------------------------------------------------------ lineage ------- #
     def _load_all_lineage(self) -> dict[tuple[str, str], dict[str, Any]]:
@@ -1784,13 +1978,17 @@ class DuckSession:
                 for (f, nm) in order
             ]
             if dry_run:
-                return {
+                out = {
                     "source_flow": flow,
                     "target_flow": target,
                     "dry_run": True,
                     "order": [nm for (_f, nm) in order],
                     "plan": plan,
                 }
+                preview = self._preview_visuals(flow, {nm for (_f, nm) in order})
+                if preview["carried"] or preview["stale"]:
+                    out["visuals"] = preview
+                return out
 
             if target != flow:
                 self._con.execute(f'CREATE SCHEMA IF NOT EXISTS "{target}"')
@@ -1838,6 +2036,7 @@ class DuckSession:
                 ).fetchone()[0]
                 self._record_lineage(target, nm, node["sql"], "query", node.get("description"))
                 rebuilt.append({"name": nm, "kind": node["kind"], "row_count": int(rc)})
+            visuals = self._carry_visuals(flow, target)
         out = {
             "source_flow": flow,
             "target_flow": target,
@@ -1847,7 +2046,73 @@ class DuckSession:
         }
         if preserved:
             out["preserved"] = preserved
+        if visuals["carried"] or visuals["stale"]:
+            out["visuals"] = visuals
         return out
+
+    def _preview_visuals(self, flow: str, planned: set[str]) -> dict[str, list[dict[str, Any]]]:
+        """What a replay WOULD do to this flow's visuals (caller holds ``_lock``).
+
+        Honest limit: this reports a visual whose read target is absent, because that is knowable
+        from the plan. It **cannot** predict field drift — a renamed column is only visible in the
+        post-rebuild schema, and that needs an actual rebuild. ``dry_run`` does not catch
+        everything, and saying so is better than implying it does.
+        """
+        carried: list[dict[str, Any]] = []
+        stale: list[dict[str, Any]] = []
+        for v in self._visuals_for_flow(flow):
+            entry = {"name": v["name"], "reads": v["reads"]}
+            read = v["reads"][0]
+            if read in planned or self._columns_of(flow, read):
+                carried.append(entry)
+            else:
+                stale.append({**entry, "reason": "missing_result"})
+        return {"carried": carried, "stale": stale}
+
+    def _carry_visuals(self, flow: str, target: str) -> dict[str, list[dict[str, Any]]]:
+        """Carry a flow's visuals through a replay and report drift (caller holds ``_lock``).
+
+        Visuals are not lineage nodes, so this is not part of the rebuild loop — it reads the
+        store for *flow* directly, which is exactly why none of the "a visual node reaches the
+        SQL execution path" problem exists.
+
+        Rebuilding **in place** needs no copy: same names, same flow, and the spec is untouched.
+        Rebuilding ``into`` a fresh flow copies the DEFINITION, without which a "complete"
+        rebuild would leave every chart behind in the old flow — the same orphaning the fetch
+        branch above copies its rows to avoid.
+
+        Versions are never bumped and nothing is re-rendered. A version would be authoring
+        history and replay authors nothing; a re-render is unnecessary because hydration happens
+        at draw time, so a replayed flow's charts pick up the new data the next time anyone
+        looks. That is the whole payoff of a data-free spec.
+        """
+        carried: list[dict[str, Any]] = []
+        stale: list[dict[str, Any]] = []
+        for v in self._visuals_for_flow(flow):
+            if target != flow:
+                self._write_visual(
+                    target, v["name"], v["reads"], v["spec"], v["fields"],
+                    v["title"], v["description"],
+                )
+            entry = {"name": v["name"], "reads": v["reads"]}
+            # Validate against the REBUILT schema: replay's whole purpose is rebuilding against
+            # possibly-changed sources, so the realistic breakage is a renamed column, not a
+            # dropped result. Report either; never raise. Replay succeeded at its job, and
+            # failing an entire rebuild over one chart's encoding would be wrong.
+            columns = {c["name"] for c in self._columns_of(target, v["reads"][0])}
+            if not columns:
+                # The read target is absent from the target flow — dropped since authoring, or
+                # never rebuilt. Reaching for its columns unguarded would raise MID-replay,
+                # after results are already rebuilt, turning a reporting concern into a
+                # half-finished operation.
+                stale.append({**entry, "reason": "missing_result"})
+                continue
+            missing = sorted(f for f in v["fields"] if f not in columns)
+            if missing:
+                stale.append({**entry, "reason": "missing_fields", "missing_fields": missing})
+            else:
+                carried.append(entry)
+        return {"carried": carried, "stale": stale}
 
     # ------------------------------------------------------------------ introspection - #
     def list_objects(self) -> list[TableInfo]:

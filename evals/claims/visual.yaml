@@ -16,8 +16,9 @@ claims:
 
 - id: VIS-001
   claim: >
-    `visual` is read-only: it creates NO result and records NO lineage node. A view is not a
-    result, so there is nothing to drop after drawing something.
+    `visual` is read-only over the DATA: it creates NO result and records NO lineage node, in
+    every mode including `save_as`. A view is not a result. What `save_as` persists is a chart
+    DEFINITION in the reserved meta schema — the same kind of thing a lineage row is.
   source: CLAUDE.md#tool-surface
   mode: invariant
   falsifier: >
@@ -28,6 +29,8 @@ claims:
   - tests/test_visual.py::TestVisualTool::test_creates_no_result_and_no_lineage_row
   - tests/test_visual.py::TestVisualTool::test_unknown_flow_is_not_provisioned
   - tests/test_visual.py::TestRowsForDisplay::test_reads_without_creating_anything
+  - tests/test_visual_store.py::TestSaveAs::test_creates_no_result_and_no_lineage_row
+  - tests/test_visual_store.py::TestModeRefusals::test_an_unknown_flow_is_refused_not_provisioned
   note: >
     The load-bearing claim of the whole feature, and it survived the Prefab-to-Vega swap
     unchanged. The flow-provisioning half is the one that hid a real leak under `show`:
@@ -424,6 +427,155 @@ claims:
     params (which for a multi-layer spec would mean guessing the owning unit). The `visual`
     tool description teaches the placement at authoring time; this refusal teaches it at
     failure time with the fix named.
+
+- id: VIS-020
+  claim: >
+    The visual store REPLACES rather than appends. Re-authoring a chart under the same name
+    leaves exactly one row in _spelunk_meta.visuals — definitions, not versions.
+  source: CLAUDE.md#key-concepts
+  mode: invariant
+  falsifier: >
+    Saving twice under one name leaves two rows, or a version column appears and the read path
+    has to pick a winner.
+  status: verified
+  covered_by:
+  - tests/test_visual_store.py::TestSaveAs::test_saving_replaces_rather_than_appends
+  note: >
+    Deliberately the same semantics as `_record_lineage`, and deliberately NOT the append-only
+    version table an earlier draft specified. Version history was cut because the case for it —
+    an agent diffing its own iterations — is an untested guess about agent behaviour, while the
+    cost is concrete in four places (a QUALIFY on every read, "removes all versions" in drop,
+    "latest per name" in catalog, copy-all-versions in replay). The one part that does not
+    reverse cheaply is the primary key: DuckDB cannot ALTER one, so adding versions later means
+    rebuilding the table rather than the ADD COLUMN IF NOT EXISTS pattern lineage used for
+    `description`.
+
+- id: VIS-021
+  claim: >
+    A stored spec is DATA-FREE. What is persisted is the validated spec, never the hydrated one,
+    so no drawn row is written into the meta table.
+  source: CLAUDE.md#tool-surface
+  mode: invariant
+  falsifier: >
+    The `spec` column of a stored visual contains a `data` key, or any value from the result it
+    was drawn against.
+  status: verified
+  covered_by:
+  - tests/test_visual_store.py::TestSaveAs::test_the_stored_spec_is_data_free
+  note: >
+    Load-bearing and one line from being wrong. `hydrate()` shallow-copies (`out = dict(spec)`)
+    before setting `out["data"]`, which is precisely what leaves `validated` clean and safe to
+    persist. Store `hydrated` instead and three things break at once: the spec is no longer
+    data-free, the workspace grows by the size of every chart drawn, and a redraw renders the
+    rows captured at authoring time while ignoring the live result — the last of which is
+    invisible until the data changes.
+
+- id: VIS-022
+  claim: >
+    A redraw re-runs every guard an authored spec runs — row cap, field validation against the
+    result's CURRENT columns, hydration, payload ceiling. The store is not a way around a check.
+  source: CLAUDE.md#tool-surface
+  mode: behavioral
+  falsifier: >
+    `visual(saved=...)` draws a chart whose spec references a column the result no longer has,
+    or bypasses the row/payload caps because the spec was validated once at authoring time.
+  status: verified
+  covered_by:
+  - tests/test_visual_store.py::TestRedraw::test_re_validates_against_the_current_schema
+  - tests/test_visual_store.py::TestRedraw::test_the_row_cap_applies_to_a_redraw_too
+  - tests/test_visual_store.py::TestRedraw::test_a_missing_read_target_names_the_result
+  - tests/test_visual_store.py::TestRedraw::test_picks_up_data_the_result_did_not_have_at_authoring
+  note: >
+    This is what makes the store safe to add: it introduces no new trust boundary, because the
+    redraw path walks the same four guards. It also delivers the staleness check for free —
+    an earlier draft designed a separate reporting structure for "a column was renamed since
+    authoring", and re-validation surfaces exactly that, at the moment someone looks, with the
+    existing "Spec references column(s) [...]" message.
+
+- id: VIS-023
+  claim: >
+    A result and a stored visual may share a name. `drop(name=...)` removes whatever carries it —
+    result, visual, or both — and the return reports each half.
+  source: CLAUDE.md#key-concepts
+  mode: behavioral
+  falsifier: >
+    Dropping a name removes only one of the two and reports success, or a collision is refused
+    on one side while the other can still claim the name.
+  status: verified
+  covered_by:
+  - tests/test_visual_store.py::TestDrop::test_a_result_and_a_visual_of_one_name_go_together
+  - tests/test_visual_store.py::TestDrop::test_removes_a_visual_and_reports_it
+  - tests/test_visual_store.py::TestDrop::test_dropping_a_flow_counts_its_visuals
+  - tests/test_visual_store.py::TestDrop::test_dropping_an_unrelated_name_leaves_the_visual
+  note: >
+    An earlier draft specified one namespace with the collision refused. That was enforcement in
+    one direction only: the check sat in the `save_as` path while `query(name=...)` could claim
+    the name from the other side. Closing it symmetrically needs guards on THREE materialize
+    paths — _materialize_query (query and every batch step), the fetch materialize, and replay's
+    rebuild — and partial enforcement of an invariant is worse than none, because the register
+    would then certify something untrue. It would also be stricter than results treat each
+    other, since `query` already lets one result silently replace another by name. So the
+    ambiguity is resolved by REPORTING rather than prohibiting.
+
+- id: VIS-024
+  claim: >
+    `replay` carries a flow's visuals — copying the definition when rebuilding `into` a fresh
+    flow — and reports drift against the rebuilt schema without ever failing the rebuild.
+  source: CLAUDE.md#key-concepts
+  mode: behavioral
+  falsifier: >
+    A rebuild `into` a fresh flow leaves the charts behind in the source flow, or a chart whose
+    column was renamed raises and aborts a replay whose data rebuild had already succeeded.
+  status: verified
+  covered_by:
+  - tests/test_visual_store.py::TestReplayCarry::test_into_copies_the_definition_and_it_redraws_there
+  - tests/test_visual_store.py::TestReplayCarry::test_in_place_carries_without_touching_the_spec
+  - tests/test_visual_store.py::TestReplayCarry::test_a_renamed_column_is_reported_stale_not_raised
+  - tests/test_visual_store.py::TestReplayCarry::test_a_missing_read_target_is_reported_not_raised
+  note: >
+    The third disposition beside `rebuilt` and `preserved`. Skipping the copy produces exactly
+    the failure the fetch branch's own comment warns about: a "complete" rebuild where the data
+    is present and the charts are orphaned. The missing-result case is the one most likely to be
+    written as an unguarded schema lookup, which would raise MID-replay — after results are
+    already rebuilt — turning a reporting concern into a half-finished operation. Because
+    visuals are not lineage nodes, none of this lives in the rebuild loop: `_carry_visuals`
+    reads the store directly, which is why no `kind='visual'` node can ever reach
+    `CREATE OR REPLACE TABLE ... AS {node["sql"]}`.
+
+- id: VIS-025
+  claim: >
+    `replay(dry_run=True)` reports a visual whose read target is absent, and does NOT claim to
+    predict field drift — that needs a post-rebuild schema, which needs an actual rebuild.
+  source: CLAUDE.md#key-concepts
+  mode: behavioral
+  falsifier: >
+    A dry run reports `missing_fields`, implying a plan can see a schema that does not exist
+    yet — or it omits visuals entirely, leaving the caller to assume there are none.
+  status: verified
+  covered_by:
+  - tests/test_visual_store.py::TestReplayCarry::test_dry_run_reports_visuals_but_cannot_predict_drift
+  note: >
+    Stating the limit is the point. A dry run that silently reported an empty `stale` list would
+    read as "no charts will break", which is a stronger claim than it can make.
+
+- id: VIS-026
+  claim: >
+    Given a chart it has already authored and stored, an agent redraws it with `saved=` rather
+    than re-authoring the whole spec.
+  source: CLAUDE.md#tool-surface
+  mode: affordance
+  falsifier: >
+    With a stored visual available and named in `catalog`, an agent still sends a full spec on
+    every look, or re-authors rather than redrawing after a `replay`.
+  status: unverified
+  covered_by: []
+  gap: >
+    The amortisation the whole store rests on: it only pays if the agent actually reaches for
+    `saved=` instead of re-authoring out of habit. Like VIS-015 this cannot be closed by unit
+    tests — it is about what a model DOES when handed the surface — but it is an unusually clean
+    thing to measure, because re-authoring and redrawing differ by orders of magnitude in output
+    tokens. A harness with an ablation arm (the same server with and without `save_as`/`saved`)
+    would settle it.
 
 - id: VIS-015
   claim: >

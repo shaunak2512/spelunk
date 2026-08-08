@@ -296,6 +296,22 @@ def assert_payload_fits(hydrated: dict, row_count: int, name: str) -> int:
     return size
 
 
+def required_columns(spec: dict) -> list[str]:
+    """The result columns a spec NEEDS, for the store to compare against later.
+
+    Field references minus whatever the spec's own ``transform`` block invents — a produced
+    field must not be demanded of the result, or a perfectly good chart would be reported stale
+    the moment anyone checked it.
+
+    Unlike :func:`spec_fields`, this takes no column list: it describes what the spec requires,
+    not what it happens to find. That is the difference that makes it storable — the answer must
+    stay true when the result's schema changes underneath it, which is the whole point of
+    checking it again after a rebuild.
+    """
+    produced = _produced_fields(spec)
+    return sorted(f for f in _field_refs(spec) if f not in produced)
+
+
 def spec_fields(spec: dict, columns: list[dict[str, str]]) -> list[str]:
     """The result columns the spec actually plots, for the text summary.
 

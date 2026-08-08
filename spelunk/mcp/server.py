@@ -431,31 +431,77 @@ def _provenance_summary(lineage: dict | None) -> dict:
 def _dispatch_visual(
     session: DuckSession,
     *,
-    name: str,
-    spec: Any,
-    title: str | None,
-    flow: str | None,
+    name: str | None = None,
+    spec: Any = None,
+    title: str | None = None,
+    flow: str | None = None,
+    save_as: str | None = None,
+    saved: str | None = None,
 ) -> ToolResult:
     """Shared body for the `visual` tool: check a spec against the data, then hydrate it.
 
+    Three modes, distinguished by which arguments arrive:
+
+    * ``name`` + ``spec`` — draw, store nothing.
+    * ``name`` + ``spec`` + ``save_as`` — draw, then store the spec under ``save_as``.
+    * ``saved`` — load a stored spec, re-validate it, and draw it against the live result.
+
     Returns both halves of an MCP result — `content` (JSON the model reads, mirroring `query`'s
     sample contract) and `structuredContent` (the hydrated Vega-Lite spec a UI host renders).
-    Read-only throughout: no table is created and no lineage row is written, because a view is
-    not a result.
+    Read-only over the DATA in every mode: no table is created and no lineage row is written,
+    because a view is not a result. ``save_as`` writes a chart DEFINITION to the reserved meta
+    schema, which is the same kind of thing a lineage row is.
 
     Order matters. The columns are read FIRST so `validate_spec` can check the spec's field
     references against the result's real schema — Vega-Lite renders a missing field as an empty
     or subtly wrong chart without erroring, and catching that here is what keeps a silent
-    mis-plot from reaching the user.
+    mis-plot from reaching the user. A redraw runs the identical pipeline rather than trusting
+    what it stored: that is what makes re-validation catch a column renamed since authoring, and
+    what stops the store becoming a way around a guard.
     """
-    if not name:
-        raise ValueError("`visual` needs the `name` of a saved result to plot.")
+    if saved is not None:
+        if name is not None or spec is not None:
+            extra = " and ".join(
+                f"`{k}`" for k, v in (("name", name), ("spec", spec)) if v is not None
+            )
+            raise ValueError(
+                f"`saved` draws a stored visual, so {extra} must be omitted — a stored spec "
+                "already records the result it reads. Drop the extra argument, or drop `saved` "
+                "to draw a new spec."
+            )
+        if save_as is not None:
+            raise ValueError(
+                "`saved` and `save_as` cannot be combined: one draws a stored visual, the other "
+                "stores a new one. To copy a visual, draw it and re-save the spec."
+            )
+    else:
+        if not name:
+            raise ValueError(
+                "`visual` needs the `name` of a saved result to plot, or `saved` to draw a "
+                "stored visual."
+            )
+        if spec is None:
+            raise ValueError(
+                "`visual` needs a `spec` describing the chart to draw, or `saved` to draw a "
+                "stored visual."
+            )
+
     # Identifier validation first, existence second: junk like `a"b` should read as an invalid
     # name, not "unknown flow". `_require_existing_flow` then stops a typo'd flow being
     # provisioned by a display path — the way "a view is not a result" is observable.
     resolved = _validate_name(flow or session.default_flow, "flow name")
-    _validate_name(name)
     _require_existing_flow(session, resolved)
+
+    if saved is not None:
+        _validate_name(saved, "visual name")
+        stored = session.load_visual(resolved, saved)
+        name = stored["reads"][0]
+        spec = json.loads(stored["spec"])
+        title = title or stored["title"]
+    else:
+        _validate_name(name)
+        if save_as is not None:
+            _validate_name(save_as, "visual name")
 
     columns, rows = session.rows_for_display(name, resolved, max_rows=vega.VEGA_MAX_ROWS)
     validated = vega.validate_spec(spec, columns)
@@ -464,6 +510,20 @@ def _dispatch_visual(
     # diverted to a sandbox file and the view is handed a pointer, so it renders blank with no
     # error — refuse it here where the message can say so.
     payload_chars = vega.assert_payload_fits(hydrated, len(rows), name)
+
+    # Store only AFTER a successful draw, so a spec that could not be delivered never enters the
+    # store. `validated` — never `hydrated`: hydrate() shallow-copies before setting `data`, so
+    # `validated` is still data-free, and persisting the hydrated one would write every drawn row
+    # into the meta table as text and leave a redraw ignoring the live result entirely.
+    if save_as is not None:
+        session.record_visual(
+            resolved,
+            save_as,
+            reads=[name],
+            spec=json.dumps(validated),
+            fields=vega.required_columns(validated),
+            title=title,
+        )
 
     # Mirror `query`'s contract exactly: every row when the result is small on both axes,
     # otherwise a short head. The model then reads a small deliverable straight out of the text
@@ -488,6 +548,12 @@ def _dispatch_visual(
         "complete": complete,
         **_provenance_summary(_provenance(session, name, resolved)),
     }
+    # Name the stored definition in play, so the model can tell a redraw from a fresh spec and
+    # knows what to pass next time instead of re-authoring.
+    if saved is not None:
+        summary["saved"] = saved
+    if save_as is not None:
+        summary["saved_as"] = save_as
     return ToolResult(
         content=[TextContent(type="text", text=json.dumps(summary, default=str))],
         structured_content={"spec": hydrated},
@@ -806,7 +872,16 @@ def build_server(
         description=(
             "DRAW a saved result in the chat as an interactive Vega-Lite chart. Read-only and "
             "non-destructive: `visual` creates NO result and NO lineage node — it is a VIEW of "
-            "what already exists, so there is nothing to `drop` afterwards.\n"
+            "what already exists, so drawing leaves no data behind to clean up.\n"
+            "AUTHOR ONCE, THEN REDRAW. Pass `save_as=\"<chart name>\"` to STORE the spec beside "
+            "the data, and every look after that is `visual(saved=\"<chart name>\")` — no `name`, "
+            "no `spec`, a handful of tokens instead of re-authoring the whole chart. A stored "
+            "spec holds no data, so a redraw picks up whatever the result contains NOW: rebuild "
+            "the pipeline and the chart is current, with nothing to re-send. Storing replaces "
+            "any chart of the same name (definitions, not versions). `catalog` lists what is "
+            "stored; `drop` removes it. A redraw re-checks the spec against the result's CURRENT "
+            "columns, so a column renamed since authoring is an error naming the field, never a "
+            "chart that quietly misstates the data.\n"
             "`name` is the saved result to plot. `spec` is a Vega-Lite spec (object or JSON "
             "string) with **no `data` key** — the server injects the result's rows for you, so "
             "write the spec as though `data` were already there. That gives you the whole "
@@ -832,12 +907,17 @@ def build_server(
     )
     @_logged
     def _visual(
-        name: str,
-        spec: dict | str,
+        name: str | None = None,
+        spec: dict | str | None = None,
         title: str | None = None,
         flow: str | None = None,
+        save_as: str | None = None,
+        saved: str | None = None,
     ) -> ToolResult:
-        return _dispatch_visual(session, name=name, spec=spec, title=title, flow=flow)
+        return _dispatch_visual(
+            session, name=name, spec=spec, title=title, flow=flow,
+            save_as=save_as, saved=saved,
+        )
 
 
     @mcp.tool(

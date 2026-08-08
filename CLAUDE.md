@@ -45,6 +45,12 @@ spelunk/core/
                  #   query() records
                  #   provenance (SQL + dep edges) into the internal _spelunk_meta.lineage
                  #   table; lineage() reads that DAG, replay() rebuilds a flow from it.
+                 #   record_visual/load_visual own the SECOND meta table, _spelunk_meta.visuals:
+                 #   chart definitions (data-free Vega-Lite JSON + the result it reads + the
+                 #   columns it needs), keyed (flow, name), REPLACE semantics like lineage. It
+                 #   stores `fields` rather than re-deriving them so replay's staleness check is
+                 #   set arithmetic here and Vega-Lite grammar stays in mcp/vega.py — core never
+                 #   imports mcp.
   sources.py     # Source registry: spec -> DuckDB attach/scan SQL (files + lakehouse scans as
                  #   VIEWs, DBs/DuckLake ATTACHed READ_ONLY). Kinds: file (local OR remote
                  #   https://,s3://,gs://,az:// via httpfs/azure ext; ext-backed readers
@@ -176,11 +182,11 @@ One row-returning tool (`query`) owns every SELECT; inspection lives on the reso
 | `query(sql, name, flow?)` | Run a read-only SELECT over sources + saved results; **materialize the full result** as table `name` (required). Returns columns, true row_count, and a sample — a 5-row head, or **every row** (with `complete: true`) when the result is small on both axes (row_count ≤ 50 and row_count×cols ≤ 1000), so an agent reads a small deliverable without paging it out into junk tables. The one tool for looking *and* building — results are named and immediately reusable. **Batch mode:** `query(steps=[{sql,name},...], flow?)` (mutually exclusive with `sql`/`name`) runs an ordered list in one call; later steps *may* reference earlier steps' names; semantics identical to N sequential calls (same guard, same lineage rows). Not only for pipelines — steps can be a dependent chain, unrelated queries, or a mix. Fail-fast — completed steps stay materialized, the failing step reports its error, the rest are skipped. Every **terminal** step (one no later step references — the last, plus any independent query) returns a sample (full rows when small, else a head); downstream-consumed intermediates stay compact. A hint after 3 consecutive single-query calls nudges agents toward the batch. |
 | `profile(sql, flow?)` | Per-column stats (null_rate, min/max/mean/std, p25/p50/p75/p95; unique/top/freq) — no row cap. |
 | `export(target, format, path, flow?)` | Write a saved result name **or** a full SELECT to csv/json/parquet. |
-| `catalog(flow?)` | No arg → list flows + counts; with a flow → its results. |
-| `drop(name?, flow?)` | Drop one result, or a whole flow (name omitted). |
+| `catalog(flow?)` | No arg → list flows + counts (`visual_count` when a flow holds charts); with a flow → its results, plus a `visuals` section listing stored charts (name/reads/title/description — not the spec: a catalog is an index). |
+| `drop(name?, flow?)` | Drop one result, or a whole flow (name omitted). A name may address a result, a stored visual, or **both** — all of it goes, and the return reports each (`dropped`/`dropped_visual`, or `dropped_results`/`dropped_visuals`). |
 | `lineage(name?, flow?, render?, path?)` | Provenance graph: with `name`, the upstream closure (transitive, cross-flow) that built a result; without, the whole flow's DAG. Returns nodes (SQL, deps, sources, kind), edges, a dependency-first `order`, and `missing` deps. `render="mermaid"` (or `"dot"`) adds a deterministic, ready-to-display diagram string (key = the format name) built server-side from the same nodes/edges — no agent parsing; Mermaid pastes into markdown/artifacts, DOT runs through `dot -Tsvg`. `path` writes it to a file (implies `render="mermaid"`, echoes `rendered_to`). Read-only. |
-| `replay(flow?, into?, dry_run?)` | Rebuild a flow from its recorded SQL in dependency order (re-run each `query`). `into` → non-destructive rebuild into a fresh flow; omitted → in-place refresh; `dry_run` → plan only. Errors on a dependency cycle. Sources + cross-flow results are read, not rebuilt. |
-| `visual(name, spec, title?, flow?)` | DRAW a saved result in the chat as an interactive Vega-Lite chart. Registered **unconditionally** — a spec is JSON and the app page is a string, so there is no optional rendering package to be missing. `spec` is a Vega-Lite spec **with no `data` key**: the server injects the result's rows, so the agent gets the whole grammar (`mark`, `encoding`, `transform`, `layer`, `facet`, `hconcat`/`vconcat`, `params` for selections, tooltips, binning) without ever naming a data source. **A view is not a result:** creates no table, records no lineage node, nothing to `drop`; an unknown `flow` is refused rather than provisioned. Three refusals, all server-side, all before anything renders: a top-level `data` (the server owns the rows), `data.url` anywhere (the one real egress channel — it would make the *viewer's* browser fetch a host we never see), and any `field` that is neither a column of the result nor produced by the spec's own `transform` (Vega-Lite draws a missing field as a blank chart *silently*, which is exactly the mis-plot to refuse). Returns *both* halves of an MCP result — a JSON text summary the model reads (mirroring `query`'s sample contract: every row when small, else a 5-row head, plus `fields` naming only what the spec actually plots) **and** the hydrated spec a UI host renders — so there is no host-detection branch to get wrong and a text-only host degrades by simply ignoring `structuredContent`. Caps at 5000 rows and **errors rather than truncating**, because a silently shortened chart is a picture that misstates the data. |
+| `replay(flow?, into?, dry_run?)` | Rebuild a flow from its recorded SQL in dependency order (re-run each `query`). `into` → non-destructive rebuild into a fresh flow; omitted → in-place refresh; `dry_run` → plan only. Errors on a dependency cycle. Sources + cross-flow results are read, not rebuilt. Stored visuals are **carried** (copied on `into`) and reported `carried`/`stale` against the rebuilt schema — never re-rendered, never failed on. |
+| `visual(name, spec, title?, flow?, save_as?, saved?)` | DRAW a saved result in the chat as an interactive Vega-Lite chart. Registered **unconditionally** — a spec is JSON and the app page is a string, so there is no optional rendering package to be missing. `spec` is a Vega-Lite spec **with no `data` key**: the server injects the result's rows, so the agent gets the whole grammar (`mark`, `encoding`, `transform`, `layer`, `facet`, `hconcat`/`vconcat`, `params` for selections, tooltips, binning) without ever naming a data source. **A view is not a result:** creates no table and records no lineage node; an unknown `flow` is refused rather than provisioned. (Only `save_as` leaves anything behind, and what it leaves is a definition — droppable, but not data.) Three refusals, all server-side, all before anything renders: a top-level `data` (the server owns the rows), `data.url` anywhere (the one real egress channel — it would make the *viewer's* browser fetch a host we never see), and any `field` that is neither a column of the result nor produced by the spec's own `transform` (Vega-Lite draws a missing field as a blank chart *silently*, which is exactly the mis-plot to refuse). Returns *both* halves of an MCP result — a JSON text summary the model reads (mirroring `query`'s sample contract: every row when small, else a 5-row head, plus `fields` naming only what the spec actually plots) **and** the hydrated spec a UI host renders — so there is no host-detection branch to get wrong and a text-only host degrades by simply ignoring `structuredContent`. Caps at 5000 rows and **errors rather than truncating**, because a silently shortened chart is a picture that misstates the data. **Author once, then redraw:** `save_as="<chart>"` stores the spec in `_spelunk_meta.visuals`, and `visual(saved="<chart>")` thereafter redraws it — no `name`, no `spec`. A stored spec is *data-free*, so a redraw picks up whatever the result holds now; it is also **re-validated against the result's current columns**, so a column renamed since authoring is an error naming the field rather than a chart that quietly misstates the data. Storing REPLACES any chart of that name (definitions, not versions). |
 | `add_source(spec)` / `remove_source(name)` | **Only registered with `--allow-add-source`** — attach/detach a file or DB at runtime (`spec` is the same grammar as `--source`). Connection-global: a source is visible in **every flow**, not flow-scoped (DuckDB `ATTACH` can't be per-schema). Isolation comes from the process-per-agent model. |
 | `fetch(source, path, name, params?, rows_from?, …)` | **Only registered with `--allow-add-source`** (agent-initiated network reach is one capability, one gate) — call ONE endpoint of an attached `openapi:` **connection** and materialize the response as result `name`. Same return shape as `query`. **One API is one source:** attach it once, then fetch as many endpoints as you like — each response is a flow-scoped *result* (droppable, in `lineage`), never a new source. `params` is a JSON object; a `{placeholder}` in `path` consumes the param of that name as a path segment. `rows_from=<result>` binds remaining placeholders to that result's columns and fetches **one URL per distinct row** (list→detail fan-out), stamping `_key_<placeholder>` for the join back. `steps=[…]` batches several fetches per round trip (fail-fast, like `query`). |
 
@@ -219,9 +225,39 @@ views named bare) and `db://{table}` (columns, PK, sample, row count).
   deterministic rebuilding would import network latency, rate limits, and a changed upstream. They
   are reported under `preserved` (and copied when rebuilding `into` a fresh flow); refresh =
   `fetch` again.
-- **A view is not a result.** `visual` renders; it never builds. No `CREATE TABLE`, no lineage row,
-  nothing in `catalog`, nothing to `drop` — the mirror of "a fetched endpoint is a result, not a
-  source". It survives interactivity because every control is *client-side state*: a Vega-Lite
+- **Visuals are carried, not rebuilt.** A stored chart lives in `_spelunk_meta.visuals`, keyed
+  `(flow, name)` with the same REPLACE semantics as lineage — a *definition*, not an authoring
+  history. `replay` reads that table directly (visuals aren't lineage nodes, so there is no topo
+  ordering to worry about): in place there is nothing to do, and `into` a fresh flow copies the
+  definition, without which a "complete" rebuild would have all the data and none of the charts.
+  Each carried chart is then checked against the **rebuilt** schema and reported `carried` or
+  `stale` — `missing_fields` when a column was renamed, `missing_result` when the result it reads
+  is gone. **Report, never fail:** replay succeeded at its job, and failing a whole rebuild over
+  one chart's encoding would be wrong, so a stale chart is still copied. The row stores the
+  columns the spec needs (`fields`) alongside the spec, so this check is set arithmetic in `core`
+  rather than Vega-Lite grammar parsing — that's what keeps `core/` free of any `mcp/` import.
+  `dry_run` reports `missing_result` but **cannot** predict field drift: that needs a
+  post-rebuild schema, which needs an actual rebuild. Nothing is re-rendered and no version is
+  bumped — hydration happens at draw time, so a replayed flow's charts pick up the new data the
+  next time anyone looks.
+- **Results and visuals share a namespace without being checked against each other.** A result
+  and a chart may carry the same name. Enforcing one namespace would need guards on *three*
+  separate materialize paths (`_materialize_query`, the fetch materialize, replay's rebuild), and
+  partial enforcement of an invariant is worse than none — the tests would certify something
+  untrue. It would also be stricter than results treat each other, since `query` already lets one
+  result silently replace another. `drop(name=…)` therefore removes whatever carries that name —
+  the result, the visual, or both — and reports each (`dropped` / `dropped_visual`, and
+  `dropped_results` / `dropped_visuals` for a whole flow). The ambiguity is resolved by saying
+  what happened, not by prohibiting it.
+- **A view is not a result — but a chart DEFINITION is durable.** `visual` renders; it never
+  builds. No `CREATE TABLE`, no lineage row, nothing to `drop` in the data sense — the mirror of
+  "a fetched endpoint is a result, not a source". `save_as` does not weaken this: what it stores
+  is a *definition* in the reserved meta schema, the same kind of thing a lineage row is, and
+  nobody calls a lineage row a result. Hence no `kind='visual'` lineage node — a visual has no
+  SQL, and a node carrying JSON would reach `replay`'s `CREATE OR REPLACE TABLE … AS
+  {node["sql"]}` and be executed as SQL. Visuals stay out of the DAG and `replay` reads
+  `_spelunk_meta.visuals` directly instead (see **Visuals are carried, not rebuilt** above).
+  A view survives interactivity because every control is *client-side state*: a Vega-Lite
   `params` selection is a renderer node, so the user drives it without a tool call ever firing.
   The rule for anything added here: if a control would need a round trip, it doesn't belong on a
   view. That is also why the spec arrives data-free and the server **hydrates** it with inline
