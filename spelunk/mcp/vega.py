@@ -157,6 +157,21 @@ def _field_refs(spec: dict) -> set[str]:
     Covers encoding channels and the ``field``-taking transforms alike, since both spell it
     ``field``. A ``field`` given as a dict (Vega-Lite's repeat/datum forms) is skipped — it does
     not name a column directly.
+
+    **Boundary: a column named only inside an EXPRESSION STRING is invisible here** — a
+    ``{"filter": "datum.revnue > 0"}`` or ``{"calculate": "datum.regoin", "as": ...}`` passes
+    :func:`validate_spec` untouched and is absent from :func:`required_columns`, so the same typo
+    that is refused in an encoding renders an empty chart from a transform. Deliberate, not
+    overlooked: extracting ``datum.<name>`` is easy, but deciding which of those names must exist
+    is not. Vega-Lite invents field names *implicitly* — an encoding-level ``aggregate`` yields
+    ``sum_revenue``, ``bin`` yields ``bin_maxbins_10_x``/``_end``, ``timeUnit`` yields
+    ``yearmonth_date`` — and expressions that run after those stages (an
+    ``encoding.*.condition.test``) legitimately reference them. Demanding them of the result
+    would reject working charts, which VIS-007's falsifier calls out as worse than no guard,
+    and the only way to avoid it is enumerating a naming scheme that changes with each release —
+    exactly the fragility :func:`_produced_fields` was written to sidestep. Widening this later
+    is safe rather than lossy: ``_spelunk_meta.visuals`` stores the spec verbatim beside its
+    ``fields``, so the stale rows backfill with an ``UPDATE`` over the stored specs.
     """
     refs: set[str] = set()
     for node in _walk(spec):
@@ -183,7 +198,9 @@ def validate_spec(spec: Any, columns: list[dict[str, str]]) -> dict:
        artifact: it makes the viewer's browser fetch a host we never see.
     3. **A field that is not a column** and is not produced by the spec's own transforms.
        Vega-Lite draws an empty or subtly wrong chart for a missing field without erroring,
-       which is precisely the mis-plot this refuses to ship.
+       which is precisely the mis-plot this refuses to ship. Scoped to ``field`` REFERENCES; a
+       column named only inside an expression string is out of reach — see :func:`_field_refs`
+       for why that boundary is where it is.
     4. **A selection param at the top level of a multi-view spec** — a Vega-Lite grammar
        limitation (selections live in unit specs only) that compiles to duplicate signals and
        kills the chart in the renderer, after the tool has already returned success.
@@ -307,6 +324,13 @@ def required_columns(spec: dict) -> list[str]:
     not what it happens to find. That is the difference that makes it storable — the answer must
     stay true when the result's schema changes underneath it, which is the whole point of
     checking it again after a rebuild.
+
+    Sees exactly what :func:`validate_spec` sees, on purpose: the drift `replay` reports is then
+    the same set of references the guard enforces, so a chart can never be reported stale for a
+    column a redraw would happily draw. It inherits the same expression-string boundary
+    (:func:`_field_refs`), and inherits it in *stored* form — these values are computed once at
+    authoring time and never recomputed on redraw, so a later widening improves new rows only
+    until the existing ones are backfilled from the specs stored beside them.
     """
     produced = _produced_fields(spec)
     return sorted(f for f in _field_refs(spec) if f not in produced)

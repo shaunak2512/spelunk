@@ -166,9 +166,13 @@ spelunk/mcp/
                  #   deny-by-default sandbox CSP refuses, and the bundled AST interpreter is what
                  #   avoids needing `script-src 'unsafe-eval'`; a field a `transform` INVENTS is
                  #   not a column, so validate_spec collects every `as` output first or it would
-                 #   reject perfectly good specs; and the data-url check is scoped to blocks under
-                 #   a `data` key, because the image mark takes a legitimate `url` ENCODING
-                 #   channel.
+                 #   reject perfectly good specs; the field guard reads `field` REFERENCES only,
+                 #   so a column named inside an expression string (`filter: "datum.revnue > 0"`)
+                 #   escapes it AND the stored `fields` — deliberate, since Vega-Lite invents
+                 #   implicit names (sum_revenue, bin_maxbins_10_x) that expressions legitimately
+                 #   read, and demanding those of the result would reject working charts; and the
+                 #   data-url check is scoped to blocks under a `data` key, because the image mark
+                 #   takes a legitimate `url` ENCODING channel.
 
 **`__init__.py` files do not re-export submodules** — import from the submodule directly
 (`from spelunk.core.duck import DuckSession`).

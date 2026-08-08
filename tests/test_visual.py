@@ -97,6 +97,23 @@ class TestValidateSpec:
         }
         assert vega.validate_spec(spec, COLUMNS) == spec
 
+    def test_a_column_named_only_in_an_expression_is_out_of_scope(self):
+        """Pins the documented boundary of the field guard, in BOTH places that inherit it.
+
+        A misspelling inside an expression string passes, where the same misspelling in an
+        encoding is refused — and `required_columns` omits it too, so `replay`'s drift check
+        cannot see it either. Asserted rather than left implicit because this is a limit worth
+        noticing on purpose: if `_field_refs` ever learns to read expressions, this test fails
+        and forces VIS-007's scope to be restated instead of drifting.
+        """
+        spec = {
+            "transform": [{"filter": "datum.revnue > 0"}],
+            "mark": "bar",
+            "encoding": {"x": {"field": "region", "type": "nominal"}},
+        }
+        assert vega.validate_spec(spec, COLUMNS) == spec
+        assert vega.required_columns(spec) == ["region"]
+
     def test_rejects_data_url(self):
         """The one real egress channel in a declarative artifact — the viewer's browser fetching
         a host we never see. Refused server-side, where it is checkable."""

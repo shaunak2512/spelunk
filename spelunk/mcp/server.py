@@ -801,7 +801,12 @@ def build_server(
         description=(
             "With no argument: list active flows and how many results each holds. With a flow: "
             "list that flow's saved results with their columns, types, row counts, and the "
-            "one-line plain-English description recorded for each (null if none)."
+            "one-line plain-English description recorded for each (null if none). Stored charts "
+            "are indexed alongside: a flow that holds any carries `visual_count`, and asking for "
+            "that flow returns a `visuals` list (name, the result each reads, title, "
+            "description) — redraw one with `visual(saved=<name>)`. The spec itself is not "
+            "included; a catalog is an index. BOTH keys are absent when a flow has no charts, "
+            "so treat them as optional rather than expecting an empty list."
         ),
     )
     @_logged
@@ -812,7 +817,10 @@ def build_server(
         name="drop",
         description=(
             "Delete a saved result (give `name`) or an entire flow and all its results (give "
-            "only `flow`). Idempotent; cannot drop reserved schemas."
+            "only `flow`). A name may address a result, a stored visual, or BOTH — all of it "
+            "goes, and the return says which: `dropped`/`dropped_visual` for a name, "
+            "`dropped_results`/`dropped_visuals` for a flow. Idempotent; cannot drop reserved "
+            "schemas."
         ),
     )
     @_logged
@@ -925,10 +933,21 @@ def build_server(
         description=(
             "Rebuild a flow's results from their recorded SQL, in dependency order — re-running "
             "each `query`. External inputs (sources, cross-flow "
-            "results) must already exist; they are read, not rebuilt. With `into`, rebuild into a "
+            "results) must already exist; they are read, not rebuilt. A `fetch` result is an "
+            "input too: its rows are a pinned snapshot, so it is PRESERVED rather than "
+            "re-requested (copied when rebuilding `into` a fresh flow) and listed under "
+            "`preserved` with its row count — a rebuild issues no network calls, and re-running "
+            "`fetch` is how you refresh one. With `into`, rebuild into a "
             "fresh flow (non-destructive — e.g. re-run the pipeline against updated source files, "
             "then compare); without it, refresh in place. `dry_run=true` returns the ordered plan "
-            "without executing. Errors on a dependency cycle."
+            "without executing. Errors on a dependency cycle. Stored charts are CARRIED, never "
+            "re-rendered — copied when rebuilding `into` a fresh flow, then checked against the "
+            "rebuilt schema and reported under `visuals` as `carried` or `stale` "
+            "(`missing_fields` when a column they plot was renamed, `missing_result` when the "
+            "result they read is gone). A stale chart is still carried and never fails the "
+            "rebuild; fix it by re-authoring that one spec. `preserved` and `visuals` are both "
+            "absent when a flow has none, so treat them as optional rather than expecting empty "
+            "lists."
         ),
     )
     @_logged

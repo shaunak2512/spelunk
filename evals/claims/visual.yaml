@@ -159,6 +159,7 @@ claims:
   - tests/test_visual.py::TestValidateSpec::test_allows_a_field_a_transform_invents
   - tests/test_visual.py::TestValidateSpec::test_allows_fold_output_fields
   - tests/test_visual.py::TestVisualTool::test_bad_field_errors_before_anything_renders
+  - tests/test_visual.py::TestValidateSpec::test_a_column_named_only_in_an_expression_is_out_of_scope
   note: >
     The successor to SHOW-008, and the sharpest reason a declarative spec was chosen over
     agent-authored JSX: the artifact is data, so it can be checked BEFORE it draws. Vega-Lite's
@@ -166,6 +167,14 @@ claims:
     chart with no error anywhere — which is exactly the mis-plot this refuses to ship. The
     both-directions falsifier is deliberate: a guard that rejected transform outputs would be
     worse than no guard, because it would push an agent away from transforms entirely.
+    SCOPE, stated so it cannot drift: `field` REFERENCES, not expression strings. A column named
+    only inside `{"filter": "datum.revnue > 0"}` reaches neither this guard nor the `fields`
+    VIS-024 compares against, so that typo still draws an empty chart. Left there on purpose —
+    pulling `datum.<name>` out of an expression is trivial, but Vega-Lite also INVENTS field
+    names implicitly (`sum_revenue`, `bin_maxbins_10_x`, `yearmonth_date`) and post-aggregation
+    expressions legitimately reference them, so demanding every extracted name of the result
+    would trip this claim's own second falsifier. Closing it means modelling a naming scheme that
+    moves each release; the boundary is pinned by a test so widening it forces a decision here.
 
 - id: VIS-008
   claim: >
@@ -540,7 +549,11 @@ claims:
     already rebuilt — turning a reporting concern into a half-finished operation. Because
     visuals are not lineage nodes, none of this lives in the rebuild loop: `_carry_visuals`
     reads the store directly, which is why no `kind='visual'` node can ever reach
-    `CREATE OR REPLACE TABLE ... AS {node["sql"]}`.
+    `CREATE OR REPLACE TABLE ... AS {node["sql"]}`. The drift this reports is exactly the set
+    VIS-007 enforces — same extractor, so a chart is never called stale for a column a redraw
+    would draw — which means it also inherits VIS-007's expression-string boundary, and inherits
+    it in STORED form: `fields` is computed once at authoring time, so widening the extractor
+    later improves new rows only until the old ones are backfilled from the specs beside them.
 
 - id: VIS-025
   claim: >
