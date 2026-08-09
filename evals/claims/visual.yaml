@@ -160,6 +160,11 @@ claims:
   - tests/test_visual.py::TestValidateSpec::test_allows_fold_output_fields
   - tests/test_visual.py::TestVisualTool::test_bad_field_errors_before_anything_renders
   - tests/test_visual.py::TestValidateSpec::test_a_column_named_only_in_an_expression_is_out_of_scope
+  - tests/test_visual.py::TestValidateSpec::test_rejects_a_misspelled_fold_input
+  - tests/test_visual.py::TestValidateSpec::test_rejects_a_misspelled_pivot_input
+  - tests/test_visual.py::TestValidateSpec::test_allows_a_pivot_output_column_that_only_the_data_can_name
+  - tests/test_visual.py::TestValidateSpec::test_allows_a_custom_category_order
+  - tests/test_visual.py::TestValidateSpec::test_a_custom_fold_as_replaces_the_default_output_names
   note: >
     The successor to SHOW-008, and the sharpest reason a declarative spec was chosen over
     agent-authored JSX: the artifact is data, so it can be checked BEFORE it draws. Vega-Lite's
@@ -167,14 +172,24 @@ claims:
     chart with no error anywhere — which is exactly the mis-plot this refuses to ship. The
     both-directions falsifier is deliberate: a guard that rejected transform outputs would be
     worse than no guard, because it would push an agent away from transforms entirely.
-    SCOPE, stated so it cannot drift: `field` REFERENCES, not expression strings. A column named
-    only inside `{"filter": "datum.revnue > 0"}` reaches neither this guard nor the `fields`
-    VIS-024 compares against, so that typo still draws an empty chart. Left there on purpose —
-    pulling `datum.<name>` out of an expression is trivial, but Vega-Lite also INVENTS field
-    names implicitly (`sum_revenue`, `bin_maxbins_10_x`, `yearmonth_date`) and post-aggregation
-    expressions legitimately reference them, so demanding every extracted name of the result
-    would trip this claim's own second falsifier. Closing it means modelling a naming scheme that
-    moves each release; the boundary is pinned by a test so widening it forces a decision here.
+    SCOPE, stated so it cannot drift, and set by that asymmetry: an input the guard cannot see
+    is a typo missed, an output it cannot see is a working chart refused. So the produced side
+    stays permissive, and the input side reads only keys that can hold nothing BUT a column name
+    — `field`, the `fold`/`flatten`/`groupby` lists, and `pivot` with its `value`. Two keys are
+    excluded for failing that test and both were live false positives: an encoding's `sort` array
+    holds the category VALUES to order an axis by, so reading them as columns refused every
+    hand-ordered axis (`sort: ["Jan", "Feb", "Mar"]` reported the months as missing columns),
+    and `stack` holds `"normalize"`.
+    Two blind spots remain, both deliberate. A column named only inside an expression string
+    (`{"filter": "datum.revnue > 0"}`) is unreachable, because Vega-Lite INVENTS field names
+    implicitly (`sum_revenue`, `bin_maxbins_10_x`, `yearmonth_date`) and post-aggregation
+    expressions legitimately reference them — demanding every extracted `datum.<name>` would trip
+    this claim's own second falsifier. And everything downstream of a `pivot` is unknowable by
+    construction: a pivot mints one column per distinct VALUE of its input, so the names exist in
+    the data, not the grammar. Enforcing them refused the ordinary pivot chart. What a pivot
+    READS is still checked. Both holes reach the `fields` VIS-024 compares against, since the
+    drift check reads the same set — and both are pinned by tests, so closing either forces a
+    decision here rather than a silent change.
 
 - id: VIS-008
   claim: >

@@ -166,13 +166,20 @@ spelunk/mcp/
                  #   deny-by-default sandbox CSP refuses, and the bundled AST interpreter is what
                  #   avoids needing `script-src 'unsafe-eval'`; a field a `transform` INVENTS is
                  #   not a column, so validate_spec collects every `as` output first or it would
-                 #   reject perfectly good specs; the field guard reads `field` REFERENCES only,
-                 #   so a column named inside an expression string (`filter: "datum.revnue > 0"`)
-                 #   escapes it AND the stored `fields` — deliberate, since Vega-Lite invents
-                 #   implicit names (sum_revenue, bin_maxbins_10_x) that expressions legitimately
-                 #   read, and demanding those of the result would reject working charts; and the
-                 #   data-url check is scoped to blocks under a `data` key, because the image mark
-                 #   takes a legitimate `url` ENCODING channel.
+                 #   reject perfectly good specs. That asymmetry is the rule for the whole guard:
+                 #   missing an OUTPUT refuses a working chart, missing an INPUT only misses a
+                 #   typo — so the produced side stays permissive and the input side reads only
+                 #   keys that can hold nothing but a column name (`field`, plus fold/flatten/
+                 #   groupby lists and pivot + its `value`). NOT `sort` (an encoding's sort array
+                 #   holds category VALUES — reading them as columns refused every hand-ordered
+                 #   axis) and NOT `stack` (holds "normalize"). Two things it deliberately can't
+                 #   see: a column named only inside an expression string (`filter: "datum.revnue
+                 #   > 0"`), because Vega-Lite's implicit names (sum_revenue, bin_maxbins_10_x)
+                 #   legitimately appear there; and anything downstream of a `pivot`, whose
+                 #   output columns are distinct data VALUES no schema can predict. Both escape
+                 #   the stored `fields` too, since replay's drift check reads the same set.
+                 #   Finally the data-url check is scoped to blocks under a `data` key, because
+                 #   the image mark takes a legitimate `url` ENCODING channel.
 
 **`__init__.py` files do not re-export submodules** — import from the submodule directly
 (`from spelunk.core.duck import DuckSession`).

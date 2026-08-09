@@ -786,7 +786,7 @@ class DuckSession:
         with self._lock:
             found = self._select_visual(flow, name)
             if found is None:
-                known = [v["name"] for v in self._visuals_for_flow(flow)]
+                known = [v["name"] for v in self._visual_index(flow)]
                 raise ValueError(
                     f"No visual named {name!r} in flow {flow!r}. "
                     f"Flow {flow!r} holds: {known or ['(none)']}."
@@ -803,13 +803,42 @@ class DuckSession:
         return None if row is None else self._visual_row(flow, row)
 
     def _visuals_for_flow(self, flow: str) -> list[dict[str, Any]]:
-        """Every stored visual in *flow*, ordered by name (caller holds ``_lock``)."""
+        """Every stored visual in *flow*, ordered by name (caller holds ``_lock``).
+
+        Whole rows, specs included — for the callers that compare against them (`replay`'s
+        carry, a redraw). Anything that only needs to LIST charts wants `_visual_index`.
+        """
         rows = self._con.execute(
             f'SELECT name, reads, spec, fields, title, description, created_at '
             f'FROM "{_META_SCHEMA}".visuals WHERE flow = ? ORDER BY name',
             [flow],
         ).fetchall()
         return [self._visual_row(flow, r) for r in rows]
+
+    def _visual_index(self, flow: str) -> list[dict[str, Any]]:
+        """What `catalog` shows for a flow's charts: an index, not the definitions.
+
+        Deliberately not `_visuals_for_flow` minus some keys — that would pull every stored
+        spec off disk to display four short columns, and a listing endpoint should not carry
+        the weight of what it is choosing not to show.
+        """
+        rows = self._con.execute(
+            f'SELECT name, reads, title, description '
+            f'FROM "{_META_SCHEMA}".visuals WHERE flow = ? ORDER BY name',
+            [flow],
+        ).fetchall()
+        return [
+            {"name": nm, "reads": json.loads(reads), "title": title, "description": description}
+            for (nm, reads, title, description) in rows
+        ]
+
+    def _visual_count(self, flow: str) -> int:
+        """How many charts *flow* holds (caller holds ``_lock``)."""
+        return int(
+            self._con.execute(
+                f'SELECT COUNT(*) FROM "{_META_SCHEMA}".visuals WHERE flow = ?', [flow]
+            ).fetchone()[0]
+        )
 
     @staticmethod
     def _visual_row(flow: str, row: tuple) -> dict[str, Any]:
@@ -826,21 +855,22 @@ class DuckSession:
         }
 
     def _delete_visuals(self, flow: str, name: str | None) -> int:
-        """Forget one visual (*name* given) or a whole flow's. Returns the count (holds lock)."""
+        """Forget one visual (*name* given) or a whole flow's. Returns the count (holds lock).
+
+        DuckDB answers a DELETE with the number of rows it removed, so the count `drop` reports
+        comes out of the statement itself rather than a COUNT(*) before it. That matters beyond
+        tidiness: `_write_visual` calls this for its REPLACE semantics and wants no count at
+        all, and a probe-then-delete would put a wasted round trip on every save.
+        """
         if name is None:
-            n = self._con.execute(
-                f'SELECT COUNT(*) FROM "{_META_SCHEMA}".visuals WHERE flow = ?', [flow]
+            deleted = self._con.execute(
+                f'DELETE FROM "{_META_SCHEMA}".visuals WHERE flow = ?', [flow]
             ).fetchone()[0]
-            self._con.execute(f'DELETE FROM "{_META_SCHEMA}".visuals WHERE flow = ?', [flow])
-            return int(n)
-        n = self._con.execute(
-            f'SELECT COUNT(*) FROM "{_META_SCHEMA}".visuals WHERE flow = ? AND name = ?',
-            [flow, name],
-        ).fetchone()[0]
-        self._con.execute(
-            f'DELETE FROM "{_META_SCHEMA}".visuals WHERE flow = ? AND name = ?', [flow, name]
-        )
-        return int(n)
+        else:
+            deleted = self._con.execute(
+                f'DELETE FROM "{_META_SCHEMA}".visuals WHERE flow = ? AND name = ?', [flow, name]
+            ).fetchone()[0]
+        return int(deleted)
 
     def _result_names(self, flow: str) -> list[str]:
         rows = self._con.execute(
@@ -1569,7 +1599,7 @@ class DuckSession:
                     entry = {"flow": sname, "result_count": count}
                     # A flow holding only charts would otherwise report result_count 0 and read
                     # as empty, which is the kind of quietly-wrong answer this surface refuses.
-                    visuals = len(self._visuals_for_flow(sname))
+                    visuals = self._visual_count(sname)
                     if visuals:
                         entry["visual_count"] = visuals
                     flows.append(entry)
@@ -1593,15 +1623,7 @@ class DuckSession:
             # every chart's JSON would bury the results it sits beside. Read one with `load` or
             # by querying _spelunk_meta.visuals directly.
             out = {"flow": flow, "results": results}
-            visuals = [
-                {
-                    "name": v["name"],
-                    "reads": v["reads"],
-                    "title": v["title"],
-                    "description": v["description"],
-                }
-                for v in self._visuals_for_flow(flow)
-            ]
+            visuals = self._visual_index(flow)
             if visuals:
                 out["visuals"] = visuals
             return out

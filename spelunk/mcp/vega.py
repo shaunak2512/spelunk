@@ -133,8 +133,13 @@ def _produced_fields(spec: dict) -> set[str]:
     Deliberately permissive. Every Vega-Lite transform that creates a column names it with
     ``as`` (``calculate``, ``aggregate``, ``window``, ``bin``, ``timeUnit``, ``density``,
     ``regression``, …), so collecting every ``as`` covers them without enumerating the list —
-    which matters because that list grows with each Vega-Lite release. ``fold`` and ``pivot``
-    get their defaults added explicitly since both can omit ``as``.
+    which matters because that list grows with each Vega-Lite release. ``fold`` is the one
+    transform that needs a special case, because it is the one that names outputs without
+    ``as``.
+
+    Missing an output here is the expensive direction: it makes the guard refuse a chart that
+    would have drawn correctly. That asymmetry is why this side stays permissive while
+    :func:`_transform_inputs` can afford to be incomplete.
     """
     produced: set[str] = set()
     for node in _walk(spec):
@@ -143,20 +148,74 @@ def _produced_fields(spec: dict) -> set[str]:
             produced.add(alias)
         elif isinstance(alias, list):
             produced.update(a for a in alias if isinstance(a, str))
-        if "fold" in node:
+        if "fold" in node and "as" not in node:
+            # `as` REPLACES these defaults rather than adding to them, so excusing key/value
+            # beside a custom `as` would wave through a reference to a column fold never made.
             produced.update({"key", "value"})
-        if isinstance(node.get("pivot"), str):
-            # pivot turns distinct VALUES into columns, which are data-dependent by definition.
-            produced.add(node["pivot"])
     return produced
+
+
+def _transform_inputs(spec: dict) -> set[str]:
+    """Columns a transform reads under a key OTHER than ``field``.
+
+    Most of the grammar spells its input ``field``, which :func:`_field_refs` picks up wholesale.
+    These four do not: ``fold`` and ``flatten`` take a LIST of source columns, ``pivot`` names
+    the column whose values become new columns, and the ``value`` beside it names the column
+    they are filled from. A typo in any of them is the same silently blank chart a misspelled
+    encoding field is.
+
+    Only keys that cannot mean anything else are read. ``value`` is taken ONLY beside a
+    ``pivot`` — everywhere else in Vega-Lite it holds a literal, and ``{"color": {"value":
+    "steelblue"}}`` would otherwise demand a column named ``steelblue``. ``stack`` is left out
+    for the same reason: in an encoding it holds ``"normalize"``, not a column name. Being
+    incomplete here only means a typo slips through; being wrong means refusing a valid chart,
+    so the bar for adding a key is that it can never hold anything but a field name.
+    """
+    refs: set[str] = set()
+    for node in _walk(spec):
+        for key in ("fold", "flatten", "groupby"):
+            value = node.get(key)
+            if isinstance(value, list):
+                refs.update(v for v in value if isinstance(v, str))
+        pivot = node.get("pivot")
+        if isinstance(pivot, str):
+            refs.add(pivot)
+            if isinstance(node.get("value"), str):
+                refs.add(node["value"])
+    return refs
+
+
+def _pivots(spec: dict) -> bool:
+    """Does the spec pivot? Then its later column names are data, not grammar."""
+    return any(isinstance(node.get("pivot"), str) for node in _walk(spec))
+
+
+def _checkable_refs(spec: dict) -> set[str]:
+    """The subset of a spec's field references that a schema can actually adjudicate.
+
+    Normally all of them. Under a ``pivot`` it is only the transform inputs: a pivot mints one
+    column per distinct VALUE of its input, so every name downstream of it comes from the data
+    rather than the spec, and there is no schema that could confirm it. Demanding those names
+    would refuse the ordinary pivot chart outright — the guard's own worst failure mode, and
+    the thing VIS-007's second falsifier names. What the pivot READS is still checkable, and
+    still checked.
+
+    Shared by :func:`validate_spec` and :func:`required_columns` so the two can never disagree
+    about what a chart needs — a chart reported stale by `replay` that a redraw draws happily
+    would make the drift report worse than useless.
+    """
+    return _transform_inputs(spec) if _pivots(spec) else _field_refs(spec)
 
 
 def _field_refs(spec: dict) -> set[str]:
     """Every source column the spec reads, as ``{field}`` names.
 
     Covers encoding channels and the ``field``-taking transforms alike, since both spell it
-    ``field``. A ``field`` given as a dict (Vega-Lite's repeat/datum forms) is skipped — it does
-    not name a column directly.
+    ``field``, plus the handful that spell it otherwise (:func:`_transform_inputs`). A ``field``
+    given as a dict (Vega-Lite's repeat/datum forms) is skipped — it does not name a column
+    directly. Nor does an encoding's ``sort`` array, which holds the VALUES to order a category
+    axis by: reading ``sort: ["Jan", "Feb", "Mar"]`` as column names refused every chart with a
+    custom category order, naming the months as missing columns.
 
     **Boundary: a column named only inside an EXPRESSION STRING is invisible here** — a
     ``{"filter": "datum.revnue > 0"}`` or ``{"calculate": "datum.regoin", "as": ...}`` passes
@@ -173,15 +232,11 @@ def _field_refs(spec: dict) -> set[str]:
     is safe rather than lossy: ``_spelunk_meta.visuals`` stores the spec verbatim beside its
     ``fields``, so the stale rows backfill with an ``UPDATE`` over the stored specs.
     """
-    refs: set[str] = set()
+    refs = _transform_inputs(spec)
     for node in _walk(spec):
         field = node.get("field")
         if isinstance(field, str):
             refs.add(field)
-        for key in ("groupby", "sort"):
-            value = node.get(key)
-            if isinstance(value, list):
-                refs.update(v for v in value if isinstance(v, str))
     return refs
 
 
@@ -257,7 +312,7 @@ def validate_spec(spec: Any, columns: list[dict[str, str]]) -> dict:
 
     known = {c["name"] for c in columns}
     produced = _produced_fields(spec)
-    missing = sorted(f for f in _field_refs(spec) if f not in known and f not in produced)
+    missing = sorted(f for f in _checkable_refs(spec) if f not in known and f not in produced)
     if missing:
         raise ValueError(
             f"Spec references column(s) {missing} that the result does not have. "
@@ -325,15 +380,16 @@ def required_columns(spec: dict) -> list[str]:
     stay true when the result's schema changes underneath it, which is the whole point of
     checking it again after a rebuild.
 
-    Sees exactly what :func:`validate_spec` sees, on purpose: the drift `replay` reports is then
-    the same set of references the guard enforces, so a chart can never be reported stale for a
-    column a redraw would happily draw. It inherits the same expression-string boundary
-    (:func:`_field_refs`), and inherits it in *stored* form — these values are computed once at
-    authoring time and never recomputed on redraw, so a later widening improves new rows only
-    until the existing ones are backfilled from the specs stored beside them.
+    Sees exactly what :func:`validate_spec` sees, on purpose — both read :func:`_checkable_refs`
+    — so the drift `replay` reports is the same set of references the guard enforces and a chart
+    can never be reported stale for a column a redraw would happily draw. It therefore inherits
+    both of that function's boundaries (expression strings, and everything downstream of a
+    ``pivot``), and inherits them in *stored* form: these values are computed once at authoring
+    time and never recomputed on redraw, so a later widening improves new rows only until the
+    existing ones are backfilled from the specs stored beside them.
     """
     produced = _produced_fields(spec)
-    return sorted(f for f in _field_refs(spec) if f not in produced)
+    return sorted(f for f in _checkable_refs(spec) if f not in produced)
 
 
 def spec_fields(spec: dict, columns: list[dict[str, str]]) -> list[str]:

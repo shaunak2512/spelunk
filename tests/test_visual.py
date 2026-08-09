@@ -97,6 +97,71 @@ class TestValidateSpec:
         }
         assert vega.validate_spec(spec, COLUMNS) == spec
 
+    def test_rejects_a_misspelled_fold_input(self):
+        """`fold` names its INPUTS in a list, not under `field` — a typo there is the same
+        silent blank chart, so the list has to be read too."""
+        spec = {
+            "transform": [{"fold": ["revnue"]}],
+            "mark": "bar",
+            "encoding": {"x": {"field": "key", "type": "nominal"},
+                         "y": {"field": "value", "type": "quantitative"}},
+        }
+        with pytest.raises(ValueError, match="revnue"):
+            vega.validate_spec(spec, COLUMNS)
+
+    def test_rejects_a_misspelled_pivot_input(self):
+        """`pivot` and its `value` name real input columns; only the OUTPUT names are data."""
+        spec = {
+            "transform": [{"pivot": "catgory", "value": "revenue", "groupby": ["region"]}],
+            "mark": "bar",
+            "encoding": {"x": {"field": "region", "type": "nominal"}},
+        }
+        with pytest.raises(ValueError, match="catgory"):
+            vega.validate_spec(spec, COLUMNS)
+
+    def test_allows_a_pivot_output_column_that_only_the_data_can_name(self):
+        """The regression that matters: a pivot mints one column per distinct VALUE of its
+        input, so no schema can confirm the names downstream of it. Demanding them refused the
+        ordinary pivot chart — a guard rejecting a working spec, which is worse than no guard.
+        """
+        spec = {
+            "transform": [{"pivot": "category", "value": "revenue", "groupby": ["region"]}],
+            "mark": "bar",
+            "encoding": {"x": {"field": "region", "type": "nominal"},
+                         "y": {"field": "Widgets", "type": "quantitative"}},
+        }
+        assert vega.validate_spec(spec, COLUMNS + [{"name": "category", "type": "VARCHAR"}]) == spec
+        # ...and the store must not demand it either, or replay would call the chart stale
+        # forever for a column that was never supposed to be in the schema.
+        assert "Widgets" not in vega.required_columns(spec)
+
+    def test_allows_a_custom_category_order(self):
+        """An encoding's `sort` array holds the VALUES to order an axis by, not column names.
+
+        Reading them as columns refused every chart with a custom category order — months,
+        sizes, any hand-ordered axis — and named the categories as the missing columns.
+        """
+        spec = {
+            "mark": "bar",
+            "encoding": {
+                "x": {"field": "region", "type": "nominal", "sort": ["West", "East", "North"]},
+                "y": {"field": "revenue", "type": "quantitative"},
+            },
+        }
+        assert vega.validate_spec(spec, COLUMNS) == spec
+        assert vega.required_columns(spec) == ["region", "revenue"]
+
+    def test_a_custom_fold_as_replaces_the_default_output_names(self):
+        """`as` REPLACES fold's key/value defaults rather than adding to them, so excusing them
+        anyway would wave through a reference to a column the fold never made."""
+        spec = {
+            "transform": [{"fold": ["revenue"], "as": ["metric", "amount"]}],
+            "mark": "bar",
+            "encoding": {"x": {"field": "key", "type": "nominal"}},
+        }
+        with pytest.raises(ValueError, match="key"):
+            vega.validate_spec(spec, COLUMNS)
+
     def test_a_column_named_only_in_an_expression_is_out_of_scope(self):
         """Pins the documented boundary of the field guard, in BOTH places that inherit it.
 
