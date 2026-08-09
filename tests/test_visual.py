@@ -97,6 +97,139 @@ class TestValidateSpec:
         }
         assert vega.validate_spec(spec, COLUMNS) == spec
 
+    def test_a_pivot_in_one_layer_does_not_disable_the_others(self):
+        """Scoping, from the direction that loses coverage.
+
+        A pivot's outputs are unknowable, but only in the subtree it applies to. Suppressing the
+        check spec-wide meant one pivot layer switched validation off for a whole layered
+        dashboard — a far bigger hole than the one the suppression exists to avoid.
+        """
+        spec = {"layer": [
+            {"transform": [{"pivot": "category", "value": "revenue", "groupby": ["region"]}],
+             "mark": "bar",
+             "encoding": {"x": {"field": "region", "type": "nominal"},
+                          "y": {"field": "Widgets", "type": "quantitative"}}},
+            {"mark": "line", "encoding": {"x": {"field": "regoin", "type": "nominal"}}},
+        ]}
+        cols = COLUMNS + [{"name": "category", "type": "VARCHAR"}]
+        with pytest.raises(ValueError, match="regoin"):
+            vega.validate_spec(spec, cols)
+
+    def test_a_transform_output_does_not_leak_across_layers(self):
+        """A sibling's `calculate` is not in scope: Vega-Lite runs it on that layer's data only,
+        so excusing the name here would wave through a column nothing in this layer makes."""
+        spec = {"layer": [
+            {"transform": [{"calculate": "1", "as": "invented"}],
+             "mark": "bar", "encoding": {"x": {"field": "region", "type": "nominal"}}},
+            {"mark": "line", "encoding": {"y": {"field": "invented", "type": "quantitative"}}},
+        ]}
+        with pytest.raises(ValueError, match="invented"):
+            vega.validate_spec(spec, COLUMNS)
+
+    def test_a_child_view_still_sees_its_parents_transform(self):
+        """The other direction of the same rule, and the one that would refuse valid charts:
+        data flows DOWN the view tree, so a parent's transform covers every child."""
+        spec = {
+            "transform": [{"calculate": "datum.revenue * 2", "as": "doubled"}],
+            "layer": [{"mark": "bar",
+                       "encoding": {"y": {"field": "doubled", "type": "quantitative"}}}],
+        }
+        assert vega.validate_spec(spec, COLUMNS) == spec
+
+    def test_a_layer_with_its_own_data_is_not_checked_against_the_result(self):
+        """A rule layer carrying two literal values is a normal chart, and its fields belong to
+        that literal data — checking them against the result refused it outright."""
+        spec = {"layer": [
+            {"mark": "bar", "encoding": {"x": {"field": "region", "type": "nominal"}}},
+            {"data": {"values": [{"threshold": 100}]}, "mark": "rule",
+             "encoding": {"y": {"field": "threshold", "type": "quantitative"}}},
+        ]}
+        assert vega.validate_spec(spec, COLUMNS) == spec
+        # ...and the store must not demand it of the result either.
+        assert vega.required_columns(spec) == ["region"]
+
+    def test_rejects_a_misspelled_fold_input(self):
+        """`fold` names its INPUTS in a list, not under `field` — a typo there is the same
+        silent blank chart, so the list has to be read too."""
+        spec = {
+            "transform": [{"fold": ["revnue"]}],
+            "mark": "bar",
+            "encoding": {"x": {"field": "key", "type": "nominal"},
+                         "y": {"field": "value", "type": "quantitative"}},
+        }
+        with pytest.raises(ValueError, match="revnue"):
+            vega.validate_spec(spec, COLUMNS)
+
+    def test_rejects_a_misspelled_pivot_input(self):
+        """`pivot` and its `value` name real input columns; only the OUTPUT names are data."""
+        spec = {
+            "transform": [{"pivot": "catgory", "value": "revenue", "groupby": ["region"]}],
+            "mark": "bar",
+            "encoding": {"x": {"field": "region", "type": "nominal"}},
+        }
+        with pytest.raises(ValueError, match="catgory"):
+            vega.validate_spec(spec, COLUMNS)
+
+    def test_allows_a_pivot_output_column_that_only_the_data_can_name(self):
+        """The regression that matters: a pivot mints one column per distinct VALUE of its
+        input, so no schema can confirm the names downstream of it. Demanding them refused the
+        ordinary pivot chart — a guard rejecting a working spec, which is worse than no guard.
+        """
+        spec = {
+            "transform": [{"pivot": "category", "value": "revenue", "groupby": ["region"]}],
+            "mark": "bar",
+            "encoding": {"x": {"field": "region", "type": "nominal"},
+                         "y": {"field": "Widgets", "type": "quantitative"}},
+        }
+        assert vega.validate_spec(spec, COLUMNS + [{"name": "category", "type": "VARCHAR"}]) == spec
+        # ...and the store must not demand it either, or replay would call the chart stale
+        # forever for a column that was never supposed to be in the schema.
+        assert "Widgets" not in vega.required_columns(spec)
+
+    def test_allows_a_custom_category_order(self):
+        """An encoding's `sort` array holds the VALUES to order an axis by, not column names.
+
+        Reading them as columns refused every chart with a custom category order — months,
+        sizes, any hand-ordered axis — and named the categories as the missing columns.
+        """
+        spec = {
+            "mark": "bar",
+            "encoding": {
+                "x": {"field": "region", "type": "nominal", "sort": ["West", "East", "North"]},
+                "y": {"field": "revenue", "type": "quantitative"},
+            },
+        }
+        assert vega.validate_spec(spec, COLUMNS) == spec
+        assert vega.required_columns(spec) == ["region", "revenue"]
+
+    def test_a_custom_fold_as_replaces_the_default_output_names(self):
+        """`as` REPLACES fold's key/value defaults rather than adding to them, so excusing them
+        anyway would wave through a reference to a column the fold never made."""
+        spec = {
+            "transform": [{"fold": ["revenue"], "as": ["metric", "amount"]}],
+            "mark": "bar",
+            "encoding": {"x": {"field": "key", "type": "nominal"}},
+        }
+        with pytest.raises(ValueError, match="key"):
+            vega.validate_spec(spec, COLUMNS)
+
+    def test_a_column_named_only_in_an_expression_is_out_of_scope(self):
+        """Pins the documented boundary of the field guard, in BOTH places that inherit it.
+
+        A misspelling inside an expression string passes, where the same misspelling in an
+        encoding is refused — and `required_columns` omits it too, so `replay`'s drift check
+        cannot see it either. Asserted rather than left implicit because this is a limit worth
+        noticing on purpose: if `_field_refs` ever learns to read expressions, this test fails
+        and forces VIS-007's scope to be restated instead of drifting.
+        """
+        spec = {
+            "transform": [{"filter": "datum.revnue > 0"}],
+            "mark": "bar",
+            "encoding": {"x": {"field": "region", "type": "nominal"}},
+        }
+        assert vega.validate_spec(spec, COLUMNS) == spec
+        assert vega.required_columns(spec) == ["region"]
+
     def test_rejects_data_url(self):
         """The one real egress channel in a declarative artifact — the viewer's browser fetching
         a host we never see. Refused server-side, where it is checkable."""

@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Iterable
 from typing import Any
 
 # --------------------------------------------------------------------------------- pins --- #
@@ -110,6 +111,39 @@ def _walk(node: Any) -> Any:
             yield from _walk(item)
 
 
+# The keys under which one view holds ANOTHER view. `layer`/`concat` hold a list of them;
+# `facet` and `repeat` wrap their single child in `spec`. Everything else in a view dict —
+# `transform`, `encoding`, `facet`'s own definition, `params` — belongs to the view itself.
+_CHILD_VIEW_KEYS = frozenset({"layer", "hconcat", "vconcat", "concat", "spec"})
+
+
+def _own_nodes(view: dict) -> list[dict]:
+    """Every dict belonging to THIS view's own definition, stopping at its nested views.
+
+    The unit of scope. Vega-Lite's data flows down a view tree — a child sees its parent's
+    transforms, a parent and its siblings never see a child's — so a check that walks the whole
+    spec flat cannot tell "this layer invented that column" from "some other layer did".
+    """
+    nodes = [view]
+    for key, value in view.items():
+        if key not in _CHILD_VIEW_KEYS:
+            nodes.extend(_walk(value))
+    return nodes
+
+
+def _child_views(view: dict) -> list[dict]:
+    """The views nested directly inside *view*, in no particular order."""
+    children: list[dict] = []
+    for key in ("layer", "hconcat", "vconcat", "concat"):
+        value = view.get(key)
+        if isinstance(value, list):
+            children.extend(c for c in value if isinstance(c, dict))
+    inner = view.get("spec")  # facet / repeat wrap their one view here
+    if isinstance(inner, dict):
+        children.append(inner)
+    return children
+
+
 def _data_blocks(node: Any) -> Any:
     """Yield every value that sits under a ``data`` key, at any depth.
 
@@ -127,46 +161,153 @@ def _data_blocks(node: Any) -> Any:
                     yield item
 
 
-def _produced_fields(spec: dict) -> set[str]:
-    """Column names the spec's own transforms invent, which therefore need no source column.
+def _produced_fields(nodes: Iterable[dict]) -> set[str]:
+    """Column names the transforms in *nodes* invent, which therefore need no source column.
 
     Deliberately permissive. Every Vega-Lite transform that creates a column names it with
     ``as`` (``calculate``, ``aggregate``, ``window``, ``bin``, ``timeUnit``, ``density``,
     ``regression``, …), so collecting every ``as`` covers them without enumerating the list —
-    which matters because that list grows with each Vega-Lite release. ``fold`` and ``pivot``
-    get their defaults added explicitly since both can omit ``as``.
+    which matters because that list grows with each Vega-Lite release. ``fold`` is the one
+    transform that needs a special case, because it is the one that names outputs without
+    ``as``.
+
+    Missing an output here is the expensive direction: it makes the guard refuse a chart that
+    would have drawn correctly. That asymmetry is why this side stays permissive while
+    :func:`_transform_inputs` can afford to be incomplete.
     """
     produced: set[str] = set()
-    for node in _walk(spec):
+    for node in nodes:
         alias = node.get("as")
         if isinstance(alias, str):
             produced.add(alias)
         elif isinstance(alias, list):
             produced.update(a for a in alias if isinstance(a, str))
-        if "fold" in node:
+        if "fold" in node and "as" not in node:
+            # `as` REPLACES these defaults rather than adding to them, so excusing key/value
+            # beside a custom `as` would wave through a reference to a column fold never made.
             produced.update({"key", "value"})
-        if isinstance(node.get("pivot"), str):
-            # pivot turns distinct VALUES into columns, which are data-dependent by definition.
-            produced.add(node["pivot"])
     return produced
 
 
-def _field_refs(spec: dict) -> set[str]:
-    """Every source column the spec reads, as ``{field}`` names.
+def _transform_inputs(nodes: Iterable[dict]) -> set[str]:
+    """Columns a transform reads under a key OTHER than ``field``.
 
-    Covers encoding channels and the ``field``-taking transforms alike, since both spell it
-    ``field``. A ``field`` given as a dict (Vega-Lite's repeat/datum forms) is skipped — it does
-    not name a column directly.
+    Most of the grammar spells its input ``field``, which :func:`_field_refs` picks up wholesale.
+    These four do not: ``fold`` and ``flatten`` take a LIST of source columns, ``pivot`` names
+    the column whose values become new columns, and the ``value`` beside it names the column
+    they are filled from. A typo in any of them is the same silently blank chart a misspelled
+    encoding field is.
+
+    Only keys that cannot mean anything else are read. ``value`` is taken ONLY beside a
+    ``pivot`` — everywhere else in Vega-Lite it holds a literal, and ``{"color": {"value":
+    "steelblue"}}`` would otherwise demand a column named ``steelblue``. ``stack`` is left out
+    for the same reason: in an encoding it holds ``"normalize"``, not a column name. Being
+    incomplete here only means a typo slips through; being wrong means refusing a valid chart,
+    so the bar for adding a key is that it can never hold anything but a field name.
     """
     refs: set[str] = set()
-    for node in _walk(spec):
-        field = node.get("field")
-        if isinstance(field, str):
-            refs.add(field)
-        for key in ("groupby", "sort"):
+    for node in nodes:
+        for key in ("fold", "flatten", "groupby"):
             value = node.get(key)
             if isinstance(value, list):
                 refs.update(v for v in value if isinstance(v, str))
+        refs |= _pivot_inputs([node])
+    return refs
+
+
+def _pivot_inputs(nodes: Iterable[dict]) -> set[str]:
+    """What a ``pivot`` itself READS — checkable even when nothing after it is.
+
+    Its own field, the ``value`` filled from, and the ``groupby`` columns that survive it. All
+    three are ordinary columns of the incoming data, so a typo in one is worth catching even
+    though the pivot's OUTPUT names can never be checked.
+    """
+    refs: set[str] = set()
+    for node in nodes:
+        pivot = node.get("pivot")
+        if not isinstance(pivot, str):
+            continue
+        refs.add(pivot)
+        if isinstance(node.get("value"), str):
+            refs.add(node["value"])
+        groupby = node.get("groupby")
+        if isinstance(groupby, list):
+            refs.update(g for g in groupby if isinstance(g, str))
+    return refs
+
+
+def _unresolved_refs(
+    view: dict,
+    known: set[str],
+    produced: set[str] = frozenset(),  # type: ignore[assignment]
+    pivoted: bool = False,
+) -> set[str]:
+    """Field references in *view* and its descendants that nothing can account for.
+
+    Walks the VIEW TREE rather than the raw dict tree, because Vega-Lite's data flows down it: a
+    child sees its parent's transforms, a parent and its siblings never see a child's. Checking
+    flat let one layer's `as` excuse a typo in the next, and let a `pivot` anywhere switch the
+    whole spec's checking off — a layered pivot dashboard went entirely unvalidated.
+
+    Three things stop a reference being adjudicable, and each stops it only where it applies:
+
+    * **A view with its own ``data``** reads its own rows, so the result's columns say nothing
+      about it — the reference-line layer with two literal values is the ordinary case. (A
+      top-level ``data`` is refused outright before this runs; the server owns that one.)
+    * **A ``pivot``** mints one column per distinct VALUE of its input, so every name after it
+      comes from the data rather than the grammar. What the pivot reads is still checked; the
+      rest of that subtree is not, because there is no schema that could confirm it.
+    * **A transform output**, which by definition has no source column — inherited downward, so
+      a parent's ``calculate`` covers its children and a sibling's does not.
+
+    Passing an empty *known* turns the same walk into "every column this spec REQUIRES", which
+    is how :func:`required_columns` reuses it. That is deliberate: the guard and the drift check
+    then cannot disagree about what a chart needs, and a chart `replay` calls stale is one a
+    redraw would genuinely refuse.
+    """
+    if "data" in view:
+        return set()
+    nodes = _own_nodes(view)
+    produced = produced | _produced_fields(nodes)
+    pivoted = pivoted or any(isinstance(n.get("pivot"), str) for n in nodes)
+    checkable = _pivot_inputs(nodes) if pivoted else _field_refs(nodes)
+    missing = {f for f in checkable if f not in known and f not in produced}
+    for child in _child_views(view):
+        missing |= _unresolved_refs(child, known, produced, pivoted)
+    return missing
+
+
+def _field_refs(nodes: Iterable[dict]) -> set[str]:
+    """Every source column *nodes* read, as ``{field}`` names.
+
+    Covers encoding channels and the ``field``-taking transforms alike, since both spell it
+    ``field``, plus the handful that spell it otherwise (:func:`_transform_inputs`). A ``field``
+    given as a dict (Vega-Lite's repeat/datum forms) is skipped — it does not name a column
+    directly. Nor does an encoding's ``sort`` array, which holds the VALUES to order a category
+    axis by: reading ``sort: ["Jan", "Feb", "Mar"]`` as column names refused every chart with a
+    custom category order, naming the months as missing columns.
+
+    **Boundary: a column named only inside an EXPRESSION STRING is invisible here** — a
+    ``{"filter": "datum.revnue > 0"}`` or ``{"calculate": "datum.regoin", "as": ...}`` passes
+    :func:`validate_spec` untouched and is absent from :func:`required_columns`, so the same typo
+    that is refused in an encoding renders an empty chart from a transform. Deliberate, not
+    overlooked: extracting ``datum.<name>`` is easy, but deciding which of those names must exist
+    is not. Vega-Lite invents field names *implicitly* — an encoding-level ``aggregate`` yields
+    ``sum_revenue``, ``bin`` yields ``bin_maxbins_10_x``/``_end``, ``timeUnit`` yields
+    ``yearmonth_date`` — and expressions that run after those stages (an
+    ``encoding.*.condition.test``) legitimately reference them. Demanding them of the result
+    would reject working charts, which VIS-007's falsifier calls out as worse than no guard,
+    and the only way to avoid it is enumerating a naming scheme that changes with each release —
+    exactly the fragility :func:`_produced_fields` was written to sidestep. Widening this later
+    is safe rather than lossy: ``_spelunk_meta.visuals`` stores the spec verbatim beside its
+    ``fields``, so the stale rows backfill with an ``UPDATE`` over the stored specs.
+    """
+    nodes = list(nodes)
+    refs = _transform_inputs(nodes)
+    for node in nodes:
+        field = node.get("field")
+        if isinstance(field, str):
+            refs.add(field)
     return refs
 
 
@@ -183,7 +324,9 @@ def validate_spec(spec: Any, columns: list[dict[str, str]]) -> dict:
        artifact: it makes the viewer's browser fetch a host we never see.
     3. **A field that is not a column** and is not produced by the spec's own transforms.
        Vega-Lite draws an empty or subtly wrong chart for a missing field without erroring,
-       which is precisely the mis-plot this refuses to ship.
+       which is precisely the mis-plot this refuses to ship. Checked per VIEW, so one layer's
+       transforms cannot excuse another layer's typo — see :func:`_unresolved_refs` for the
+       scoping and :func:`_field_refs` for which keys count as a reference at all.
     4. **A selection param at the top level of a multi-view spec** — a Vega-Lite grammar
        limitation (selections live in unit specs only) that compiles to duplicate signals and
        kills the chart in the renderer, after the tool has already returned success.
@@ -239,8 +382,7 @@ def validate_spec(spec: Any, columns: list[dict[str, str]]) -> dict:
             )
 
     known = {c["name"] for c in columns}
-    produced = _produced_fields(spec)
-    missing = sorted(f for f in _field_refs(spec) if f not in known and f not in produced)
+    missing = sorted(_unresolved_refs(spec, known))
     if missing:
         raise ValueError(
             f"Spec references column(s) {missing} that the result does not have. "
@@ -296,6 +438,30 @@ def assert_payload_fits(hydrated: dict, row_count: int, name: str) -> int:
     return size
 
 
+def required_columns(spec: dict) -> list[str]:
+    """The result columns a spec NEEDS, for the store to compare against later.
+
+    Field references minus whatever the spec's own ``transform`` block invents — a produced
+    field must not be demanded of the result, or a perfectly good chart would be reported stale
+    the moment anyone checked it.
+
+    Unlike :func:`spec_fields`, this takes no column list: it describes what the spec requires,
+    not what it happens to find. That is the difference that makes it storable — the answer must
+    stay true when the result's schema changes underneath it, which is the whole point of
+    checking it again after a rebuild.
+
+    Sees exactly what :func:`validate_spec` sees, on purpose — both are :func:`_unresolved_refs`,
+    one with the result's columns and one with none — so the drift `replay` reports is the same
+    set of references the guard enforces, and a chart can never be reported stale for a column a
+    redraw would happily draw. It therefore inherits that walk's boundaries (expression strings,
+    anything downstream of a ``pivot``, any view carrying its own ``data``), and inherits them in
+    *stored* form: these values are computed once at authoring time and never recomputed on
+    redraw, so a later widening improves new rows only until the existing ones are backfilled
+    from the specs stored beside them.
+    """
+    return sorted(_unresolved_refs(spec, set()))
+
+
 def spec_fields(spec: dict, columns: list[dict[str, str]]) -> list[str]:
     """The result columns the spec actually plots, for the text summary.
 
@@ -303,7 +469,7 @@ def spec_fields(spec: dict, columns: list[dict[str, str]]) -> list[str]:
     reporting all the columns would overstate what the reader is looking at.
     """
     known = {c["name"] for c in columns}
-    return sorted(f for f in _field_refs(spec) if f in known)
+    return sorted(f for f in _field_refs(_walk(spec)) if f in known)
 
 
 # -------------------------------------------------------------------------------- the app --- #

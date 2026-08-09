@@ -64,6 +64,11 @@ Three things worth knowing:
 
 - **A view is not a result.** `visual` creates no table and records no lineage, so there is
   nothing to clean up afterwards.
+- **Author a chart once, then redraw it.** `save_as="revenue"` stores the spec; every look after
+  that is `visual(saved="revenue")`. The stored spec holds no data, so a redraw shows whatever
+  the result contains *now* — rebuild the pipeline and the chart is current, with nothing to
+  re-send. A redraw re-checks the spec against the result's current columns, so a renamed column
+  is an error naming the field rather than a chart that quietly misstates the data.
 - **Every `field` is checked against the real schema** before anything renders. Vega-Lite draws a
   misspelled field as a blank chart *silently*; Spelunk errors instead and names the columns you
   actually have. Fields your own `transform` creates are fine.
