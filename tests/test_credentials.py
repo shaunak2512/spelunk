@@ -20,6 +20,7 @@ import pytest
 
 from spelunk.core import apifetch
 from spelunk.core.duck import DuckSession
+from spelunk.core.sources import Source
 from spelunk.mcp.server import _load_env_file, build_server
 
 CANARY = "cAnAry-9f3b7e21-tOkEn-value"
@@ -65,6 +66,8 @@ class TestCredentialNeverEscapesItsEnvVar:
                 ),
                 "catalog": json.dumps(session.catalog(), default=str),
                 "catalog(flow)": json.dumps(session.catalog("default"), default=str),
+                "catalog(source)": json.dumps(session.catalog(source="canary"), default=str),
+                "catalog(object)": json.dumps(session.catalog(object="canary"), default=str),
                 "lineage": json.dumps(session.lineage(flow="default"), default=str),
                 "describe": json.dumps(session.describe("canary").model_dump(), default=str),
             }
@@ -124,6 +127,55 @@ class TestCredentialNeverEscapesItsEnvVar:
         finally:
             session.close()
             os.environ.pop("CANARY_TOKEN", None)
+
+
+class TestDsnLocatorIsRedactedOnTheWayOut:
+    """`catalog` returns locators to the AGENT, so a DSN password must be masked there too.
+
+    The env-var sweep above cannot catch this: an `api:` spec carries a variable NAME, while a
+    `postgresql://user:pw@host/db` source carries the secret itself, in the one field the new
+    source listing exists to show.
+    """
+
+    SECRET = "sup3r-s3cret-pw"
+
+    def _session_with_dsn(self, tmp_path, locator: str):
+        """Attach nothing real — a Postgres DSN cannot connect here; register the Source directly."""
+        session = DuckSession.open([], session_dir=str(tmp_path / "ws"))
+        session.sources.append(Source(name="pg", kind="postgres", locator=locator))
+        return session
+
+    @pytest.mark.parametrize(
+        "locator",
+        [
+            "postgresql://admin:{secret}@db.internal:5432/warehouse",
+            "mysql://root:{secret}@10.0.0.4/app",
+            "host=db.internal user=admin password={secret} dbname=warehouse",
+            "postgresql://admin:{secret}@db.internal/warehouse?sslmode=require",
+        ],
+    )
+    def test_no_catalog_shape_echoes_the_password(self, tmp_path, locator):
+        session = self._session_with_dsn(tmp_path, locator.format(secret=self.SECRET))
+        try:
+            for label, blob in (
+                ("catalog()", json.dumps(session.catalog(), default=str)),
+                ("catalog(source)", json.dumps(session.catalog(source="pg"), default=str)),
+            ):
+                assert self.SECRET not in blob, f"DSN password leaked into {label}"
+                assert "***" in blob, f"{label} dropped the locator instead of masking it"
+        finally:
+            session.close()
+
+    def test_the_rest_of_the_locator_survives(self, tmp_path):
+        """Masking that ate the host would make the listing useless — redact, don't delete."""
+        session = self._session_with_dsn(
+            tmp_path, f"postgresql://admin:{self.SECRET}@db.internal:5432/warehouse"
+        )
+        try:
+            locator = session.catalog()["sources"][0]["locator"]
+            assert locator == "postgresql://***@db.internal:5432/warehouse"
+        finally:
+            session.close()
 
 
 BASE_URL = "https://api.example.com/v3/base"

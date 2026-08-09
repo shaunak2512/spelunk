@@ -292,3 +292,63 @@ claims:
   - tests/test_cli.py::TestStdoutPurity::test_console_log_writes_to_stderr_not_stdout
   note: Resolution is pinned at unit level (_resolve_console_log) because the CLI default depends on the
     tool-log default, which is itself resolved after DuckSession.open() picks the per-process workspace.
+- id: MCP-019
+  claim: '`catalog` is the discovery ladder: no argument lists attached `sources` and `flows`;
+    `source=<name>` lists that source''s queryable objects; `object=<name>` describes one object;
+    `flow=<name>` lists a flow''s results and charts. At most one of the three may be given.
+
+    '
+  source: CLAUDE.md#tool-surface
+  mode: behavioral
+  falsifier: A rung returns something other than its documented shape, an unknown source is accepted
+    silently, or two modes at once resolve by precedence instead of erroring.
+  status: verified
+  covered_by:
+  - tests/test_duck.py::TestCatalogLadder::test_no_arg_lists_sources_beside_flows
+  - tests/test_duck.py::TestCatalogLadder::test_source_lists_its_objects
+  - tests/test_duck.py::TestCatalogLadder::test_file_source_is_one_bare_view
+  - tests/test_duck.py::TestCatalogLadder::test_unknown_source_names_the_known_ones
+  - tests/test_duck.py::TestCatalogLadder::test_two_modes_at_once_is_refused
+  - tests/test_mcp_server.py::TestOtherTools::test_catalog_ladder_over_the_tool
+  - tests/test_mcp_server.py::TestOtherTools::test_catalog_refuses_two_modes
+  note: The exclusivity case is parametrised over all four illegal combinations — a precedence rule
+    that silently ignored one argument would otherwise pass a single-example test.
+- id: MCP-020
+  claim: The no-argument `catalog` carries no columns — the ladder exists so an opening call does not
+    dump every column of every source into the agent's context.
+  source: CLAUDE.md#tool-surface
+  mode: invariant
+  falsifier: A column name of any attached source appears in the no-argument output.
+  status: verified
+  covered_by:
+  - tests/test_duck.py::TestCatalogLadder::test_no_arg_carries_no_columns
+  note: Asserted by sweeping the serialized output for a known column name rather than by inspecting
+    keys, so an added key that happens to carry schema is caught too.
+- id: MCP-021
+  claim: '`catalog(object=…)` delegates to the same `describe` that serves `db://{table}`, so the tool
+    and the resource cannot drift into two different answers.
+
+    '
+  source: CLAUDE.md#tool-surface
+  mode: invariant
+  falsifier: The two return different payloads for the same object.
+  status: verified
+  covered_by:
+  - tests/test_duck.py::TestCatalogLadder::test_object_matches_the_describe_resource
+  - tests/test_duck.py::TestCatalogLadder::test_object_takes_a_bare_file_view_too
+  note: Asserted as equality against describe().model_dump() rather than by spot-checking fields, so
+    any future divergence fails regardless of which key drifts.
+- id: MCP-022
+  claim: A source listed by `catalog` shows a credential-free locator — a DSN's password is masked
+    before it reaches the agent, in both the URL (//user:pass@) and libpq (password=) forms.
+  source: CLAUDE.md#tool-surface
+  mode: invariant
+  falsifier: A DSN password appears in any `catalog` shape, or masking eats the rest of the locator.
+  status: verified
+  covered_by:
+  - tests/test_credentials.py::TestDsnLocatorIsRedactedOnTheWayOut::test_no_catalog_shape_echoes_the_password
+  - tests/test_credentials.py::TestDsnLocatorIsRedactedOnTheWayOut::test_the_rest_of_the_locator_survives
+  - tests/test_credentials.py::TestCredentialNeverEscapesItsEnvVar::test_no_output_channel_carries_the_value
+  note: 'The env-var canary sweep cannot cover this: an api: spec carries a variable NAME, while a DSN
+    carries the secret itself — in the one field the source listing exists to show. Masking moved to
+    core.sources so the tool log and the catalog cannot mask differently.'

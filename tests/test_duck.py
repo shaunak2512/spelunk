@@ -1,6 +1,7 @@
 """Tests for spelunk.core.duck.DuckSession — the unified engine + workspace."""
 from __future__ import annotations
 
+import json
 import os
 import time
 
@@ -34,6 +35,80 @@ class TestIntrospection:
         assert desc.primary_key == ["id"]
         assert desc.row_count == 3
         assert len(desc.sample_rows) == 3
+
+
+class TestCatalogLadder:
+    """`catalog` is the discovery surface: sources -> a source's objects -> one object."""
+
+    def test_no_arg_lists_sources_beside_flows(self, session):
+        out = session.catalog()
+        assert [s["name"] for s in out["sources"]] == ["shop", "orders"]
+        kinds = {s["name"]: s["kind"] for s in out["sources"]}
+        assert kinds == {"shop": "sqlite", "orders": "file"}
+        assert all(s["locator"] for s in out["sources"])
+        assert "flows" in out
+
+    def test_no_arg_carries_no_columns(self, session):
+        """The whole point of the ladder: the opening call must not dump every schema."""
+        blob = json.dumps(session.catalog())
+        assert "signup_date" not in blob and "customers" not in blob
+
+    def test_source_lists_its_objects(self, session):
+        out = session.catalog(source="shop")
+        assert out["source"] == "shop" and out["kind"] == "sqlite"
+        names = [o["name"] for o in out["objects"]]
+        assert "shop.customers" in names and "shop.orders" in names
+
+    def test_file_source_is_one_bare_view(self, session):
+        out = session.catalog(source="orders")
+        assert [o["name"] for o in out["objects"]] == ["orders"]
+        assert out["objects"][0]["kind"] == "view"
+
+    def test_object_matches_the_describe_resource(self, session):
+        """The tier delegates, so it can never drift from `db://{table}`."""
+        assert session.catalog(object="shop.customers") == session.describe(
+            "shop.customers"
+        ).model_dump()
+
+    def test_object_takes_a_bare_file_view_too(self, session):
+        out = session.catalog(object="orders")
+        assert [c["name"] for c in out["columns"]] == ["oid", "customer_id", "amount"]
+
+    def test_unknown_source_names_the_known_ones(self, session):
+        with pytest.raises(ValueError, match="No source named 'nope'.*shop"):
+            session.catalog(source="nope")
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"flow": "default", "source": "shop"},
+            {"flow": "default", "object": "orders"},
+            {"source": "shop", "object": "orders"},
+            {"flow": "default", "source": "shop", "object": "orders"},
+        ],
+    )
+    def test_two_modes_at_once_is_refused(self, session, kwargs):
+        with pytest.raises(ValueError, match="at most one"):
+            session.catalog(**kwargs)
+
+    def test_a_source_that_exposes_nothing_says_so(self, tmp_path):
+        """An attached-but-empty DB is invisible in `db://tables`; here it is a real answer."""
+        import sqlite3
+
+        empty = tmp_path / "empty.sqlite"
+        sqlite3.connect(empty).close()
+        s = DuckSession.open([f"blank={empty}"])
+        try:
+            assert s.catalog(source="blank")["objects"] == []
+            assert "blank" in [src["name"] for src in s.catalog()["sources"]]
+        finally:
+            s.close()
+
+    def test_a_runtime_added_source_appears_immediately(self, session, csv_file):
+        session.add_source(f"extra={csv_file}")
+        assert "extra" in [s["name"] for s in session.catalog()["sources"]]
+        session.remove_source("extra")
+        assert "extra" not in [s["name"] for s in session.catalog()["sources"]]
 
 
 class TestQuery:
