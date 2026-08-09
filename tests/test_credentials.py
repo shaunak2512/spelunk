@@ -20,7 +20,8 @@ import pytest
 
 from spelunk.core import apifetch
 from spelunk.core.duck import DuckSession
-from spelunk.mcp.server import _load_env_file, build_server
+from spelunk.core.sources import Source
+from spelunk.mcp.server import _load_env_file, _redact, build_server
 
 CANARY = "cAnAry-9f3b7e21-tOkEn-value"
 
@@ -65,6 +66,8 @@ class TestCredentialNeverEscapesItsEnvVar:
                 ),
                 "catalog": json.dumps(session.catalog(), default=str),
                 "catalog(flow)": json.dumps(session.catalog("default"), default=str),
+                "catalog(source)": json.dumps(session.catalog(source="canary"), default=str),
+                "catalog(object)": json.dumps(session.catalog(object="canary"), default=str),
                 "lineage": json.dumps(session.lineage(flow="default"), default=str),
                 "describe": json.dumps(session.describe("canary").model_dump(), default=str),
             }
@@ -124,6 +127,79 @@ class TestCredentialNeverEscapesItsEnvVar:
         finally:
             session.close()
             os.environ.pop("CANARY_TOKEN", None)
+
+
+class TestDsnLocatorIsRedactedOnTheWayOut:
+    """`catalog` returns locators to the AGENT, so a DSN password must be masked there too.
+
+    The env-var sweep above cannot catch this: an `api:` spec carries a variable NAME, while a
+    `postgresql://user:pw@host/db` source carries the secret itself, in the one field the new
+    source listing exists to show.
+    """
+
+    SECRET = "sup3r-s3cret-pw"
+
+    def _session_with_dsn(self, tmp_path, locator: str):
+        """Attach nothing real — a Postgres DSN cannot connect here; register the Source directly."""
+        session = DuckSession.open([], session_dir=str(tmp_path / "ws"))
+        session.sources.append(Source(name="pg", kind="postgres", locator=locator))
+        return session
+
+    @pytest.mark.parametrize(
+        "locator",
+        [
+            "postgresql://admin:{secret}@db.internal:5432/warehouse",
+            "mysql://root:{secret}@10.0.0.4/app",
+            "host=db.internal user=admin password={secret} dbname=warehouse",
+            "postgresql://admin:{secret}@db.internal/warehouse?sslmode=require",
+            # Quoted libpq values. The escape forms are the ones a naive `'[^']*'` gets WRONG:
+            # it stops at the backslash-escaped quote and prints the tail of the secret.
+            "host=db.internal password='{secret}' dbname=warehouse",
+            r"host=db.internal password='pa\'{secret}' dbname=warehouse",
+            r'host=db.internal password="pa\"{secret}" dbname=warehouse',
+            # Unterminated quote: must still redact rather than fall through to no match at all.
+            "host=db.internal password='{secret}",
+            # `&` is a legal libpq password character — truncating there would print the tail.
+            "host=db.internal password=a&{secret} dbname=warehouse",
+        ],
+    )
+    def test_no_catalog_shape_echoes_the_password(self, tmp_path, locator):
+        session = self._session_with_dsn(tmp_path, locator.format(secret=self.SECRET))
+        try:
+            for label, blob in (
+                ("catalog()", json.dumps(session.catalog(), default=str)),
+                ("catalog(source)", json.dumps(session.catalog(source="pg"), default=str)),
+            ):
+                assert self.SECRET not in blob, f"DSN password leaked into {label}"
+                assert "***" in blob, f"{label} dropped the locator instead of masking it"
+        finally:
+            session.close()
+
+    @pytest.mark.parametrize(
+        "spec",
+        [
+            "pg=postgresql://admin:{secret}@db.internal/warehouse",
+            "host=db.internal password='{secret}' dbname=warehouse",
+            r"host=db.internal password='pa\'{secret}' dbname=warehouse",
+            "host=db.internal password='{secret}",
+            "host=db.internal password=a&{secret} dbname=warehouse",
+        ],
+    )
+    def test_the_tool_log_masks_the_same_forms(self, spec):
+        """One masking rule, two egress channels — the log must not mask less than the catalog."""
+        masked = _redact(spec.format(secret=self.SECRET))
+        assert self.SECRET not in masked and "***" in masked
+
+    def test_the_rest_of_the_locator_survives(self, tmp_path):
+        """Masking that ate the host would make the listing useless — redact, don't delete."""
+        session = self._session_with_dsn(
+            tmp_path, f"postgresql://admin:{self.SECRET}@db.internal:5432/warehouse"
+        )
+        try:
+            locator = session.catalog()["sources"][0]["locator"]
+            assert locator == "postgresql://***@db.internal:5432/warehouse"
+        finally:
+            session.close()
 
 
 BASE_URL = "https://api.example.com/v3/base"

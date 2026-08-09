@@ -51,6 +51,11 @@ spelunk/core/
                  #   stores `fields` rather than re-deriving them so replay's staleness check is
                  #   set arithmetic here and Vega-Lite grammar stays in mcp/vega.py — core never
                  #   imports mcp.
+                 #   catalog() is the discovery ladder (sources -> a source's objects -> one
+                 #   object -> a flow's results); its object rung delegates to describe(), and
+                 #   its source rung reads self.sources, redacting each locator through
+                 #   sources.redact_credentials — which lives in core precisely because mcp's
+                 #   tool-log needs the same masking and core never imports mcp.
   sources.py     # Source registry: spec -> DuckDB attach/scan SQL (files + lakehouse scans as
                  #   VIEWs, DBs/DuckLake ATTACHed READ_ONLY). Kinds: file (local OR remote
                  #   https://,s3://,gs://,az:// via httpfs/azure ext; ext-backed readers
@@ -200,7 +205,7 @@ One row-returning tool (`query`) owns every SELECT; inspection lives on the reso
 | `query(sql, name, flow?)` | Run a read-only SELECT over sources + saved results; **materialize the full result** as table `name` (required). Returns columns, true row_count, and a sample — a 5-row head, or **every row** (with `complete: true`) when the result is small on both axes (row_count ≤ 50 and row_count×cols ≤ 1000), so an agent reads a small deliverable without paging it out into junk tables. The one tool for looking *and* building — results are named and immediately reusable. **Batch mode:** `query(steps=[{sql,name},...], flow?)` (mutually exclusive with `sql`/`name`) runs an ordered list in one call; later steps *may* reference earlier steps' names; semantics identical to N sequential calls (same guard, same lineage rows). Not only for pipelines — steps can be a dependent chain, unrelated queries, or a mix. Fail-fast — completed steps stay materialized, the failing step reports its error, the rest are skipped. Every **terminal** step (one no later step references — the last, plus any independent query) returns a sample (full rows when small, else a head); downstream-consumed intermediates stay compact. A hint after 3 consecutive single-query calls nudges agents toward the batch. |
 | `profile(sql, flow?)` | Per-column stats (null_rate, min/max/mean/std, p25/p50/p75/p95; unique/top/freq) — no row cap. |
 | `export(target, format, path, flow?)` | Write a saved result name **or** a full SELECT to csv/json/parquet. |
-| `catalog(flow?)` | No arg → list flows + counts (`visual_count` when a flow holds charts); with a flow → its results, plus a `visuals` section listing stored charts (name/reads/title/description — not the spec: a catalog is an index). |
+| `catalog(flow?, source?, object?)` | **The discovery ladder** — at most one argument, two is an error rather than a precedence rule. No arg → what the session *has*: `sources` (name/kind/credential-free locator, straight off `session.sources`, so a runtime `add_source` shows immediately) + `flows` (+ counts, `visual_count` when a flow holds charts). `source=` → that source's queryable objects (an empty list is a real answer: attached but exposing nothing, which `db://tables` renders invisible). `object=` → **delegates to `describe()`**, the same payload `db://{table}` serves, so tool and resource can't drift. `flow=` → its results, plus a `visuals` section listing stored charts (name/reads/title/description — not the spec: a catalog is an index). **No columns and no object counts in the no-arg call:** columns would spend the agent's context on every schema before it knows which two tables it needs, and a count never changes a decision (it drills in because it needs that source) while turning a free in-memory listing into one metadata round trip per attached DB, under the lock. |
 | `drop(name?, flow?)` | Drop one result, or a whole flow (name omitted). A name may address a result, a stored visual, or **both** — all of it goes, and the return reports each (`dropped`/`dropped_visual`, or `dropped_results`/`dropped_visuals`). |
 | `lineage(name?, flow?, render?, path?)` | Provenance graph: with `name`, the upstream closure (transitive, cross-flow) that built a result; without, the whole flow's DAG. Returns nodes (SQL, deps, sources, kind), edges, a dependency-first `order`, and `missing` deps. `render="mermaid"` (or `"dot"`) adds a deterministic, ready-to-display diagram string (key = the format name) built server-side from the same nodes/edges — no agent parsing; Mermaid pastes into markdown/artifacts, DOT runs through `dot -Tsvg`. `path` writes it to a file (implies `render="mermaid"`, echoes `rendered_to`). Read-only. |
 | `replay(flow?, into?, dry_run?)` | Rebuild a flow from its recorded SQL in dependency order (re-run each `query`). `into` → non-destructive rebuild into a fresh flow; omitted → in-place refresh; `dry_run` → plan only. Errors on a dependency cycle. Sources + cross-flow results are read, not rebuilt. Stored visuals are **carried** (copied on `into`) and reported `carried`/`stale` against the rebuilt schema — never re-rendered, never failed on. |
@@ -209,7 +214,10 @@ One row-returning tool (`query`) owns every SELECT; inspection lives on the reso
 | `fetch(source, path, name, params?, rows_from?, …)` | **Only registered with `--allow-add-source`** (agent-initiated network reach is one capability, one gate) — call ONE endpoint of an attached `openapi:` **connection** and materialize the response as result `name`. Same return shape as `query`. **One API is one source:** attach it once, then fetch as many endpoints as you like — each response is a flow-scoped *result* (droppable, in `lineage`), never a new source. `params` is a JSON object; a `{placeholder}` in `path` consumes the param of that name as a path segment. `rows_from=<result>` binds remaining placeholders to that result's columns and fetches **one URL per distinct row** (list→detail fan-out), stamping `_key_<placeholder>` for the join back. `steps=[…]` batches several fetches per round trip (fail-fast, like `query`). |
 
 Resources: `db://tables` (queryable objects — attached-DB tables named `<source>.<table>`, file
-views named bare) and `db://{table}` (columns, PK, sample, row count).
+views named bare) and `db://{table}` (columns, PK, sample, row count). Both are also reachable as
+`catalog` rungs, because **agents call tools and don't call resources** — that asymmetry is the
+whole reason the ladder was added, and `catalog(object=…)` delegating to `describe()` is what
+keeps it one implementation instead of two answers.
 
 ## Key concepts
 
@@ -457,7 +465,9 @@ summary, duration_ms) for usage analysis. DSN credentials are masked before anyt
 libpq keyword form (`password=…`) that DuckDB reports back on a failed ATTACH. Redacting only
 the arg leaks the secret on the error path, which is where a connection failure quotes the whole
 DSN back at you — wired by the `@_logged` decorator in `mcp/server.py`,
-which preserves each function's signature so FastMCP's schema is unchanged. `--tool-log` controls
+which preserves each function's signature so FastMCP's schema is unchanged. The masking itself is
+`core.sources.redact_credentials`, shared with `catalog`'s source listing: the log and the agent
+see the same locator, so one of them cannot quietly mask less than the other. `--tool-log` controls
 the sink: a file path, `-` for stderr, or `off` to disable. Default: `<session-dir>/tool-calls.jsonl`
 when `--session-dir` is set, else stderr — never stdout (that's the stdio MCP transport). Library
 callers of `build_server(session)` log nowhere unless passed `tool_log=`. The JSONL is queryable by

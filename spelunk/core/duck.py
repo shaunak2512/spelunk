@@ -1583,8 +1583,41 @@ class DuckSession:
         return {"path": abs_path, "format": fmt, "row_count": int(row_count)}
 
     # ------------------------------------------------------------------ catalog / drop  #
-    def catalog(self, flow: str | None = None) -> dict:
-        """List flows (no arg) or the results in one flow (their columns + row counts)."""
+    def catalog(
+        self, flow: str | None = None, source: str | None = None, object: str | None = None
+    ) -> dict:
+        """The one discovery surface, as a ladder of four shapes.
+
+        No argument lists what this session *has* — the attached sources and the active flows.
+        Each of the other three drills into one thing: ``flow`` its results and charts, ``source``
+        the objects that source made queryable, ``object`` one table's columns and sample.
+
+        The ladder exists because the alternative is a first call that dumps every column of every
+        source into the agent's context before it knows which two tables it needs. Only the depth
+        asked for is paid for: the source list is in-memory state (no query at all), and columns
+        cost a round trip that, for a remote database, happens under ``_lock``.
+
+        ``object`` shadows the builtin deliberately — it is the agent-facing parameter name, and
+        "table" would be wrong for a file source, which is a view.
+        """
+        # `is not None`, not truthiness: the DISPATCH below tests `is not None`, so a guard that
+        # tested truthiness would let `catalog(flow="x", source="")` through and then silently
+        # take the source branch — two selectors given, one quietly ignored.
+        given = [
+            k for k, v in (("flow", flow), ("source", source), ("object", object)) if v is not None
+        ]
+        if len(given) > 1:
+            raise ValueError(
+                f"catalog takes at most one of flow/source/object — got {', '.join(given)}. "
+                "Call it with none to list sources and flows, then drill into one."
+            )
+        if source is not None:
+            return self._catalog_source(source)
+        if object is not None:
+            # Straight delegation, not a reimplementation: `describe` is what `db://{table}`
+            # already serves, so the resource and this tier cannot drift into two answers.
+            return self.describe(object).model_dump()
+
         with self._lock:
             if flow is None:
                 rows = self._con.execute(
@@ -1603,7 +1636,12 @@ class DuckSession:
                     if visuals:
                         entry["visual_count"] = visuals
                     flows.append(entry)
-                return {"flows": flows}
+                # Sources come FIRST: an agent's opening call is "what data is here?", and the
+                # flows are what it built, not what it can read. No object counts — the number
+                # never changes a decision (it drills in because it needs that source, not
+                # because the count is 6), and counting would turn a free, in-memory listing
+                # into one metadata round trip per attached database, under this lock.
+                return {"sources": self._source_index(), "flows": flows}
 
             _validate_name(flow, "flow name")
             self._con.execute(f'CREATE SCHEMA IF NOT EXISTS "{flow}"')
@@ -2188,6 +2226,41 @@ class DuckSession:
                 objs.append(TableInfo(name=qualified, kind=kind, row_count=rc))
             return objs
         return []
+
+    def _source_index(self) -> list[dict[str, Any]]:
+        """What `catalog()` shows for sources: name, kind, and a credential-free locator.
+
+        Pure in-memory state — `self.sources` is the live list, so a runtime `add_source` shows up
+        here immediately (the server's `instructions` string, built once, does not).
+        """
+        return [
+            {"name": s.name, "kind": s.kind, "locator": sources_mod.redact_credentials(s.locator)}
+            for s in self.sources
+        ]
+
+    def _catalog_source(self, source: str) -> dict[str, Any]:
+        """One source's queryable objects — the middle rung of the `catalog` ladder.
+
+        An empty `objects` list is a real answer, not a failure: a database that attached but
+        exposes no user tables (wrong schema, no permissions) is otherwise invisible, and this is
+        where an agent finds that out.
+        """
+        # Look up and list under ONE lock, the same rule add_source/remove_source follow: worker
+        # threads run tools concurrently, so a source found before the lock can be DETACHed by the
+        # time we list it — and an emptied catalog would report "attached but exposes nothing",
+        # which is the one answer this shape exists to make meaningful.
+        with self._lock:
+            src = next((s for s in self.sources if s.name == source), None)
+            if src is None:
+                known = ", ".join(sorted(s.name for s in self.sources)) or "(none attached)"
+                raise ValueError(f"No source named {source!r}. Attached sources: {known}.")
+            objects = [obj.model_dump() for obj in self._objects_for_source(src)]
+        return {
+            "source": src.name,
+            "kind": src.kind,
+            "locator": sources_mod.redact_credentials(src.locator),
+            "objects": objects,
+        }
 
     def describe(self, table: str) -> TableDescription:
         """Describe one source object: columns, primary key, a sample, and a row count.

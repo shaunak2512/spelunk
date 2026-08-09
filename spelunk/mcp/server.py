@@ -23,7 +23,6 @@ import ipaddress
 import json
 import logging
 import os
-import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -40,6 +39,7 @@ from pydantic import BaseModel, Field
 
 from spelunk import __version__
 from spelunk.core.duck import DuckSession, _full_sample_fits, _SAMPLE_ROWS, _validate_name
+from spelunk.core.sources import redact_credentials
 from spelunk.mcp import vega
 
 # Shared help text for the plain-English `description` — kept identical on the single-query
@@ -88,7 +88,7 @@ _console_enabled = False
 # and row payloads are summarised, never dumped. `steps` is a batch of {sql, name} — full SQL kept.
 _LOGGED_ARGS = (
     "sql", "name", "flow", "target", "format", "path", "spec", "steps", "into", "dry_run",
-    "description", "source", "params", "rows_from", "records", "paginate", "max_pages",
+    "description", "source", "object", "params", "rows_from", "records", "paginate", "max_pages",
     "max_rows", "max_urls",
     "kind", "title",  # visual
 )
@@ -101,27 +101,15 @@ _LOGGED_RESULT_FIELDS = (
 # lineage/replay result lists carry the full SQL of every node — log their size, not their body.
 _COUNTED_RESULT_FIELDS = ("columns", "nodes", "edges", "order", "missing", "rebuilt", "plan")
 
-# add_source accepts DSNs that can embed credentials (postgresql://user:pw@host/db); strip the
-# userinfo (user:pass@) before the spec is written to the on-disk tool-call log.
-_DSN_CREDENTIALS_RE = re.compile(r"//[^/@\s]+@")
-# DuckDB rewrites a postgresql:// DSN into libpq keyword form before connecting, so a failed
-# ATTACH reports `password=<secret>` — a shape the userinfo pattern above cannot match. Both
-# forms have to be masked, or the error path leaks what the arg path redacts.
-_KEYWORD_PASSWORD_RE = re.compile(
-    r"""(?i)\b(password\s*=\s*)('[^']*'|"[^"]*"|[^\s'";]+)"""
-)
-
-
 def _redact(value: object) -> object:
     """Mask credentials in DSN-like strings so they never reach the log.
 
     Handles both the URL form (``//user:pass@host``) and the keyword form
-    (``password=secret``) that database drivers produce in connection errors.
+    (``password=secret``) that database drivers produce in connection errors. The patterns live
+    in `core.sources` beside the DSN parsing — `catalog` redacts the same locators on the way
+    out to the agent, and one masking rule is the only way both stay in step.
     """
-    if isinstance(value, str):
-        masked = _DSN_CREDENTIALS_RE.sub("//***@", value)
-        return _KEYWORD_PASSWORD_RE.sub(r"\1***", masked)
-    return value
+    return redact_credentials(value) if isinstance(value, str) else value
 
 
 def _log_arg(key: str, value: object) -> object:
@@ -602,13 +590,18 @@ def build_server(
             "Spelunk is a single DuckDB engine over all your data sources. Files (CSV/Parquet/"
             "JSON/Excel) and attached databases (SQLite/PostgreSQL/MySQL) live in one DuckDB "
             "session together with your saved results, so one query can join across all of "
-            f"them. All SQL is DuckDB SQL. Configured sources: {source_list}.\n\n"
+            f"them. All SQL is DuckDB SQL. Sources at startup: {source_list} — this line is "
+            "fixed at launch, so call `catalog()` for the sources attached NOW.\n\n"
             "## Discover\n"
-            "- `db://tables` — JSON array of queryable source objects. Attached-database tables "
-            "are named `<source>.<table>`, or `<source>.<schema>.<table>` when in a non-default "
+            "- `catalog()` — START HERE. With no argument it lists the attached `sources` and "
+            "your `flows`. Then drill in with ONE of: `catalog(source=<name>)` for that source's "
+            "queryable objects, `catalog(object=<name>)` for one object's columns/sample, "
+            "`catalog(flow=<name>)` for a flow's saved results and charts.\n"
+            "- `db://tables` — the same object list as a resource: attached-database tables are "
+            "named `<source>.<table>`, or `<source>.<schema>.<table>` when in a non-default "
             "schema (paste-ready either way); file sources appear as a bare view name.\n"
             "- `db://{table}` — describe one object: columns, types, primary key, a sample, and "
-            "a row count. Read this before writing SQL.\n\n"
+            "a row count. Read this (or `catalog(object=…)`) before writing SQL.\n\n"
             "## Query and build\n"
             "- `query(sql, name, flow?)` — run a read-only SELECT over sources AND saved results, "
             "and store the FULL result as table `name` in the flow (no row cap). Returns the "
@@ -687,7 +680,7 @@ def build_server(
             "A *flow* is an isolated result namespace (a DuckDB schema; default `\"default\"`). "
             "Give each concurrent line of analysis its own `flow` so results never collide. "
             "Reference a result in another flow as \"<flow>\".\"<name>\".\n"
-            "- `catalog()` — list flows and their result counts; `catalog(flow)` — list the "
+            "- `catalog()` — list attached sources and flows; `catalog(flow=...)` — list the "
             "results in a flow with columns and row counts.\n"
             "- `drop(name, flow?)` — drop one result; `drop(flow=...)` with no name — drop a whole "
             "flow.\n\n"
@@ -799,19 +792,34 @@ def build_server(
     @mcp.tool(
         name="catalog",
         description=(
-            "With no argument: list active flows and how many results each holds. With a flow: "
-            "list that flow's saved results with their columns, types, row counts, and the "
-            "one-line plain-English description recorded for each (null if none). Stored charts "
-            "are indexed alongside: a flow that holds any carries `visual_count`, and asking for "
-            "that flow returns a `visuals` list (name, the result each reads, title, "
-            "description) — redraw one with `visual(saved=<name>)`. The spec itself is not "
-            "included; a catalog is an index. BOTH keys are absent when a flow has no charts, "
-            "so treat them as optional rather than expecting an empty list."
+            "START HERE. Discovery, as a ladder — call it with NO argument first, then drill "
+            "into one thing. Pass at most one of `flow`/`source`/`object`; two is an error.\n"
+            "- No argument: what this session HAS — `sources` (every attached data source: "
+            "name, kind, locator) and `flows` (result namespaces you have built, with counts). "
+            "This is how you find out what data you can query.\n"
+            "- `source=<name>`: that source's queryable `objects` — the table names to put in "
+            "your SQL (attached-DB tables come back qualified as `<source>.<table>`, a file "
+            "source as one bare view name). An empty list means the source attached but exposes "
+            "nothing.\n"
+            "- `object=<name>`: one table's columns and types, primary key, sample rows, and row "
+            "count — the same answer as the `db://{table}` resource. Takes the object name "
+            "exactly as the `source=` listing gave it; no `source=` alongside it.\n"
+            "- `flow=<name>`: that flow's saved results with their columns, types, row counts, "
+            "and the one-line plain-English description recorded for each (null if none). "
+            "Stored charts are indexed alongside: a flow that holds any carries `visual_count`, "
+            "and asking for that flow returns a `visuals` list (name, the result each reads, "
+            "title, description) — redraw one with `visual(saved=<name>)`. The spec itself is "
+            "not included; a catalog is an index. BOTH keys are absent when a flow has no "
+            "charts, so treat them as optional rather than expecting an empty list.\n"
+            "Columns are deliberately NOT in the no-argument listing: every column of every "
+            "source would bury the answer before you know which tables you need."
         ),
     )
     @_logged
-    def _catalog(flow: str | None = None) -> dict:
-        return session.catalog(flow)
+    def _catalog(
+        flow: str | None = None, source: str | None = None, object: str | None = None
+    ) -> dict:
+        return session.catalog(flow, source, object)
 
     @mcp.tool(
         name="drop",

@@ -168,6 +168,34 @@ _NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
 _SANITIZE_RE = re.compile(r"[^A-Za-z0-9_]+")
 _PREFIX_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]{0,62})=(.+)$", re.DOTALL)
 
+# A DSN can embed credentials (postgresql://user:pw@host/db), so a locator is not safe to echo
+# anywhere. It lives here, beside the DSN parsing that produces the shape, because BOTH consumers
+# need it and neither can import the other: `catalog` returns locators to the agent from `core`,
+# and the tool log masks them in `mcp` — and `core` never imports `mcp`.
+_DSN_CREDENTIALS_RE = re.compile(r"//[^/@\s]+@")
+# DuckDB rewrites a postgresql:// DSN into libpq keyword form before connecting, so a failed
+# ATTACH reports `password=<secret>` — a shape the userinfo pattern above cannot match. Both
+# forms have to be masked, or the error path leaks what the arg path redacts.
+#
+# The quoted branches are escape-aware (`(?:[^'\\]|\\.)*`) because libpq quotes a value containing
+# a quote by backslash-escaping it: a naive `'[^']*'` stops at the escape and masks `password='pa\'`
+# while printing the rest of the secret. The closing quote is optional for the same failure mode
+# in the other direction — an unterminated value must still redact rather than fall through to no
+# match at all. A redactor's errors have to land on the over-masking side.
+#
+# Deliberately NOT stopping the unquoted branch at `&`: in libpq keyword form the separator is
+# whitespace and `&` is a legal password character, so truncating there would mask `a` and print
+# `&b`. It costs a trailing `?password=x&sslmode=require` query param, which is cosmetic; the
+# alternative is a leak.
+_KEYWORD_PASSWORD_RE = re.compile(
+    r"""(?i)\b(password\s*=\s*)('(?:[^'\\]|\\.)*'?|"(?:[^"\\]|\\.)*"?|[^\s'";]+)"""
+)
+
+
+def redact_credentials(value: str) -> str:
+    """Mask credentials in a DSN-like string: ``//user:pass@`` and ``password=secret``."""
+    return _KEYWORD_PASSWORD_RE.sub(r"\1***", _DSN_CREDENTIALS_RE.sub("//***@", value))
+
 
 @dataclass
 class Source:

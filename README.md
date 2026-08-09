@@ -28,7 +28,9 @@ query(sql, name, flow?)     # run a read-only SELECT over sources + results; sto
                             #   looking and building — every result is named and chainable.
 profile(sql, flow?)         # per-column stats (null_rate, min/max/mean/std, percentiles, top/freq)
 export(target, fmt, path)   # write a saved result name OR a full SELECT to csv/json/parquet
-catalog(flow?)              # list flows, or the results in one flow
+catalog(flow?|source?|object?)  # discovery ladder: no arg -> attached sources + flows;
+                            #   source= -> that source's queryable objects; object= -> one
+                            #   object's columns/sample; flow= -> a flow's results + charts
 drop(name?, flow?)          # drop one result, or a whole flow
 lineage(name?, flow?)       # provenance DAG: the SQL + deps that built a result (or a whole flow)
 replay(flow?, into?)        # rebuild a flow from its recorded SQL, in dependency order
@@ -37,9 +39,16 @@ visual(name, spec, ...)     # DRAW a saved result in the chat as an interactive 
                             #   injects the rows. A view, never a new result.
 ```
 
-Discovery resources: `db://tables` (queryable source objects) and `db://{table}` (columns, PK,
-sample, row count). A **flow** is an isolated result namespace (a DuckDB schema); give each
-concurrent line of analysis its own flow.
+**Discovery starts at `catalog()`.** With no argument it answers "what data is here?" — the
+attached sources and the flows built so far — and each of `source=` / `object=` / `flow=` drills
+into one of them (at most one per call). It is a ladder rather than one dump because the
+alternative is an opening call that spends the agent's context on every column of every source
+before it knows which two tables it needs. The same information is also served as resources for
+hosts that use them: `db://tables` (queryable source objects) and `db://{table}` (columns, PK,
+sample, row count) — `catalog(object=…)` delegates to the latter, so they cannot disagree.
+
+A **flow** is an isolated result namespace (a DuckDB schema); give each concurrent line of
+analysis its own flow.
 
 ### Charts in the chat
 

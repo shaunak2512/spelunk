@@ -120,6 +120,29 @@ class TestOtherTools:
         dropped = _run(mcp_server.call_tool("drop", {"flow": "w"})).structured_content
         assert dropped["dropped_results"] == 1
 
+    def test_catalog_ladder_over_the_tool(self, mcp_server):
+        """The three drill-down rungs are reachable as TOOL calls, not just resources."""
+        top = _run(mcp_server.call_tool("catalog", {})).structured_content
+        assert {s["name"] for s in top["sources"]} == {"shop", "orders"}
+
+        objs = _run(mcp_server.call_tool("catalog", {"source": "shop"})).structured_content
+        assert "shop.customers" in [o["name"] for o in objs["objects"]]
+
+        desc = _run(mcp_server.call_tool("catalog", {"object": "shop.customers"})).structured_content
+        assert [c["name"] for c in desc["columns"]] == ["id", "name", "city", "signup_date"]
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            {"flow": "default", "source": "shop"},
+            {"flow": "default", "source": ""},  # an empty selector is still a selector
+            {"source": "", "object": ""},
+        ],
+    )
+    def test_catalog_refuses_two_modes(self, mcp_server, args):
+        with pytest.raises(Exception, match="at most one"):
+            _run(mcp_server.call_tool("catalog", args))
+
     def test_export(self, mcp_server, tmp_path):
         _run(mcp_server.call_tool("query", {"sql": "SELECT * FROM orders", "name": "o"}))
         out = str(tmp_path / "o.parquet")

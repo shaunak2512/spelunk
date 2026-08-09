@@ -70,7 +70,7 @@ class TestToolSchemas:
         "query": {"sql", "name", "steps", "flow"},
         "profile": {"sql", "flow"},
         "export": {"target", "format", "path", "flow"},
-        "catalog": {"flow"},
+        "catalog": {"flow", "source", "object"},
         "drop": {"name", "flow"},
         "lineage": {"name", "flow", "render", "path"},
         "replay": {"flow", "into", "dry_run"},
