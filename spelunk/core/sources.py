@@ -176,8 +176,19 @@ _DSN_CREDENTIALS_RE = re.compile(r"//[^/@\s]+@")
 # DuckDB rewrites a postgresql:// DSN into libpq keyword form before connecting, so a failed
 # ATTACH reports `password=<secret>` — a shape the userinfo pattern above cannot match. Both
 # forms have to be masked, or the error path leaks what the arg path redacts.
+#
+# The quoted branches are escape-aware (`(?:[^'\\]|\\.)*`) because libpq quotes a value containing
+# a quote by backslash-escaping it: a naive `'[^']*'` stops at the escape and masks `password='pa\'`
+# while printing the rest of the secret. The closing quote is optional for the same failure mode
+# in the other direction — an unterminated value must still redact rather than fall through to no
+# match at all. A redactor's errors have to land on the over-masking side.
+#
+# Deliberately NOT stopping the unquoted branch at `&`: in libpq keyword form the separator is
+# whitespace and `&` is a legal password character, so truncating there would mask `a` and print
+# `&b`. It costs a trailing `?password=x&sslmode=require` query param, which is cosmetic; the
+# alternative is a leak.
 _KEYWORD_PASSWORD_RE = re.compile(
-    r"""(?i)\b(password\s*=\s*)('[^']*'|"[^"]*"|[^\s'";]+)"""
+    r"""(?i)\b(password\s*=\s*)('(?:[^'\\]|\\.)*'?|"(?:[^"\\]|\\.)*"?|[^\s'";]+)"""
 )
 
 

@@ -131,9 +131,17 @@ class TestOtherTools:
         desc = _run(mcp_server.call_tool("catalog", {"object": "shop.customers"})).structured_content
         assert [c["name"] for c in desc["columns"]] == ["id", "name", "city", "signup_date"]
 
-    def test_catalog_refuses_two_modes(self, mcp_server):
+    @pytest.mark.parametrize(
+        "args",
+        [
+            {"flow": "default", "source": "shop"},
+            {"flow": "default", "source": ""},  # an empty selector is still a selector
+            {"source": "", "object": ""},
+        ],
+    )
+    def test_catalog_refuses_two_modes(self, mcp_server, args):
         with pytest.raises(Exception, match="at most one"):
-            _run(mcp_server.call_tool("catalog", {"flow": "default", "source": "shop"}))
+            _run(mcp_server.call_tool("catalog", args))
 
     def test_export(self, mcp_server, tmp_path):
         _run(mcp_server.call_tool("query", {"sql": "SELECT * FROM orders", "name": "o"}))

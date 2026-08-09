@@ -21,7 +21,7 @@ import pytest
 from spelunk.core import apifetch
 from spelunk.core.duck import DuckSession
 from spelunk.core.sources import Source
-from spelunk.mcp.server import _load_env_file, build_server
+from spelunk.mcp.server import _load_env_file, _redact, build_server
 
 CANARY = "cAnAry-9f3b7e21-tOkEn-value"
 
@@ -152,6 +152,15 @@ class TestDsnLocatorIsRedactedOnTheWayOut:
             "mysql://root:{secret}@10.0.0.4/app",
             "host=db.internal user=admin password={secret} dbname=warehouse",
             "postgresql://admin:{secret}@db.internal/warehouse?sslmode=require",
+            # Quoted libpq values. The escape forms are the ones a naive `'[^']*'` gets WRONG:
+            # it stops at the backslash-escaped quote and prints the tail of the secret.
+            "host=db.internal password='{secret}' dbname=warehouse",
+            r"host=db.internal password='pa\'{secret}' dbname=warehouse",
+            r'host=db.internal password="pa\"{secret}" dbname=warehouse',
+            # Unterminated quote: must still redact rather than fall through to no match at all.
+            "host=db.internal password='{secret}",
+            # `&` is a legal libpq password character — truncating there would print the tail.
+            "host=db.internal password=a&{secret} dbname=warehouse",
         ],
     )
     def test_no_catalog_shape_echoes_the_password(self, tmp_path, locator):
@@ -165,6 +174,21 @@ class TestDsnLocatorIsRedactedOnTheWayOut:
                 assert "***" in blob, f"{label} dropped the locator instead of masking it"
         finally:
             session.close()
+
+    @pytest.mark.parametrize(
+        "spec",
+        [
+            "pg=postgresql://admin:{secret}@db.internal/warehouse",
+            "host=db.internal password='{secret}' dbname=warehouse",
+            r"host=db.internal password='pa\'{secret}' dbname=warehouse",
+            "host=db.internal password='{secret}",
+            "host=db.internal password=a&{secret} dbname=warehouse",
+        ],
+    )
+    def test_the_tool_log_masks_the_same_forms(self, spec):
+        """One masking rule, two egress channels — the log must not mask less than the catalog."""
+        masked = _redact(spec.format(secret=self.SECRET))
+        assert self.SECRET not in masked and "***" in masked
 
     def test_the_rest_of_the_locator_survives(self, tmp_path):
         """Masking that ate the host would make the listing useless — redact, don't delete."""

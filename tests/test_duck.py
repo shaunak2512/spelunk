@@ -85,11 +85,61 @@ class TestCatalogLadder:
             {"flow": "default", "object": "orders"},
             {"source": "shop", "object": "orders"},
             {"flow": "default", "source": "shop", "object": "orders"},
+            # An EMPTY selector is still a selector. A truthiness guard lets these through and
+            # then dispatches on the empty one, silently ignoring the other.
+            {"flow": "default", "source": ""},
+            {"flow": "", "source": "shop"},
+            {"flow": "default", "object": ""},
+            {"source": "", "object": ""},
         ],
     )
     def test_two_modes_at_once_is_refused(self, session, kwargs):
         with pytest.raises(ValueError, match="at most one"):
             session.catalog(**kwargs)
+
+    def test_the_refusal_names_every_selector_given(self, session):
+        """A guard that reported only the truthy ones would hide the argument being ignored."""
+        with pytest.raises(ValueError, match="flow, source"):
+            session.catalog(flow="default", source="")
+
+    def test_lookup_and_listing_share_one_lock_acquisition(self, session):
+        """Worker threads run tools concurrently, so a source found BEFORE the lock can be
+        DETACHed before it is listed — and an emptied catalog reads as "attached but exposes
+        nothing", the one answer this shape exists to make meaningful.
+        """
+        real = session._lock
+
+        class _CountingLock:
+            entries = 0
+
+            def __enter__(self):
+                _CountingLock.entries += 1
+                return real.__enter__()
+
+            def __exit__(self, *exc):
+                return real.__exit__(*exc)
+
+        real_objects = session._objects_for_source
+        held: dict[str, bool] = {}
+
+        def spy(src):
+            free = real.acquire(blocking=False)  # a plain Lock: acquirable => nobody holds it
+            if free:
+                real.release()
+            held["locked"] = not free
+            return real_objects(src)
+
+        session._lock = _CountingLock()
+        session._objects_for_source = spy
+        try:
+            out = session.catalog(source="shop")
+        finally:
+            session._lock = real
+            del session._objects_for_source
+
+        assert out["objects"], "the fixture source should expose tables"
+        assert held["locked"], "objects were listed without the lock"
+        assert _CountingLock.entries == 1, "lookup and listing took the lock separately"
 
     def test_a_source_that_exposes_nothing_says_so(self, tmp_path):
         """An attached-but-empty DB is invisible in `db://tables`; here it is a real answer."""

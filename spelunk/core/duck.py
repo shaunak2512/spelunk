@@ -1600,7 +1600,12 @@ class DuckSession:
         ``object`` shadows the builtin deliberately — it is the agent-facing parameter name, and
         "table" would be wrong for a file source, which is a view.
         """
-        given = [k for k, v in (("flow", flow), ("source", source), ("object", object)) if v]
+        # `is not None`, not truthiness: the DISPATCH below tests `is not None`, so a guard that
+        # tested truthiness would let `catalog(flow="x", source="")` through and then silently
+        # take the source branch — two selectors given, one quietly ignored.
+        given = [
+            k for k, v in (("flow", flow), ("source", source), ("object", object)) if v is not None
+        ]
         if len(given) > 1:
             raise ValueError(
                 f"catalog takes at most one of flow/source/object — got {', '.join(given)}. "
@@ -2240,11 +2245,15 @@ class DuckSession:
         exposes no user tables (wrong schema, no permissions) is otherwise invisible, and this is
         where an agent finds that out.
         """
-        src = next((s for s in self.sources if s.name == source), None)
-        if src is None:
-            known = ", ".join(sorted(s.name for s in self.sources)) or "(none attached)"
-            raise ValueError(f"No source named {source!r}. Attached sources: {known}.")
+        # Look up and list under ONE lock, the same rule add_source/remove_source follow: worker
+        # threads run tools concurrently, so a source found before the lock can be DETACHed by the
+        # time we list it — and an emptied catalog would report "attached but exposes nothing",
+        # which is the one answer this shape exists to make meaningful.
         with self._lock:
+            src = next((s for s in self.sources if s.name == source), None)
+            if src is None:
+                known = ", ".join(sorted(s.name for s in self.sources)) or "(none attached)"
+                raise ValueError(f"No source named {source!r}. Attached sources: {known}.")
             objects = [obj.model_dump() for obj in self._objects_for_source(src)]
         return {
             "source": src.name,
