@@ -178,6 +178,13 @@ spelunk/mcp/
                  #   legitimately appear there; and anything downstream of a `pivot`, whose
                  #   output columns are distinct data VALUES no schema can predict. Both escape
                  #   the stored `fields` too, since replay's drift check reads the same set.
+                 #   All of it is scoped per VIEW, not per spec: the walk follows the view tree
+                 #   the way Vega-Lite's data does (a child sees its parent's transforms, never
+                 #   a sibling's), so one layer's `pivot` can't switch checking off for a whole
+                 #   layered dashboard and one layer's `as` can't excuse the next layer's typo.
+                 #   A nested view with its OWN `data` is skipped entirely — a rule layer with
+                 #   two literal values is a normal chart, and its fields are columns of those
+                 #   rows, not of the result.
                  #   Finally the data-url check is scoped to blocks under a `data` key, because
                  #   the image mark takes a legitimate `url` ENCODING channel.
 

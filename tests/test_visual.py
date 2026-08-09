@@ -97,6 +97,57 @@ class TestValidateSpec:
         }
         assert vega.validate_spec(spec, COLUMNS) == spec
 
+    def test_a_pivot_in_one_layer_does_not_disable_the_others(self):
+        """Scoping, from the direction that loses coverage.
+
+        A pivot's outputs are unknowable, but only in the subtree it applies to. Suppressing the
+        check spec-wide meant one pivot layer switched validation off for a whole layered
+        dashboard — a far bigger hole than the one the suppression exists to avoid.
+        """
+        spec = {"layer": [
+            {"transform": [{"pivot": "category", "value": "revenue", "groupby": ["region"]}],
+             "mark": "bar",
+             "encoding": {"x": {"field": "region", "type": "nominal"},
+                          "y": {"field": "Widgets", "type": "quantitative"}}},
+            {"mark": "line", "encoding": {"x": {"field": "regoin", "type": "nominal"}}},
+        ]}
+        cols = COLUMNS + [{"name": "category", "type": "VARCHAR"}]
+        with pytest.raises(ValueError, match="regoin"):
+            vega.validate_spec(spec, cols)
+
+    def test_a_transform_output_does_not_leak_across_layers(self):
+        """A sibling's `calculate` is not in scope: Vega-Lite runs it on that layer's data only,
+        so excusing the name here would wave through a column nothing in this layer makes."""
+        spec = {"layer": [
+            {"transform": [{"calculate": "1", "as": "invented"}],
+             "mark": "bar", "encoding": {"x": {"field": "region", "type": "nominal"}}},
+            {"mark": "line", "encoding": {"y": {"field": "invented", "type": "quantitative"}}},
+        ]}
+        with pytest.raises(ValueError, match="invented"):
+            vega.validate_spec(spec, COLUMNS)
+
+    def test_a_child_view_still_sees_its_parents_transform(self):
+        """The other direction of the same rule, and the one that would refuse valid charts:
+        data flows DOWN the view tree, so a parent's transform covers every child."""
+        spec = {
+            "transform": [{"calculate": "datum.revenue * 2", "as": "doubled"}],
+            "layer": [{"mark": "bar",
+                       "encoding": {"y": {"field": "doubled", "type": "quantitative"}}}],
+        }
+        assert vega.validate_spec(spec, COLUMNS) == spec
+
+    def test_a_layer_with_its_own_data_is_not_checked_against_the_result(self):
+        """A rule layer carrying two literal values is a normal chart, and its fields belong to
+        that literal data — checking them against the result refused it outright."""
+        spec = {"layer": [
+            {"mark": "bar", "encoding": {"x": {"field": "region", "type": "nominal"}}},
+            {"data": {"values": [{"threshold": 100}]}, "mark": "rule",
+             "encoding": {"y": {"field": "threshold", "type": "quantitative"}}},
+        ]}
+        assert vega.validate_spec(spec, COLUMNS) == spec
+        # ...and the store must not demand it of the result either.
+        assert vega.required_columns(spec) == ["region"]
+
     def test_rejects_a_misspelled_fold_input(self):
         """`fold` names its INPUTS in a list, not under `field` — a typo there is the same
         silent blank chart, so the list has to be read too."""
